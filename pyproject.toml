@@ -1,0 +1,18 @@
+[project]
+name = "blupe-evals"
+version = "0.1.0"
+description = "Teleop a single YAM arm with XRoboToolkit (MuJoCo sim, then real hardware via i2rt)."
+requires-python = ">=3.10,<3.11"
+
+# Only the pip-installable bits live here. The core deps are installed from
+# source / conda and are NOT on PyPI — see README "Install":
+#   - xrobotoolkit_sdk   (XRoboToolkit-PC-Service-Pybind; setup_orin.sh on Orin)
+#   - xrobotoolkit_teleop (XRoboToolkit-Teleop-Sample-Python; setup_conda.sh)
+#   - i2rt               (hardware only; ~/i2rt on the Orin)
+dependencies = [
+    "tyro",
+    "numpy",
+]
+
+[tool.setuptools]
+py-modules = []
