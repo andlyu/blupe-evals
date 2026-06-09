@@ -2,11 +2,16 @@
 
 Quest controller -> XRoboToolkit PC Service -> xrobotoolkit_sdk -> placo IK -> MuJoCo.
 
-Prereqs (see README):
-  - XRoboToolkit PC Service running on this host, Quest connected (Controller + Send ON)
-  - `xrobotoolkit_sdk` and `xrobotoolkit_teleop` installed (Python 3.10)
+Follows the stock framework process (teleop_details.md): the MuJoCo MJCF (assets/yam/yam.xml,
+the i2rt ground-truth model) and the placo URDF (assets/yam/yam.urdf) describe the SAME robot
+-- the URDF is generated from the MJCF by scripts/gen_yam_urdf.py, so link/joint names and
+kinematics match exactly. Same `link_name` ("link6") works for both. Stock full-pose control.
 
-Run:
+Prereqs (see docs/ORIN-SETUP.md):
+  - PC Service running, Quest connected (Controller + Send ON)
+  - `python scripts/gen_yam_urdf.py` has produced a consistent assets/yam/yam.urdf
+
+Run (on the Orin desktop, DISPLAY=:0):
   python scripts/teleop_yam_mujoco.py
 """
 
@@ -18,30 +23,34 @@ from xrobotoolkit_teleop.simulation.mujoco_teleop_controller import (
 
 def main(
     xml_path: str = "assets/yam/scene.xml",
-    robot_urdf_path: str = "assets/yam/yam.urdf",
+    robot_urdf_path: str = "assets/yam/yam.urdf",  # consistent with yam.xml (generated from it)
     scale_factor: float = 1.0,
-    visualize_placo: bool = True,
+    visualize_placo: bool = False,
 ):
-    # Single right arm. NOTE on names (verified against the vendored assets):
-    #   - placo IK runs on the URDF, whose EE link is "link_6" (underscore).
-    #   - the MuJoCo body for the same link is "link6" (no underscore).
-    # `link_name` here feeds placo IK, so it must be the URDF name "link_6".
     config = {
         "right_hand": {
-            "link_name": "link_6",  # YAM EE link in yam.urdf (placo target)
+            "link_name": "grasp",  # EE = i2rt grasp_site tool frame (Z = gripper approach)
             "pose_source": "right_controller",
-            "control_trigger": "right_grip",  # grip = clutch (engage >0.5)
+            "control_trigger": "right_grip",  # grip = clutch (engage >0.9)
             "vis_target": "right_target",
+            "control_mode": "pose",  # full 6-DOF: EE tracks controller position + orientation
         }
     }
 
-    MujocoTeleopController(
+    controller = MujocoTeleopController(
         xml_path=xml_path,
         robot_urdf_path=robot_urdf_path,
         manipulator_config=config,
         scale_factor=scale_factor,
         visualize_placo=visualize_placo,
-    ).run()
+    )
+
+    # Soft joint regularization keeps the IK well-behaved (mirrors the UR5e / Flexiv examples).
+    joints_task = controller.solver.add_joints_task()
+    joints_task.set_joints({joint: 0.0 for joint in controller.placo_robot.joint_names()})
+    joints_task.configure("joints_regularization", "soft", 1e-4)
+
+    controller.run()
 
 
 if __name__ == "__main__":
