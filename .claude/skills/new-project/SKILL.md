@@ -13,7 +13,7 @@ description: >
 
 # new-project — read the docs before you build
 
-**Version: v1**
+**Version: v2**
 
 We adopt a lot of external machinery (XRoboToolkit, placo, MuJoCo, i2rt, LeRobot, robot model
 formats…). The expensive failures here come from **implementing against assumptions instead of
@@ -34,6 +34,9 @@ project (or a new corner of a known one): read its docs, **keep them as a local 
   haven't exercised).
 - We're trial-and-erroring against an external tool, or "the files don't add up." That is the
   signal we skipped this skill — stop and run it now.
+- Integrating across a **wire / client-server protocol** (we send, they receive, or vice-versa).
+- It **half-works** — works once then drops, or one config/frame works and the next doesn't. That
+  is a protocol/negotiation mismatch, not a format bug; run this skill.
 
 ## Procedure
 
@@ -75,6 +78,19 @@ Explore agents / a workflow) rather than skimming one page.
 - Confirm that names/paths actually resolve: link/body/site names, mesh paths, schemes like
   `package://`, env vars. A name that's off by one underscore fails silently or in a confusing way.
 
+### 4b. For a wire / client-server protocol: read BOTH sides + the reference
+- **Enumerate the whole org first** — `gh repo list <ORG> --limit 100`. A capability you think is
+  missing often lives in a sibling repo (we wrongly concluded "XRoboToolkit can't render to the
+  headset" from the SDK alone — the entire video pipeline was in repos we hadn't listed).
+- **Read both ends.** The **receiver** defines what's actually required; the **sender** shows the
+  exact params. Inferring one side from the other leaves gaps.
+- **Match the reference/sample impl exactly** — framing, byte order, and every transport/codec
+  param; don't leave defaults to chance (the reference set an explicit bitrate; we didn't).
+- **Honor any handshake** — receivers often send a config request first and expect the stream to
+  match; don't just blast data.
+- Read source without cloning: `gh api "repos/<O>/<R>/git/trees/<B>?recursive=1" --jq '.tree[].path'`
+  (quote the URL — `?` is a glob), then `gh api "repos/<O>/<R>/contents/<P>" --jq .content | base64 -d`.
+
 ### 5. Implement, citing the source
 - Model the code on the canonical example. In a comment, **cite the doc/example/issue** you
   followed (repo path or URL + version).
@@ -104,6 +120,14 @@ formats and the framework's own behavior:
 
 Reading placo's MJCF support, the URDF/MJCF format conventions, and verifying the actual frame
 names up front would have avoided nearly all of it. That is exactly steps 2–4 above.
+
+**A second case — streaming sim video to the Quest.** It "half-worked": the first keyframe decoded
+(the arm flashed in the headset) then the connection dropped. We'd read only the *sender* and
+inferred the protocol. Reading the *receiver* (`CameraDataReceiver.cpp`, the Quest's
+`MediaDecoderTextureViewTCP.java`) and the *reference sender* (`CameraDataSender.cpp` +
+`H264Encoder.cpp`) showed the framing was right but we'd improvised the **negotiation** — ignoring
+the Quest's `StartReceivePcCamera` params and direct-connecting with a guessed resolution/bitrate.
+Reading both ends + the reference up front (step 4b) would have shown it.
 
 ## Reference layout (convention)
 
