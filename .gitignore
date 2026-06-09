@@ -21,3 +21,4 @@ env/
 logs/
 data/
 *.log
+.gstack/

@@ -71,8 +71,11 @@
     <position name="joint6" joint="joint6" kp="100" kv="6"/>
   </actuator>
 
-  <!-- Startup pose; the controller resets to key "home" on launch. -->
+  <!-- Startup/home pose, captured from the REAL YAM (read_yam_home.py on can0, zero-torque
+       encoder read). J3 clamped to its 0 lower limit. The controller resets here on launch
+       and GO_HOME eases back to it. -->
   <keyframe>
-    <key name="home" qpos="0 1.0 1.0 0 0 0" ctrl="0 1.0 1.0 0 0 0"/>
+    <key name="home" qpos="-0.02842 0.00134 0.0 -0.10014 -0.0555 -0.22717"
+                     ctrl="-0.02842 0.00134 0.0 -0.10014 -0.0555 -0.22717"/>
   </keyframe>
 </mujoco>

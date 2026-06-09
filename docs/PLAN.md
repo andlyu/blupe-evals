@@ -74,6 +74,10 @@ Two relationships, not one — **we own teleop; the user owns the policy.** One 
    **eased to a home pose under control first, then torque-off / disconnect** — so it never drops or
    ends in a bad configuration. (Uses `Robot.home()` then the safe torque-off sequence.) The
    watchdog-limp is only the *uncontrolled* fallback for a crash / network drop, not the normal path.
+6. **Move-to-home is speed-limited.** Every move to the home pose — the `GO_HOME` state *and* the
+   shutdown path — must obey a **rate-independent max-speed cap** (rad/s): the arm eases home
+   **slowly and predictably**, never a fast snap. (A per-frame step clamp varies with loop rate; the
+   cap must be in rad/s, same as the teleop velocity cap in #1.)
 
 Boundary: **we own teleop + oversight; the user owns the policy's commands** (we halt it, we don't
 rewrite it); a physical E-stop stays theirs. Sim holds on stop; on an uncontrolled drop the real YAM
