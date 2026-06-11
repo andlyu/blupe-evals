@@ -74,14 +74,16 @@ via `start_joints` handshake, cameras; starts what's down) → headset LISTEN + 
 
 ## Open issues / next subtasks
 
-1. **Headset video black (ACTIVE).** Sender connects to Quest:12345 and streams (verified), port
-   open, frames flowing, no VIEW mix-up; app restart did NOT fix. Ruled out: relay (26 fps to
-   Mac), camera relay, encoder running. Next steps: (a) check Remote Vision **Video Source
-   dropdown** (resets; must match what worked before); (b) build the **fleet-UI camera view**
-   (below) to prove robot→browser path; (c) add frame/keyframe send logging to `VideoStreamer`;
-   (d) try the known-good standalone `scripts/orin/sim_video_sender.py` FROM THE MAC at the
-   Quest to isolate eval-encoder vs app; (e) headset reboot. Suspect list: app's decoder/panel
-   state, source-IP filtering in the app, encoder SPS timing after many reconnects.
+1. **Headset video "black" — SOLVED (root cause: decode backlog, not a broken stream).**
+   When the Quest sleeps, its app freezes but its TCP stack keeps buffering; the sender pumps
+   ~4 Mbit/s into kernel buffers on both ends. On wake the decoder plays the backlog IN ORDER →
+   first "black", later **old frames**, never catching up. The stream was time-shifted, never
+   broken (confirmed by user seeing stale camera frames). Workaround: re-press LISTEN (fresh
+   socket = current frames). Structural fix for the video transport rework: **small SO_SNDBUF
+   (~128 KB) + drop frames on backpressure** so the sender can never queue more than a fraction
+   of a second; the stereo flow (Quest dials us, fresh session per panel-open) also resets this
+   inherently. Measured: camera composite encodes at ~4 Mbit/s, 62 KB keyframes (content is NOT
+   the issue; cv2 URL reads verified at 24–31 fps with real content).
 2. **Fleet UI camera view** ("Turn ON lets us view cameras"). Design ready: relay gains
    `Relay.open_channel(robot_id, port)` (reuse pending/open machinery), HTTP route
    `/cam/<robot>/<idx>?token=` that opens a channel to robot :8089, writes a raw
