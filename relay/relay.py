@@ -178,6 +178,22 @@ class Relay:
         else:
             writer.close()
 
+    async def open_channel(self, robot_id, port):
+        """Open a data channel to a robot's local port (same machinery operators use)."""
+        rob = self.robots.get(robot_id)
+        if rob is None:
+            raise ConnectionError(f"robot '{robot_id}' offline")
+        conn_id = next(self.ids)
+        fut = asyncio.get_running_loop().create_future()
+        self.pending[conn_id] = fut
+        _send(rob.writer, {"open": port, "conn": conn_id})
+        await rob.writer.drain()
+        try:
+            return await asyncio.wait_for(fut, timeout=OPEN_TIMEOUT_S)
+        except Exception:
+            self.pending.pop(conn_id, None)
+            raise
+
     # ---- fleet commands ------------------------------------------------------ #
     async def command(self, robot_id, cmd):
         rob = self.robots.get(robot_id)
@@ -228,23 +244,46 @@ async function cmd(robot, c, btn){ btn.disabled = true; btn.textContent = c + '�
   const r = await api('/api/cmd?robot=' + robot + '&cmd=' + c);
   document.getElementById('out-' + robot).textContent = JSON.stringify(r, null, 2);
   btn.disabled = false; btn.textContent = ({arm_on:'Turn ON',arm_off:'Turn OFF',preflight:'Check'})[c];
+  if (c === 'arm_on' && r.ok && r.data && (r.data.result === 'ON' || r.data.result === 'already on'))
+    showCams(robot, true);                                  // ON => show what the arm sees
   refresh(); }
+function showCams(id, on){
+  const d = document.getElementById('cams-' + id);
+  const btn = document.getElementById('camsbtn-' + id);
+  if (on === undefined) on = !d.hasChildNodes();
+  d.innerHTML = on ? ['0','2'].map(i =>
+    `<img src="/cam/${id}/${i}?token=${TOKEN}" width="340"
+          style="border-radius:6px;margin:6px 8px 0 0" alt="camera ${i}">`).join('') : '';
+  btn.textContent = on ? 'Hide cameras' : 'Cameras'; }
+function card(id){                                          // built ONCE; refresh only edits text
+  const el = document.createElement('div'); el.className = 'arm'; el.id = 'arm-' + id;
+  el.innerHTML = `<span class="name">${id}</span> <span class="on" id="st-${id}"></span>
+    <div class="ops" id="ops-${id}"></div>
+    <button class="primary" onclick="cmd('${id}','arm_on',this)">Turn ON</button>
+    <button class="danger" onclick="cmd('${id}','arm_off',this)">Turn OFF</button>
+    <button onclick="cmd('${id}','preflight',this)">Check</button>
+    <button id="camsbtn-${id}" onclick="showCams('${id}')">Cameras</button>
+    <div id="cams-${id}"></div>
+    <pre id="out-${id}"></pre>`;
+  document.getElementById('arms').appendChild(el); return el; }
 async function refresh(){
   const s = await api('/api/status'); const div = document.getElementById('arms');
-  const ids = Object.keys(s); if(!ids.length){ div.innerHTML = '<p class="muted">no arms online</p>'; return; }
-  div.innerHTML = ids.map(id => {
-    const r = s[id];
-    const ops = r.channels.length
-      ? r.channels.map(c => `port ${c.port} ← ${c.peer} (${c.for_s}s)`).join('<br>')
+  const ids = Object.keys(s);
+  if (div.textContent === 'loading…' || (!ids.length && !div.querySelector('.arm')))
+    div.innerHTML = ids.length ? '' : '<p class="muted">no arms online</p>';
+  for (const el of div.querySelectorAll('.arm'))            // mark offline arms, keep cards
+    if (!ids.includes(el.id.slice(4))) el.style.opacity = 0.4;
+  for (const id of ids){
+    const el = document.getElementById('arm-' + id) || card(id);
+    el.style.opacity = 1;
+    document.getElementById('st-' + id).textContent = `● online ${s[id].online_s}s`;
+    document.getElementById('ops-' + id).innerHTML = s[id].channels.length
+      ? s[id].channels.map(c => `port ${c.port} ← ${c.peer} (${c.for_s}s)`).join('<br>')
       : 'no operator connected';
-    const pf = r.last_preflight ? JSON.stringify(r.last_preflight.data, null, 2) : '';
-    return `<div class="arm"><span class="name">${id}</span>
-      <span class="on">● online ${r.online_s}s</span>
-      <div class="ops">${ops}</div>
-      <button class="primary" onclick="cmd('${id}','arm_on',this)">Turn ON</button>
-      <button class="danger" onclick="cmd('${id}','arm_off',this)">Turn OFF</button>
-      <button onclick="cmd('${id}','preflight',this)">Check</button>
-      <pre id="out-${id}">${pf}</pre></div>`; }).join('');
+    const pre = document.getElementById('out-' + id);
+    if (!pre.textContent && s[id].last_preflight)
+      pre.textContent = JSON.stringify(s[id].last_preflight.data, null, 2);
+  }
 }
 refresh(); setInterval(refresh, 5000);
 </script></body></html>"""
@@ -260,6 +299,26 @@ async def _http_ui(relay, args):
             url = urllib.parse.urlparse(target)
             q = urllib.parse.parse_qs(url.query)
             token_ok = (q.get("token", [""])[0] == relay.admin_token)
+
+            if url.path.startswith("/cam/") and token_ok:
+                # /cam/<robot>/<idx> -> open a channel to the robot's camera relay (:8089),
+                # send a raw GET, splice the multipart-MJPEG response verbatim to the browser.
+                _, _, rid, idx = url.path.split("/", 3)
+                rr, rw = await relay.open_channel(rid, 8089)
+                rw.write(f"GET /{idx} HTTP/1.1\r\nHost: cam\r\n\r\n".encode())
+                await rw.drain()
+                try:
+                    while True:
+                        data = await rr.read(65536)
+                        if not data:
+                            break
+                        writer.write(data)
+                        await writer.drain()
+                except (ConnectionError, OSError):
+                    pass
+                finally:
+                    rw.close()
+                return
 
             if url.path == "/" :
                 body, ctype, code = UI_HTML, "text/html", 200
