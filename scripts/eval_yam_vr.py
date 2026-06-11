@@ -321,7 +321,8 @@ def main(quest_ip: str, port: int = 12345, policy: Optional[str] = None,
 
     state, connect_arm, highlight, centered, prev_sel = "HOLD", False, 0, True, False
     prev = {b: False for b in E.SHORTCUT}
-    menu = list(E.MENU) + ["RELAUNCH"]   # RELAUNCH = soft reset after QUIT (re-home, ready)
+    menu = list(E.MENU) + ["VIEW", "RELAUNCH"]   # VIEW = cameras<->sim; RELAUNCH = soft reset
+    view_sim = False                     # False = camera composite (when available); True = sim render
     link = None                          # RobotLink when CONNECT is on (sim joints -> real arm)
     gripper_open = True                   # gripper toggle state (starts open); flips on each trigger press
     trig_prev = False                    # right index trigger as a button, for rising-edge detection
@@ -343,8 +344,11 @@ def main(quest_ip: str, port: int = 12345, policy: Optional[str] = None,
             console.start(run_loop)
 
     def choose(opt):
-        nonlocal connect_arm, state, link
-        if opt == "CONNECT":
+        nonlocal connect_arm, state, link, view_sim
+        if opt == "VIEW":
+            view_sim = not view_sim
+            print(f"[eval] view -> {'SIM' if view_sim else 'CAMERAS'}", flush=True)
+        elif opt == "CONNECT":
             connect_arm = not connect_arm
             if connect_arm:
                 link = RobotLink(serve_host, serve_port)
@@ -448,7 +452,7 @@ def main(quest_ip: str, port: int = 12345, policy: Optional[str] = None,
                 mujoco.mj_step(m, d)
 
             if t0 - last_render >= render_period:
-                cam_rgb = grabber.latest()                 # real camera frame (RGB), or None
+                cam_rgb = None if view_sim else grabber.latest()   # VIEW toggle; None -> sim render
                 if cam_rgb is None:                        # fallback: render the sim
                     renderer.update_scene(d, cam)
                     cam_rgb = renderer.render().copy()
