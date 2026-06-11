@@ -352,7 +352,17 @@ class Arm:
         return checks
 
     async def arm_on(self):
+        """ON = headset-ready: cameras streaming + serve up with motors answering. The
+        operator still explicitly CONNECTs in the headset — that handoff stays deliberate."""
         pre = await self.preflight()
+        if pre["camera"] != "ok":                  # cameras are part of 'operable'
+            await asyncio.create_subprocess_shell(
+                f"exec {self.args.camera_cmd}", start_new_session=True,
+                stdout=open("/tmp/camera_managed.log", "ab"), stderr=asyncio.subprocess.STDOUT)
+            await asyncio.sleep(3)
+            pre = await self.preflight()
+            if pre["camera"] != "ok":
+                return {"result": "REFUSED: cameras won't start", "preflight": pre}
         if pre["serve"]["up"]:
             return {"result": "already on", "preflight": pre}
         if pre["can"] != "UP":
@@ -375,13 +385,20 @@ class Arm:
         if self.proc is not None and self.proc.returncode is None:
             self.proc.kill()                       # SIGINT is swallowed by i2rt; kill + turn_off
             killed.append("managed serve")
-        rc, _ = await self._sh("pkill -9 -f 'yam_real_serve'")
-        if rc == 0:
-            killed.append("external serve")
+        try:
+            rc, _ = await self._sh("pkill -9 -f 'yam_real_serve'")
+            if rc == 0:
+                killed.append("external serve")
+        except asyncio.TimeoutError:
+            killed.append("pkill timed out")
         await asyncio.sleep(0.5)
-        rc, out = await self._sh(self.args.turnoff_cmd, timeout=30)
-        return {"result": "OFF (torque cut)" if rc == 0 else f"turn_off rc={rc}",
-                "killed": killed or ["nothing running"], "turnoff_tail": out.splitlines()[-1] if out else ""}
+        try:
+            rc, out = await self._sh(self.args.turnoff_cmd, timeout=40)
+            result = "OFF (torque cut)" if rc == 0 else f"turn_off rc={rc}"
+            tail = out.splitlines()[-1] if out else ""
+        except asyncio.TimeoutError:
+            result, tail = "serve killed; turn_off TIMED OUT (arm powered?)", ""
+        return {"result": result, "killed": killed or ["nothing running"], "turnoff_tail": tail}
 
 
 async def _robot_data(args, conn_id, port):
@@ -419,7 +436,7 @@ async def role_robot(args):
                 try:
                     data = await cmds[name]()
                 except Exception as e:
-                    data = {"result": f"agent error: {e}"}
+                    data = {"result": f"agent error: {type(e).__name__}: {e}"}
                 _send(writer, {"resp": req, "data": data})
                 await writer.drain()
                 print(f"[agent] cmd {name} -> {json.dumps(data)[:120]}", flush=True)
@@ -502,6 +519,8 @@ def main():
         "~/i2rt/.venv/bin/python ~/blupe-evals/YAM_control/yam_real_serve.py --channel can0"))
     r.add_argument("--turnoff-cmd", default=os.path.expanduser(
         "~/i2rt/.venv/bin/python ~/blupe-evals/YAM_control/turn_off.py --channel can0"))
+    r.add_argument("--camera-cmd", default=os.path.expanduser(
+        "~/miniforge3/envs/xr/bin/python ~/blupe-evals/YAM_control/camera_relay.py --devices 0 2"))
 
     o = sub.add_parser("operator")
     o.add_argument("--relay", required=True)
