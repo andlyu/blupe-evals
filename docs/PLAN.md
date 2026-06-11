@@ -211,6 +211,16 @@ processing.** Diagrams: `docs/remote-topology.png` (where things run, ports, bui
   the Mac, re-encoded to the Quest locally). Heavy/latency-sensitive traffic (video, input)
   never leaves the operator's Wi-Fi. WAN drop = serve holds = fail-safe.
 
+## Customer transport (decided 2026-06-11)
+
+For customers, **no VPN — the robot node dials OUT to a relay we host** (outbound-only TLS
+on 443: WSS v1, WebRTC/LiveKit endgame with camera frames as video tracks). The relay gives
+us auth (per-robot tokens), tenancy, audit/metering, and a server-side kill switch. Tailscale
+remains the tool for OUR machines and design-partner pilots only. Our seams are already
+direction-agnostic byte streams (joints JSON, camera frames), so this swaps transports in
+`RobotLink`/the relays without touching robot-side safety (clamp, hold-on-drop, watchdog).
+Needed from us: hosted relay + token issuance + dial-out wrappers on both ends + kill endpoint.
+
 ## Decisions still to pin
 1. Sim-first — enforced gate vs. recommended.
 2. Minimum report contents; video/episode capture v1 vs. later.

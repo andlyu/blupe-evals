@@ -238,19 +238,23 @@ class CameraGrabber:
             print("[camera] cv2 unavailable -> sim render", flush=True)
             return
         for dev in devices:
-            if dev < 0:
-                continue
-            cap = cv2.VideoCapture(dev)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            cap.set(cv2.CAP_PROP_FPS, fps)
+            dev = int(dev) if str(dev).lstrip("-").isdigit() else str(dev)
+            if isinstance(dev, int):                   # local device index
+                if dev < 0:
+                    continue
+                cap = cv2.VideoCapture(dev)
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                cap.set(cv2.CAP_PROP_FPS, fps)
+            else:                                      # network stream (camera_relay.py URL)
+                cap = cv2.VideoCapture(dev)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)        # latest frame, low latency
             if cap.isOpened():
                 self.caps.append(cap)
-                print(f"[camera] /dev/video{dev} open", flush=True)
+                print(f"[camera] {dev} open", flush=True)
             else:
-                print(f"[camera] /dev/video{dev} failed to open", flush=True)
+                print(f"[camera] {dev} failed to open", flush=True)
                 cap.release()
         if self.caps:
             print(f"[camera] {len(self.caps)} camera(s) -> headset (side-by-side)", flush=True)
@@ -292,7 +296,7 @@ class CameraGrabber:
 
 def main(quest_ip: str, port: int = 12345, policy: Optional[str] = None,
          width: int = 960, height: int = 540, fps: int = 30, scale_factor: float = 1.0,
-         cameras: list[int] = [0, 2],
+         cameras: list[str] = ["0", "2"],
          serve_host: str = "127.0.0.1", serve_port: int = 5599):
     cfg = {"right_hand": {"link_name": E.EE, "pose_source": "right_controller",
                           "control_trigger": "right_grip", "vis_target": "right_target",
