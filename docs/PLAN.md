@@ -109,6 +109,12 @@ Sequencing: **sim-readiness first, then merge to hardware.** The headline artifa
 9. Set **real EE site, gripper, CAN/joint config, watchdog + torque-off**.
 10. Set **`SafeRobot` params**: velocity cap + workspace box.
 11. **Sim-first verify** the run loop, then swap in the real `Robot`. ✅ hardware-ready.
+12. **Verify the robot is being served** — before relying on the connection, run
+    **`scripts/orin/check_serve.py`** (exit 0 = served). The serve replies with its `start_joints`
+    handshake *only* once the real arm is actually connected, so a down serve / powered-off arm /
+    dead CAN is caught **at setup** — not discovered mid-eval when you suddenly can't connect and it
+    becomes a whole mess. (`--hold` also exercises the command path.) Live equivalent: the headset
+    HUD shows **`ROBOT OFF`** until the `CONNECT` mirror receives that handshake. ✅ served.
 
 ### Integrate a policy — checklist (parallel)
 - Seam: implement **`run(robot, stop)`** (calls their model, their cadence) — or a simpler
@@ -183,8 +189,29 @@ Remote bar — same-LAN or true over-the-internet operation?
 - **New:** input-seam abstraction, run-log + report, camera publish/record, the doctor/setup,
   the network seam.
 
+## Remote topology (decided 2026-06-10)
+
+Resolves "remote bar" (was open question 4): **internet, via tailnet, with operator-side
+processing.** Diagrams: `docs/remote-topology.png` (where things run, ports, build status) and
+`docs/what-happens-where.png` (what each piece does). Protocol: `docs/XR-INPUT-BRIDGE.md`.
+
+- **Operator site (anywhere):** Quest (stock app, zero changes) + a **Mac laptop** on the same
+  local Wi-Fi. The Quest's NAT-hostile link (video is *inbound* to Quest:12345) stays local;
+  the Quest never needs to be reachable across the internet.
+- **Mac = processing node.** The closed Linux-only PC Service + `xrobotoolkit_sdk` run in an
+  **arm64 Docker container** (`docker/xr-bridge/`) with a small bridge republishing XR state on
+  a socket; the eval (IK, sim, policy, HUD/encode) runs **natively on macOS** behind an input
+  seam (`XR_INPUT=bridge|sdk|stub` — this is also Part 4's input seam; `stub` enables headless
+  tests and keyboard later). Fallback if the service misbehaves in Docker: full Linux VM with
+  bridged networking.
+- **Robot site:** the Orin keeps only `YAM_control/yam_real_serve.py` (robot-side safety:
+  clamp, hold-on-drop, torque-off) + CAN. Safety authority stays robot-side per Part 1 #4.
+- **Cross-internet links (tailscale on Mac + Orin only):** the joints stream
+  (`--serve-host`, :5599 newline-JSON) and, at M2, camera frames Orin → Mac (HUD composited on
+  the Mac, re-encoded to the Quest locally). Heavy/latency-sensitive traffic (video, input)
+  never leaves the operator's Wi-Fi. WAN drop = serve holds = fail-safe.
+
 ## Decisions still to pin
 1. Sim-first — enforced gate vs. recommended.
 2. Minimum report contents; video/episode capture v1 vs. later.
 3. Input seam scope now (Quest only vs. Quest + keyboard).
-4. Remote bar — LAN vs. internet.

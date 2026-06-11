@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { margin: 0; background: #ffffff; font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; }
+  svg { display: block; }
+  .lane-title { font-size: 17px; font-weight: 800; fill: #1a2233; }
+  .lane-role { font-size: 12.5px; font-style: italic; fill: #556; }
+  .step { font-size: 12px; fill: #223; }
+  .step-b { font-size: 12px; font-weight: 700; fill: #223; }
+  .note { font-size: 10.5px; fill: #667; }
+  .mono { font-family: "SF Mono", Menlo, monospace; }
+  .flow-label { font-size: 12.5px; font-weight: 700; fill: #1a5c2e; }
+  .flow-note { font-size: 10.5px; fill: #557; }
+  .back-label { font-size: 12.5px; font-weight: 700; fill: #8a2be2; }
+  .sub-title { font-size: 12.5px; font-weight: 700; fill: #334; }
+  .insight { font-size: 13px; font-weight: 600; fill: #1a2233; }
+</style>
+</head>
+<body>
+<svg id="diagram" width="1240" height="730" viewBox="0 0 1240 730" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="fg" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#2c7a44"/>
+    </marker>
+    <marker id="fp" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#8a2be2"/>
+    </marker>
+    <marker id="fb" markerWidth="10" markerHeight="10" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#445"/>
+    </marker>
+  </defs>
+
+  <text x="620" y="34" text-anchor="middle" style="font-size:20px;font-weight:800;fill:#111">What happens where</text>
+  <text x="620" y="55" text-anchor="middle" style="font-size:13px;fill:#556">the journey of one controller motion, left → right · and the picture coming back</text>
+
+  <!-- ============ LANE 1: QUEST ============ -->
+  <rect x="24" y="80" width="240" height="520" rx="14" fill="#f2f7ff" stroke="#5b8bc9" stroke-width="2"/>
+  <text x="44" y="112" class="lane-title">QUEST</text>
+  <text x="44" y="130" class="lane-role">the operator's eyes &amp; hands</text>
+
+  <text x="44" y="166" class="step-b">SENSES the operator:</text>
+  <text x="44" y="188" class="step">• controller 6-DOF pose</text>
+  <text x="44" y="206" class="step">• grip = clutch (hold to drive)</text>
+  <text x="44" y="224" class="step">• trigger = open/close gripper</text>
+  <text x="44" y="242" class="step">• A·X·B·Y + stick = menu</text>
+
+  <text x="44" y="276" class="step-b">SHOWS the operator:</text>
+  <text x="44" y="298" class="step">• the video the laptop sends —</text>
+  <text x="44" y="316" class="step">&#160;&#160;that IS the whole UI</text>
+  <text x="44" y="334" class="step">&#160;&#160;(live arm + menu HUD)</text>
+
+  <text x="44" y="372" class="note">Runs the stock XRoboToolkit app.</text>
+  <text x="44" y="388" class="note">No robot knowledge. No changes.</text>
+  <text x="44" y="404" class="note">Does NO processing.</text>
+
+  <!-- ============ LANE 2: LAPTOP ============ -->
+  <rect x="294" y="80" width="356" height="520" rx="14" fill="#fdfdf2" stroke="#b8a930" stroke-width="2"/>
+  <text x="314" y="112" class="lane-title">LAPTOP (Mac)</text>
+  <text x="314" y="130" class="lane-role">the brain — ALL processing happens here</text>
+
+  <rect x="310" y="146" width="324" height="116" rx="8" fill="#f3f0fa" stroke="#9a86c8" stroke-width="1.5"/>
+  <text x="322" y="166" class="sub-title">Docker container — "the ear"</text>
+  <text x="322" y="186" class="step"><tspan class="step-b">PC Service</tspan> — hears the headset (<tspan class="mono">:63901</tspan>),</text>
+  <text x="322" y="202" class="step">&#160;&#160;republishes the feed locally</text>
+  <text x="322" y="220" class="step"><tspan class="step-b">SDK</tspan> — hands the feed to Python, unchanged</text>
+  <text x="322" y="238" class="step"><tspan class="step-b">bridge</tspan> — passes it out of the container</text>
+  <text x="322" y="254" class="note">input acquisition only — zero decisions</text>
+
+  <rect x="310" y="274" width="324" height="250" rx="8" fill="#eef4ee" stroke="#7aa87a" stroke-width="1.5"/>
+  <text x="322" y="294" class="sub-title">eval_yam_vr.py (native) — "the brain"</text>
+  <text x="322" y="316" class="step">1. read buttons → <tspan class="step-b">menu / state machine</tspan></text>
+  <text x="334" y="332" class="note mono">TELEOP · POLICY · GO_HOME · QUIT · CONNECT</text>
+  <text x="322" y="352" class="step">2. <tspan class="step-b">decide joint angles</tspan>, by state:</text>
+  <text x="334" y="370" class="step">TELEOP: IK — controller motion → 6 angles</text>
+  <text x="334" y="388" class="step">POLICY: the user's model drives instead</text>
+  <text x="334" y="406" class="step">GO_HOME: ease home, rate-capped</text>
+  <text x="322" y="426" class="step">3. <tspan class="step-b">our safety caps</tspan> — velocity-limit teleop</text>
+  <text x="322" y="446" class="step">4. <tspan class="step-b">step MuJoCo sim</tspan> with those angles</text>
+  <text x="322" y="466" class="step">5. <tspan class="step-b">render + HUD → H.264</tspan> → headset</text>
+  <text x="322" y="486" class="step">6. CONNECT on → <tspan class="step-b">same angles → Jetson</tspan></text>
+  <text x="322" y="502" class="note">one brain, one set of angles —</text>
+  <text x="322" y="516" class="note">sim view and real arm both consume it</text>
+
+  <text x="314" y="538" class="note">+ tailscale (tunnel to robot site)</text>
+  <text x="314" y="554" class="note">+ M2 later: real-camera relay replaces the sim render as video</text>
+
+  <!-- ============ LANE 3: JETSON ============ -->
+  <rect x="680" y="80" width="300" height="520" rx="14" fill="#f4fff4" stroke="#56a056" stroke-width="2"/>
+  <text x="700" y="112" class="lane-title">JETSON ORIN</text>
+  <text x="700" y="130" class="lane-role">obeys — but enforces its own safety</text>
+
+  <text x="700" y="164" class="sub-title">yam_real_serve.py</text>
+  <text x="700" y="186" class="step">1. receive joint targets <tspan class="mono">{"q","g"}</tspan></text>
+  <text x="700" y="206" class="step">2. <tspan class="step-b">re-clamp ≤ 0.6 rad/s</tspan> — its own</text>
+  <text x="700" y="222" class="step">&#160;&#160;&#160;backstop, trusts nobody upstream</text>
+  <text x="700" y="242" class="step">3. gripper <tspan class="step-b">bounded-lead walk</tspan></text>
+  <text x="700" y="258" class="step">&#160;&#160;&#160;(blocked jaw can't grind/crush)</text>
+  <text x="700" y="278" class="step">4. issue the actual CAN commands</text>
+
+  <text x="700" y="314" class="sub-title">Fail-safes (why distance is safe):</text>
+  <text x="700" y="336" class="step">• link drops → <tspan class="step-b">HOLD pose</tspan></text>
+  <text x="700" y="356" class="step">• shutdown msg / Ctrl-C → <tspan class="step-b">torque OFF</tspan></text>
+  <text x="700" y="376" class="step">• serve itself dies → watchdog limp</text>
+
+  <text x="700" y="412" class="note">Near-idle box: no IK, no sim, no UI.</text>
+  <text x="700" y="428" class="note">Just safety + CAN. The operator can</text>
+  <text x="700" y="444" class="note">never command around these limits.</text>
+
+  <text x="700" y="538" class="note">+ tailscale · + CAN up (setup_can.sh)</text>
+  <text x="700" y="554" class="note">+ M2 later: camera_sender → laptop</text>
+
+  <!-- ============ LANE 4: ARM ============ -->
+  <rect x="1010" y="80" width="206" height="520" rx="14" fill="#fff5f3" stroke="#c97b5b" stroke-width="2"/>
+  <text x="1030" y="112" class="lane-title">YAM ARM</text>
+  <text x="1030" y="130" class="lane-role">the body</text>
+
+  <text x="1030" y="166" class="step">• 6 Damiao joints +</text>
+  <text x="1030" y="184" class="step">&#160;&#160;gripper (ids 1–7)</text>
+  <text x="1030" y="208" class="step">• executes position</text>
+  <text x="1030" y="226" class="step">&#160;&#160;commands on <tspan class="mono">can0</tspan></text>
+  <text x="1030" y="250" class="step">• <tspan class="step-b">400 ms watchdog:</tspan></text>
+  <text x="1030" y="268" class="step">&#160;&#160;no commands → limp</text>
+  <text x="1030" y="286" class="step">&#160;&#160;(last-resort reflex)</text>
+
+  <text x="1030" y="322" class="note">No smarts. If the chain</text>
+  <text x="1030" y="338" class="note">above goes quiet, it goes</text>
+  <text x="1030" y="354" class="note">soft instead of wild.</text>
+
+  <!-- ============ FORWARD PATH (top band) ============ -->
+  <line x1="264" y1="218" x2="294" y2="218" stroke="#2c7a44" stroke-width="3" marker-end="url(#fg)"/>
+  <text x="279" y="98" text-anchor="middle" class="flow-label" transform="rotate(0)"></text>
+
+  <line x1="650" y1="218" x2="680" y2="218" stroke="#2c7a44" stroke-width="3" marker-end="url(#fg)"/>
+  <line x1="980" y1="218" x2="1010" y2="218" stroke="#2c7a44" stroke-width="3" marker-end="url(#fg)"/>
+
+  <!-- flow captions under top edge -->
+  <text x="279" y="640" text-anchor="middle" class="flow-label"></text>
+
+  <!-- ============ RETURN PATH (video) ============ -->
+  <path d="M 310 620 C 290 648, 250 648, 230 620" stroke="none" fill="none"/>
+  <line x1="294" y1="630" x2="264" y2="630" stroke="#8a2be2" stroke-width="3" marker-end="url(#fp)"/>
+
+  <!-- ============ FLOW LABELS BAND ============ -->
+  <text x="279" y="190" text-anchor="middle" class="flow-label" font-size="11">pose +</text>
+  <text x="279" y="204" text-anchor="middle" class="flow-label" font-size="11">buttons</text>
+  <text x="279" y="240" text-anchor="middle" class="flow-note">Wi-Fi</text>
+
+  <text x="665" y="190" text-anchor="middle" class="flow-label" font-size="11">joint</text>
+  <text x="665" y="204" text-anchor="middle" class="flow-label" font-size="11">angles</text>
+  <text x="665" y="240" text-anchor="middle" class="flow-note">tailnet</text>
+
+  <text x="995" y="190" text-anchor="middle" class="flow-label" font-size="11">CAN</text>
+  <text x="995" y="204" text-anchor="middle" class="flow-label" font-size="11">cmds</text>
+  <text x="995" y="240" text-anchor="middle" class="flow-note">wire</text>
+
+  <text x="279" y="616" text-anchor="middle" class="back-label" font-size="11">video</text>
+  <text x="279" y="652" text-anchor="middle" class="flow-note">sim render + HUD (M2: real camera)</text>
+
+  <!-- ============ INSIGHT FOOTER ============ -->
+  <rect x="24" y="672" width="1192" height="44" rx="10" fill="#fafafa" stroke="#ccc"/>
+  <text x="620" y="699" text-anchor="middle" class="insight">Quest senses &amp; shows · Laptop decides · Jetson obeys + enforces · Arm moves — and every layer to the right survives the layer to its left disappearing.</text>
+</svg>
+</body>
+</html>

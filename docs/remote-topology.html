@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { margin: 0; background: #ffffff; font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; }
+  svg { display: block; }
+  .site-label { font-size: 17px; font-weight: 700; fill: #334; }
+  .site-sub { font-size: 12.5px; fill: #667; }
+  .box-title { font-size: 14.5px; font-weight: 700; fill: #1a2233; }
+  .box-sub { font-size: 11.5px; fill: #556; }
+  .mono { font-family: "SF Mono", Menlo, monospace; }
+  .item { font-size: 12px; fill: #223; }
+  .item-note { font-size: 10.5px; fill: #667; }
+  .arrow-label { font-size: 12px; font-weight: 600; fill: #1a5c2e; }
+  .arrow-note { font-size: 10.5px; fill: #557; }
+  .todo { fill: #9a6200; }
+  .todo-label { font-size: 12px; font-weight: 600; fill: #9a6200; }
+  .legend { font-size: 12px; fill: #334; }
+</style>
+</head>
+<body>
+<svg id="diagram" width="1240" height="780" viewBox="0 0 1240 780" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ag" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#2c7a44"/>
+    </marker>
+    <marker id="ao" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#c07f00"/>
+    </marker>
+    <marker id="ab" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#445"/>
+    </marker>
+  </defs>
+
+  <text x="620" y="34" text-anchor="middle" style="font-size:20px;font-weight:800;fill:#111">blupe-evals — remote operation topology</text>
+  <text x="620" y="56" text-anchor="middle" style="font-size:13px;fill:#556">headset off the robot LAN · laptop = processing node · safety authority stays robot-side</text>
+
+  <!-- ============ OPERATOR SITE ============ -->
+  <rect x="22" y="84" width="568" height="556" rx="14" fill="#f2f7ff" stroke="#b8cce8" stroke-width="1.5"/>
+  <text x="40" y="112" class="site-label">OPERATOR SITE</text>
+  <text x="40" y="130" class="site-sub">anywhere — home, office, hotel · devices share local Wi-Fi</text>
+
+  <!-- Quest box -->
+  <rect x="44" y="158" width="206" height="190" rx="10" fill="#ffffff" stroke="#5b8bc9" stroke-width="2"/>
+  <text x="60" y="184" class="box-title">Quest headset</text>
+  <text x="60" y="201" class="box-sub">XRoboToolkit app — ZERO changes</text>
+  <text x="60" y="226" class="item">• dials OUT to laptop <tspan class="mono">:63901</tspan></text>
+  <text x="60" y="244" class="item">&#160;&#160;(manual IP entry, no discovery)</text>
+  <text x="60" y="266" class="item">• LISTENs <tspan class="mono">:12345</tspan> for video</text>
+  <text x="60" y="284" class="item">&#160;&#160;(sender connects in — that's</text>
+  <text x="60" y="300" class="item">&#160;&#160;why it must stay local-only)</text>
+  <text x="60" y="326" class="item-note">no VPN, no sideload, no port-fwd</text>
+
+  <!-- Laptop box -->
+  <rect x="318" y="158" width="252" height="452" rx="10" fill="#ffffff" stroke="#5b8bc9" stroke-width="2"/>
+  <text x="334" y="184" class="box-title">Laptop — processing node</text>
+  <text x="334" y="201" class="box-sub">Linux x86_64 (NOT the Mac) — install replay of ORIN-SETUP.md</text>
+
+  <rect x="334" y="216" width="220" height="56" rx="6" fill="#eef4ee" stroke="#7aa87a"/>
+  <text x="344" y="236" class="item" style="font-weight:700">PC Service <tspan class="item-note">(RoboticsService)</tspan></text>
+  <text x="344" y="253" class="item-note"><tspan class="mono">*:63901</tspan> Quest · <tspan class="mono">127.0.0.1:60061</tspan> SDK</text>
+
+  <rect x="334" y="282" width="220" height="50" rx="6" fill="#eef4ee" stroke="#7aa87a"/>
+  <text x="344" y="302" class="item" style="font-weight:700">xrobotoolkit_sdk</text>
+  <text x="344" y="319" class="item-note">localhost gRPC → MUST sit with PC Service</text>
+
+  <rect x="334" y="342" width="220" height="118" rx="6" fill="#eef4ee" stroke="#7aa87a"/>
+  <text x="344" y="362" class="item" style="font-weight:700">eval_yam_vr.py</text>
+  <text x="344" y="381" class="item">• gate / state machine (Console)</text>
+  <text x="344" y="398" class="item">• placo IK · MuJoCo sim · policy</text>
+  <text x="344" y="415" class="item">• HUD overlay + H.264 encode</text>
+  <text x="344" y="437" class="todo-label">⚠ --serve-host flag: TO ADD</text>
+  <text x="344" y="452" class="item-note todo">(RobotLink hardcodes 127.0.0.1 today)</text>
+
+  <rect x="334" y="470" width="220" height="40" rx="6" fill="#fff7e8" stroke="#d9a33a" stroke-dasharray="5,4"/>
+  <text x="344" y="495" class="todo-label">tailscale — to install</text>
+
+  <rect x="334" y="520" width="220" height="74" rx="6" fill="#fff7e8" stroke="#d9a33a" stroke-dasharray="5,4"/>
+  <text x="344" y="540" class="todo-label">M2: camera relay — to build</text>
+  <text x="344" y="557" class="item-note">recv Orin camera frames → HUD</text>
+  <text x="344" y="572" class="item-note">overlay → re-encode → Quest</text>
+
+  <!-- Quest <-> Laptop arrows -->
+  <line x1="250" y1="220" x2="318" y2="220" stroke="#2c7a44" stroke-width="2.5" marker-end="url(#ag)"/>
+  <text x="284" y="206" text-anchor="middle" class="arrow-label">input</text>
+  <text x="284" y="238" text-anchor="middle" class="arrow-note mono">:63901</text>
+
+  <line x1="318" y1="296" x2="250" y2="296" stroke="#2c7a44" stroke-width="2.5" marker-end="url(#ag)"/>
+  <text x="284" y="282" text-anchor="middle" class="arrow-label">video</text>
+  <text x="284" y="314" text-anchor="middle" class="arrow-note mono">:12345</text>
+
+  <text x="284" y="345" text-anchor="middle" class="arrow-note" style="font-weight:600">local Wi-Fi</text>
+  <text x="284" y="360" text-anchor="middle" class="arrow-note">~2–5 Mbps video stays local</text>
+
+  <!-- ============ INTERNET BAND ============ -->
+  <rect x="606" y="84" width="160" height="556" rx="14" fill="#fbf6ec" stroke="#e0cda0" stroke-width="1.5"/>
+  <text x="686" y="112" text-anchor="middle" class="site-label" style="fill:#7a5c10">INTERNET</text>
+  <text x="686" y="130" text-anchor="middle" class="todo-label">tailnet (WireGuard)</text>
+  <text x="686" y="146" text-anchor="middle" class="item-note todo">to install — both ends</text>
+  <text x="686" y="170" text-anchor="middle" class="item-note">no router config,</text>
+  <text x="686" y="185" text-anchor="middle" class="item-note">encrypted for free</text>
+
+  <!-- ============ ROBOT SITE ============ -->
+  <rect x="782" y="84" width="436" height="556" rx="14" fill="#f4fff4" stroke="#a8d8a8" stroke-width="1.5"/>
+  <text x="800" y="112" class="site-label">ROBOT SITE</text>
+  <text x="800" y="130" class="site-sub">the arm's LAN — 192.168.0.x</text>
+
+  <!-- Orin box -->
+  <rect x="804" y="158" width="392" height="298" rx="10" fill="#ffffff" stroke="#56a056" stroke-width="2"/>
+  <text x="820" y="184" class="box-title">Jetson Orin — robot node</text>
+  <text x="820" y="201" class="box-sub mono">andrew@192.168.0.185 · near-idle: safety + CAN only</text>
+
+  <rect x="820" y="216" width="360" height="108" rx="6" fill="#eef4ee" stroke="#7aa87a"/>
+  <text x="830" y="236" class="item" style="font-weight:700">yam_real_serve.py <tspan class="mono">0.0.0.0:5599</tspan> <tspan style="fill:#2c7a44;font-weight:700">✓ EXISTS</tspan></text>
+  <text x="830" y="255" class="item">• velocity clamp 0.6 rad/s (robot-side backstop)</text>
+  <text x="830" y="272" class="item">• connection drop → HOLD pose (fail-safe)</text>
+  <text x="830" y="289" class="item">• shutdown / Ctrl-C → torque OFF (limp)</text>
+  <text x="830" y="306" class="item">• gripper bounded-lead walk (no crush)</text>
+
+  <rect x="820" y="334" width="360" height="40" rx="6" fill="#fff7e8" stroke="#d9a33a" stroke-dasharray="5,4"/>
+  <text x="830" y="359" class="todo-label">tailscale — to install</text>
+
+  <rect x="820" y="384" width="360" height="56" rx="6" fill="#fff7e8" stroke="#d9a33a" stroke-dasharray="5,4"/>
+  <text x="830" y="404" class="todo-label">M2: camera_sender.py → relay via laptop</text>
+  <text x="830" y="421" class="item-note">exists for direct webcam→Quest; reroute to laptop for HUD</text>
+
+  <!-- YAM arm -->
+  <rect x="860" y="498" width="280" height="104" rx="10" fill="#ffffff" stroke="#56a056" stroke-width="2"/>
+  <text x="876" y="526" class="box-title">YAM arm + gripper</text>
+  <text x="876" y="546" class="item">6× Damiao (DM4340/4310) + gripper</text>
+  <text x="876" y="564" class="item mono">motor ids 1–7 · ~400 ms watchdog</text>
+  <text x="876" y="582" class="item-note">no command 400 ms → limp (last-resort fallback)</text>
+
+  <line x1="1000" y1="456" x2="1000" y2="498" stroke="#445" stroke-width="2.5" marker-end="url(#ab)"/>
+  <text x="1014" y="481" class="arrow-note mono" style="font-weight:600">can0 (CAN bus, 1 Mbps)</text>
+
+  <!-- ============ CROSS-INTERNET ARROWS ============ -->
+  <!-- joints: laptop -> orin -->
+  <line x1="570" y1="402" x2="804" y2="270" stroke="#c07f00" stroke-width="2.5" marker-end="url(#ao)"/>
+  <text x="687" y="310" text-anchor="middle" class="todo-label">joints stream</text>
+  <text x="687" y="326" text-anchor="middle" class="arrow-note mono">:5599 {"q":[6],"g":0..1} newline-JSON</text>
+  <text x="687" y="341" text-anchor="middle" class="arrow-note">tiny · ← start_joints handshake (no-jump)</text>
+
+  <!-- M2 camera: orin -> laptop -->
+  <line x1="804" y1="412" x2="570" y2="540" stroke="#c07f00" stroke-width="2" stroke-dasharray="6,5" marker-end="url(#ao)"/>
+  <text x="687" y="500" text-anchor="middle" class="todo-label">M2: camera frames</text>
+  <text x="687" y="515" text-anchor="middle" class="arrow-note">(sim mode: video is rendered on laptop)</text>
+
+  <!-- ============ LEGEND ============ -->
+  <rect x="22" y="664" width="1196" height="92" rx="10" fill="#fafafa" stroke="#ccc"/>
+  <text x="40" y="690" class="legend" style="font-weight:700">Legend</text>
+  <line x1="110" y1="686" x2="150" y2="686" stroke="#2c7a44" stroke-width="2.5" marker-end="url(#ag)"/>
+  <text x="158" y="690" class="legend">implemented &amp; verified (protocols read from source, proven on LAN)</text>
+  <line x1="110" y1="712" x2="150" y2="712" stroke="#c07f00" stroke-width="2.5" marker-end="url(#ao)"/>
+  <text x="158" y="716" class="legend">seam exists, deployment to do (flag / installs)</text>
+  <rect x="660" y="700" width="26" height="16" rx="4" fill="#fff7e8" stroke="#d9a33a" stroke-dasharray="5,4"/>
+  <text x="694" y="713" class="legend">component to install / build</text>
+  <text x="40" y="742" class="legend" style="fill:#556">Fail-safe chain: WAN drop → serve HOLDS pose · serve dies → 400 ms watchdog → limp · QUIT → ease home (rad/s-capped) → torque off.</text>
+</svg>
+</body>
+</html>
