@@ -11,6 +11,8 @@ Consume:  http://<orin>:8089/0  and  http://<orin>:8089/2   (one stream per devi
 """
 
 import argparse
+import select
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,11 +42,18 @@ class Cam:
         print(f"[relay] /dev/video{dev}: {'open' if self.ok else 'FAILED'}", flush=True)
 
     def _run(self):
+        n = 0
         while True:
             ok, bgr = self.cap.read()
             if not ok:
                 time.sleep(0.1)
                 continue
+            n += 1
+            # Staleness diagnostic: burn capture wall-time + frame counter into the pixels, so
+            # EVERY consumer (browser, eval, headset) displays how old the frame it shows is.
+            stamp = f"{time.strftime('%H:%M:%S')}.{int((time.time() % 1) * 10)} #{n}"
+            cv2.rectangle(bgr, (0, 0), (250, 28), (0, 0, 0), -1)
+            cv2.putText(bgr, stamp, (6, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
             ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
             if ok:
                 with self.lock:
@@ -64,20 +73,31 @@ class Handler(BaseHTTPRequestHandler):
         if cam is None or not cam.ok:
             self.send_error(404, f"no camera {key!r}; have {sorted(CAMS)}")
             return
+        # Small send buffer + drop-on-backpressure: a slow consumer (Wi-Fi dip, cloud-relay
+        # congestion) must get FEWER frames, not OLDER frames. Blocking writes with a big
+        # default buffer queue seconds of video in TCP and the stream never catches up.
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 128 * 1024)
         self.send_response(200)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.end_headers()
         print(f"[relay] client {self.client_address} -> /{key}", flush=True)
+        last = None
         try:
             while True:
                 with cam.lock:
                     jpeg = cam.jpeg
-                if jpeg is not None:
-                    self.wfile.write(BOUNDARY + b"\r\n")
-                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                    self.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode())
-                    self.wfile.write(jpeg + b"\r\n")
-                time.sleep(1.0 / 30)
+                if jpeg is None or jpeg is last:       # only NEW frames (fps trap: re-sending
+                    time.sleep(0.005)                  # dupes wastes the path's bandwidth)
+                    continue
+                _, writable, _ = select.select([], [self.connection], [], 0)
+                if not writable:                       # client stalled -> drop, stay current
+                    time.sleep(1.0 / 30)
+                    continue
+                last = jpeg
+                self.wfile.write(BOUNDARY + b"\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode())
+                self.wfile.write(jpeg + b"\r\n")
         except (BrokenPipeError, ConnectionResetError):
             print(f"[relay] client {self.client_address} left /{key}", flush=True)
 

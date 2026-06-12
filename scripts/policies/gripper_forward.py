@@ -49,10 +49,10 @@ def run(robot, stop):
     frame = solver.add_frame_task(EE, T)
     frame.configure("ee", "soft", 1.0)
     reg = solver.add_joints_task()
-    reg.set_joints({j: 0.0 for j in r.joint_names()})
-    reg.configure("reg", "soft", 1e-4)
+    reg.set_joints({j: float(home_q[i]) for i, j in enumerate(r.joint_names())})  # bias toward HOME
+    reg.configure("reg", "soft", 1e-3)          # -> natural config near home, not a folded branch
 
-    for _ in range(300):                        # converge to the goal config
+    for _ in range(400):                        # converge to the goal config
         solver.solve(True)
         r.update_kinematics()
     q_goal = np.asarray(r.state.q[nq - 6:], dtype=float)

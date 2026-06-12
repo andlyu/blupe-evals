@@ -8,6 +8,8 @@ or assets.
 | Know what files a new arm needs (sim vs hardware) | [teleop-integration.md](teleop-integration.md) |
 | The teleop config dict schema (link_name, gripper_config, …) | [teleop-integration.md](teleop-integration.md) §"Config dict" |
 | Why YAM was painful (and that it was a documented violation) | [teleop-integration.md](teleop-integration.md) §"How YAM violated this" |
+| Stereo 3D video to the headset (ZEDMINI flow, Quest dials us) | [stereo-vision.md](stereo-vision.md) |
+| Stop typing IPs in the headset (UDP :29888 announce, what persists) | [discovery-announce.md](discovery-announce.md) |
 
 Upstream: https://github.com/XR-Robotics/XRoboToolkit-Teleop-Sample-Python (MIT).
 Authoritative integration doc upstream: `teleop_details.md`.

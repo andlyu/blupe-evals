@@ -113,6 +113,12 @@ class _Bridge:
         t = (tick or {}).get("t")
         return int((t if t is not None else time.monotonic()) * 1e9)
 
+    def input_age_s(self):
+        """Seconds since the latest tick ARRIVED (local clock — bridge t isn't comparable)."""
+        with self._lock:
+            rx = self._rx_t
+        return time.monotonic() - rx if rx else 0.0
+
 
 # --------------------------------------------------------------------------- #
 # backend: stub (deterministic scripted session for headless tests)
@@ -330,6 +336,13 @@ def get_right_axis():
 
 
 # -- misc --------------------------------------------------------------------- #
+def get_input_age_s():
+    """Latency probe (this shim only, not in the real SDK): seconds since the newest XR
+    tick arrived. 0.0 for sdk/stub backends (no transport hop to measure)."""
+    r = _real()
+    return r.input_age_s() if isinstance(r, _Bridge) else 0.0
+
+
 def get_time_stamp_ns():
     r = _real()
     if _is_real():

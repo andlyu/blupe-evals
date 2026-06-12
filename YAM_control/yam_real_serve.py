@@ -7,7 +7,11 @@ the robot host (separate from the eval's conda `xr`):
 
 Wire (newline-delimited JSON, matches blupe-eval-console/link.py):
   server->client once:  {"start_joints": [6]}          (no-jump seed)
-  client->server tick:  {"q": [6], "g": 0..1}          (arm joints + gripper; g 0=closed 1=open)
+  client->server tick:  {"q": [6], "g": 0..1, "t": s}  (arm joints + gripper; g 0=closed 1=open;
+                                                        t = OPTIONAL sender monotonic timestamp)
+  server->client ack:   {"ack": t}                      (echo of t AFTER the command is applied —
+                                                        the sender computes RTT on ITS OWN clock;
+                                                        only sent when t is present)
   client->server quit:  {"shutdown": true}              (-> torque OFF)
 
 Gripper: i2rt's gripper is NORMALIZED [0,1] (0=closed, 1=open) — never raw motor radians. We follow
@@ -122,6 +126,10 @@ def main():
             f.flush()
             last_t = None
             nrx = 0
+            # latency probes (all on the Orin clock): inter-command gap = network+sender
+            # jitter as seen here; apply = i2rt command_joint_pos duration.
+            gap_sum, gap_max, app_sum, app_max, nlat = 0.0, 0.0, 0.0, 0.0, 0
+            last_lat = time.monotonic()
             try:
                 for line in f:
                     if not line.strip():
@@ -135,6 +143,11 @@ def main():
                     if q is None:
                         continue
                     now = time.monotonic()
+                    if last_t is not None:
+                        gap = now - last_t
+                        gap_sum += gap
+                        gap_max = max(gap_max, gap)
+                        nlat += 1
                     dt = 0.02 if last_t is None else min(max(now - last_t, 1e-4), 0.1)
                     last_t = now
                     step = MAX_VEL * dt
@@ -150,9 +163,23 @@ def main():
                         else:
                             cmd[gidx] = max(desired, actual - GRIPPER_LEAD)
                     robot.command_joint_pos(cmd)
+                    t_applied = time.monotonic()
+                    app = t_applied - now
+                    app_sum += app
+                    app_max = max(app_max, app)
+                    t_cmd = msg.get("t")
+                    if t_cmd is not None:              # ack AFTER apply -> sender-side RTT probe
+                        f.write((json.dumps({"ack": t_cmd}) + "\n").encode())
+                        f.flush()
                     nrx += 1
                     if nrx % 25 == 0:
                         print(f"[serve] {nrx} cmds; applied joints {np.round(last, 3)}", flush=True)
+                    if nlat and t_applied - last_lat >= 5.0:
+                        print(f"[lat] serve gap={gap_sum / nlat * 1e3:.1f}/{gap_max * 1e3:.1f}ms "
+                              f"apply={app_sum / nlat * 1e3:.1f}/{app_max * 1e3:.1f}ms "
+                              f"({nlat / (t_applied - last_lat):.0f}cmd/s)", flush=True)
+                        gap_sum, gap_max, app_sum, app_max, nlat = 0.0, 0.0, 0.0, 0.0, 0
+                        last_lat = t_applied
             except Exception as e:
                 print(f"[serve] stream ended: {e}", flush=True)
             finally:

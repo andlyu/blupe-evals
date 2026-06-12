@@ -65,10 +65,12 @@ class Observation:
 class SimRobot:
     """Robot adapter over the XRoboToolkit controller's MuJoCo sim. read() = joint
     qpos + EE FK; command() writes the position-actuator targets (d.ctrl). No sim
-    gripper DOF, so gripper is reported 0 and the command's gripper arg is ignored."""
+    gripper DOF to move, but the last commanded gripper is KEPT (self.gripper) so the
+    eval's real-arm link and HUD can honor a policy's gripper commands."""
 
     def __init__(self, c: MujocoTeleopController):
         self.m, self.d = c.mj_model, c.mj_data
+        self.gripper = None
 
     def read(self) -> Observation:
         try:
@@ -79,6 +81,8 @@ class SimRobot:
 
     def command(self, joint_pos, gripper=None) -> None:
         self.d.ctrl[:N_ARM] = np.asarray(joint_pos, dtype=float)[:N_ARM]
+        if gripper is not None:
+            self.gripper = float(gripper)
 
     def turn_off(self) -> None:
         print("[eval] (sim) arm disarmed -- real i2rt motor-off is M2")
