@@ -36,6 +36,7 @@ import asyncio
 import itertools
 import json
 import os
+import secrets
 import shlex
 import time
 import urllib.parse
@@ -89,16 +90,95 @@ class Robot:
 
 
 class Relay:
-    def __init__(self, tokens, admin_token):
-        self.tokens = tokens
+    def __init__(self, state_path, env_tokens, admin_token):
+        self.state_path = state_path
         self.admin_token = admin_token
-        self.robots = {}              # robot_id -> Robot
+        # Fleet registry, PERSISTED: robots (id -> token+label) and users/customers
+        # (id -> token+label+linked robot ids). Admin mutations take effect live — no restart.
+        self.fleet = {"robots": {}, "users": {}}
+        if state_path and os.path.exists(state_path):
+            try:
+                f = json.load(open(state_path))
+                self.fleet = {"robots": f.get("robots", {}), "users": f.get("users", {})}
+            except (ValueError, OSError) as e:
+                print(f"[relay] WARNING: {state_path} unreadable ({e}); starting empty", flush=True)
+        for rid, tok in (env_tokens or {}).items():     # legacy RELAY_TOKENS -> registry
+            self.fleet["robots"].setdefault(rid, {"token": tok, "label": rid})
+        self._save()
+        self.robots = {}              # robot_id -> Robot (LIVE connections)
         self.pending = {}             # conn_id -> Future[(reader, writer)]
         self.cmd_waiters = {}         # req_id -> Future[dict]
         self.ids = itertools.count(1)
 
-    def auth(self, robot, token):
-        return self.tokens.get(robot) is not None and self.tokens[robot] == token
+    def _save(self):
+        if not self.state_path:
+            return
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.fleet, f, indent=2)
+        os.replace(tmp, self.state_path)                # atomic: never a torn fleet file
+
+    # ---- auth ---------------------------------------------------------------- #
+    def auth_robot(self, robot, token):
+        r = self.fleet["robots"].get(robot)
+        return r is not None and bool(token) and r["token"] == token
+
+    def auth_operator(self, robot, token):
+        """Data-plane access to a robot: its own token, or a user LINKED to it."""
+        if self.auth_robot(robot, token):
+            return True
+        return any(bool(token) and u.get("token") == token and robot in u.get("robots", [])
+                   for u in self.fleet["users"].values())
+
+    def viewer(self, token):
+        """UI access level: ('admin', None) | ('user', uid) | None."""
+        if token and token == self.admin_token:
+            return ("admin", None)
+        for uid, u in self.fleet["users"].items():
+            if token and u.get("token") == token:
+                return ("user", uid)
+        return None
+
+    def visible_robots(self, who):
+        kind, uid = who
+        if kind == "admin":
+            return set(self.fleet["robots"]) | set(self.robots)
+        return set(self.fleet["users"].get(uid, {}).get("robots", []))
+
+    # ---- fleet admin (UI: add arms, add customers, link/unlink) -------------- #
+    def fleet_action(self, action, q):
+        rid = q.get("robot", [""])[0]
+        uid = q.get("user", [""])[0]
+        label = q.get("label", [""])[0]
+        if action == "add_robot":
+            if not rid or rid in self.fleet["robots"]:
+                return {"ok": False, "err": "missing or duplicate robot id"}
+            tok = secrets.token_hex(16)
+            self.fleet["robots"][rid] = {"token": tok, "label": label or rid}
+            self._save()
+            return {"ok": True, "robot": rid, "token": tok,
+                    "install": (f"python3 relay.py robot --relay <RELAY_HOST>:8443 "
+                                f"--robot {rid} --token {tok}")}
+        if action == "add_user":
+            if not uid or uid in self.fleet["users"]:
+                return {"ok": False, "err": "missing or duplicate user id"}
+            tok = secrets.token_hex(16)
+            self.fleet["users"][uid] = {"token": tok, "label": label or uid, "robots": []}
+            self._save()
+            return {"ok": True, "user": uid, "token": tok,
+                    "ui": f"http://<RELAY_HOST>:8080/?token={tok}"}
+        if action in ("link", "unlink"):
+            u = self.fleet["users"].get(uid)
+            if u is None or rid not in self.fleet["robots"]:
+                return {"ok": False, "err": "unknown user or robot"}
+            robots = set(u.get("robots", []))
+            (robots.add if action == "link" else robots.discard)(rid)
+            u["robots"] = sorted(robots)
+            self._save()
+            return {"ok": True, "user": uid, "robots": u["robots"]}
+        if action == "list":                            # admin-only; includes tokens
+            return {"ok": True, "fleet": self.fleet}
+        return {"ok": False, "err": "bad action"}
 
     # ---- transport ---------------------------------------------------------- #
     async def handle(self, reader, writer):
@@ -112,7 +192,7 @@ class Relay:
 
         if role == "robot":
             robot_id, token = hello.get("robot"), hello.get("token")
-            if not self.auth(robot_id, token):
+            if not self.auth_robot(robot_id, token):
                 _send(writer, {"err": "auth"})
                 writer.close()
                 return
@@ -149,7 +229,7 @@ class Relay:
 
         elif role == "operator":
             robot_id, token, port = hello.get("robot"), hello.get("token"), hello.get("port")
-            if not self.auth(robot_id, token):
+            if not self.auth_operator(robot_id, token):   # robot token OR a LINKED user token
                 _send(writer, {"err": "auth"})
                 writer.close()
                 return
@@ -213,13 +293,27 @@ class Relay:
             rob.last_preflight = {"t": time.time(), "data": data}
         return {"ok": True, "data": data}
 
-    def status(self):
-        return {rid: {
-            "online_s": round(time.time() - r.since),
-            "channels": [{"port": c["port"], "peer": c["peer"],
-                          "for_s": round(time.time() - c["since"])} for c in r.channels.values()],
-            "last_preflight": r.last_preflight,
-        } for rid, r in self.robots.items()}
+    def status(self, visible=None):
+        """Registered + live robots merged; offline arms still get a card (onboarding UX:
+        add the arm -> see it -> install the agent -> watch it come online)."""
+        out = {}
+        for rid in sorted(set(self.fleet["robots"]) | set(self.robots)):
+            if visible is not None and rid not in visible:
+                continue
+            r = self.robots.get(rid)
+            reg = self.fleet["robots"].get(rid, {})
+            out[rid] = {
+                "online": r is not None,
+                "label": reg.get("label", rid),
+                "linked": sorted(u for u, d in self.fleet["users"].items()
+                                 if rid in d.get("robots", [])),
+                "online_s": round(time.time() - r.since) if r else 0,
+                "channels": [{"port": c["port"], "peer": c["peer"],
+                              "for_s": round(time.time() - c["since"])}
+                             for c in r.channels.values()] if r else [],
+                "last_preflight": r.last_preflight if r else None,
+            }
+        return out
 
 
 UI_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Blupe fleet</title>
@@ -235,11 +329,48 @@ UI_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Blupe fleet
  pre{background:#f2f4f7;border-radius:6px;padding:10px;font-size:12px;overflow-x:auto}
  .muted{color:#889;font-size:12px}
 </style></head><body>
-<h1>Blupe fleet</h1><div id="arms">loading…</div>
+<h1>Blupe fleet</h1>
+<div class="arm" id="admin-card" style="display:none">
+  <span class="name">Fleet admin</span>
+  <div class="ops">arms get an install one-liner; customers get a UI link scoped to the
+  arms you link to them</div>
+  <button class="primary" onclick="addArm()">Add arm</button>
+  <button class="primary" onclick="addCustomer()">Add customer</button>
+  <pre id="admin-out"></pre></div>
+<div class="arm" id="report-card" style="display:none"><span class="name">Eval report</span>
+  <div class="ops">runs on the operator Mac: rotates to a fresh trial session + records the
+  full operator view (session.mp4); Finish renders report.html</div>
+  <button class="primary" onclick="report('new',this)">New report</button>
+  <button onclick="report('finish',this)">Finish report</button>
+  <button onclick="report('status',this)">Status</button>
+  <pre id="report-out"></pre></div>
+<div id="arms">loading…</div>
 <script>
 const TOKEN = new URLSearchParams(location.search).get('token') || '';
+let ME = {role: 'user'}, USERS = [];
 async function api(path){ const r = await fetch(path + (path.includes('?')?'&':'?') + 'token=' + TOKEN);
   return r.json(); }
+async function whoami(){ ME = await api('/api/me');
+  if (ME.role === 'admin'){
+    document.getElementById('admin-card').style.display = '';
+    document.getElementById('report-card').style.display = '';
+    await loadFleet(); } }
+async function loadFleet(){ const r = await api('/api/fleet?action=list');
+  if (r.ok) USERS = Object.keys(r.fleet.users); }
+async function fleetAct(params){ const r = await api('/api/fleet?' + params);
+  document.getElementById('admin-out').textContent = JSON.stringify(r, null, 2);
+  await loadFleet(); refresh(); }
+function addArm(){ const id = prompt('arm id (e.g. yam-2):');
+  if (id) fleetAct('action=add_robot&robot=' + encodeURIComponent(id.trim())); }
+function addCustomer(){ const id = prompt('customer id (e.g. acme):');
+  if (id) fleetAct('action=add_user&user=' + encodeURIComponent(id.trim())); }
+function linkSel(rid){ const uid = document.getElementById('link-' + rid).value;
+  if (uid) fleetAct('action=link&robot=' + rid + '&user=' + uid); }
+function unlink(rid, uid){ fleetAct('action=unlink&robot=' + rid + '&user=' + uid); }
+async function report(action, btn){ btn.disabled = true;
+  try { const r = await api('/api/report?action=' + action);
+        document.getElementById('report-out').textContent = JSON.stringify(r, null, 2); }
+  finally { btn.disabled = false; } }
 async function cmd(robot, c, btn){ btn.disabled = true; btn.textContent = c + '…';
   const r = await api('/api/cmd?robot=' + robot + '&cmd=' + c);
   document.getElementById('out-' + robot).textContent = JSON.stringify(r, null, 2);
@@ -257,8 +388,12 @@ function showCams(id, on){
   btn.textContent = on ? 'Hide cameras' : 'Cameras'; }
 function card(id){                                          // built ONCE; refresh only edits text
   const el = document.createElement('div'); el.className = 'arm'; el.id = 'arm-' + id;
-  el.innerHTML = `<span class="name">${id}</span> <span class="on" id="st-${id}"></span>
-    <div class="ops" id="ops-${id}"></div>
+  const admin = ME.role === 'admin' ? `
+    <div class="ops">customers: <span id="links-${id}"></span>
+      <select id="link-${id}"></select>
+      <button onclick="linkSel('${id}')">Link</button></div>` : '';
+  el.innerHTML = `<span class="name" id="nm-${id}">${id}</span> <span class="on" id="st-${id}"></span>
+    <div class="ops" id="ops-${id}"></div>${admin}
     <button class="primary" onclick="cmd('${id}','arm_on',this)">Turn ON</button>
     <button class="danger" onclick="cmd('${id}','arm_off',this)">Turn OFF</button>
     <button onclick="cmd('${id}','preflight',this)">Check</button>
@@ -268,24 +403,37 @@ function card(id){                                          // built ONCE; refre
   document.getElementById('arms').appendChild(el); return el; }
 async function refresh(){
   const s = await api('/api/status'); const div = document.getElementById('arms');
-  const ids = Object.keys(s);
+  const ids = Object.keys(s).filter(id => !id.startsWith('mac-'));  // operator nodes: no arm card
   if (div.textContent === 'loading…' || (!ids.length && !div.querySelector('.arm')))
-    div.innerHTML = ids.length ? '' : '<p class="muted">no arms online</p>';
-  for (const el of div.querySelectorAll('.arm'))            // mark offline arms, keep cards
-    if (!ids.includes(el.id.slice(4))) el.style.opacity = 0.4;
+    div.innerHTML = ids.length ? '' : '<p class="muted">no arms registered</p>';
   for (const id of ids){
     const el = document.getElementById('arm-' + id) || card(id);
-    el.style.opacity = 1;
-    document.getElementById('st-' + id).textContent = `● online ${s[id].online_s}s`;
-    document.getElementById('ops-' + id).innerHTML = s[id].channels.length
-      ? s[id].channels.map(c => `port ${c.port} ← ${c.peer} (${c.for_s}s)`).join('<br>')
-      : 'no operator connected';
+    const on = s[id].online;
+    el.style.opacity = on ? 1 : 0.55;
+    document.getElementById('nm-' + id).textContent = s[id].label || id;
+    const st = document.getElementById('st-' + id);
+    st.textContent = on ? `● online ${s[id].online_s}s` : '○ offline';
+    st.className = on ? 'on' : 'off';
+    document.getElementById('ops-' + id).innerHTML = !on
+      ? 'agent not connected — run the install one-liner on the robot computer'
+      : s[id].channels.length
+        ? s[id].channels.map(c => `port ${c.port} ← ${c.peer} (${c.for_s}s)`).join('<br>')
+        : 'no operator connected';
+    if (ME.role === 'admin'){
+      document.getElementById('links-' + id).innerHTML = (s[id].linked || []).map(u =>
+        `<b>${u}</b> <button onclick="unlink('${id}','${u}')" title="unlink">✕</button>`)
+        .join(' ') || '<span class="muted">none</span>';
+      const sel = document.getElementById('link-' + id);
+      const opts = [''].concat(USERS.filter(u => !(s[id].linked || []).includes(u)));
+      if (sel.options.length !== opts.length)
+        sel.innerHTML = opts.map(u => `<option value="${u}">${u || 'customer…'}</option>`).join('');
+    }
     const pre = document.getElementById('out-' + id);
     if (!pre.textContent && s[id].last_preflight)
       pre.textContent = JSON.stringify(s[id].last_preflight.data, null, 2);
   }
 }
-refresh(); setInterval(refresh, 5000);
+whoami().then(refresh); setInterval(refresh, 5000);
 </script></body></html>"""
 
 
@@ -298,12 +446,17 @@ async def _http_ui(relay, args):
             _, target, _ = req_line.split(" ", 2)
             url = urllib.parse.urlparse(target)
             q = urllib.parse.parse_qs(url.query)
-            token_ok = (q.get("token", [""])[0] == relay.admin_token)
+            who = relay.viewer(q.get("token", [""])[0])   # ('admin',None)|('user',uid)|None
+            token_ok = who is not None
+            is_admin = who is not None and who[0] == "admin"
 
             if url.path.startswith("/cam/") and token_ok:
                 # /cam/<robot>/<idx> -> open a channel to the robot's camera relay (:8089),
                 # send a raw GET, splice the multipart-MJPEG response verbatim to the browser.
                 _, _, rid, idx = url.path.split("/", 3)
+                if rid not in relay.visible_robots(who):
+                    writer.close()
+                    return
                 rr, rw = await relay.open_channel(rid, 8089)
                 rw.write(f"GET /{idx} HTTP/1.1\r\nHost: cam\r\n\r\n".encode())
                 await rw.drain()
@@ -323,14 +476,65 @@ async def _http_ui(relay, args):
             if url.path == "/" :
                 body, ctype, code = UI_HTML, "text/html", 200
             elif not token_ok:
-                body, ctype, code = '{"err":"bad admin token"}', "application/json", 403
+                body, ctype, code = '{"err":"bad token"}', "application/json", 403
+            elif url.path == "/api/me":
+                body, ctype, code = json.dumps({"role": who[0], "id": who[1]}), \
+                    "application/json", 200
             elif url.path == "/api/status":
-                body, ctype, code = json.dumps(relay.status()), "application/json", 200
+                body, ctype, code = json.dumps(relay.status(relay.visible_robots(who))), \
+                    "application/json", 200
+            elif url.path == "/api/fleet":
+                if not is_admin:
+                    body, ctype, code = '{"err":"admin only"}', "application/json", 403
+                else:
+                    body = json.dumps(relay.fleet_action(q.get("action", [""])[0], q))
+                    ctype, code = "application/json", 200
+            elif url.path == "/api/report" and not is_admin:
+                body, ctype, code = '{"err":"admin only"}', "application/json", 403
+            elif url.path == "/api/report":
+                # Proxy to the operator Mac's preview server (:8810) over a relay channel —
+                # the Mac registers like a robot (id mac-*) so the same machinery applies.
+                action = q.get("action", [""])[0]
+                op = q.get("op", ["mac-1"])[0]
+                if action not in ("new", "finish", "status") or not op.startswith("mac-"):
+                    body, ctype, code = '{"err":"bad report request"}', "application/json", 400
+                else:
+                    try:
+                        rr, rw = await relay.open_channel(op, 8810)
+                        rw.write(f"GET /report/{action} HTTP/1.1\r\nHost: op\r\n"
+                                 f"Connection: close\r\n\r\n".encode())
+                        await rw.drain()
+                        # Read by Content-Length, NOT to EOF: the agent-side splice keeps the
+                        # channel open until BOTH directions close, so EOF never comes.
+                        raw = b""
+                        while b"\r\n\r\n" not in raw:
+                            data = await asyncio.wait_for(rr.read(65536), CMD_TIMEOUT_S)
+                            if not data:
+                                break
+                            raw += data
+                        head, _, payload = raw.partition(b"\r\n\r\n")
+                        clen = 0
+                        for h in head.split(b"\r\n"):
+                            if h.lower().startswith(b"content-length:"):
+                                clen = int(h.split(b":")[1])
+                        while len(payload) < clen:
+                            data = await asyncio.wait_for(rr.read(65536), CMD_TIMEOUT_S)
+                            if not data:
+                                break
+                            payload += data
+                        rw.close()
+                        body = payload.decode() if payload \
+                            else '{"ok": false, "err": "bad upstream response"}'
+                    except Exception as e:
+                        body = json.dumps({"ok": False, "err": f"operator node: {e}"})
+                    ctype, code = "application/json", 200
             elif url.path == "/api/cmd":
                 robot = q.get("robot", [""])[0]
                 cmd = q.get("cmd", [""])[0]
                 if cmd not in ("preflight", "arm_on", "arm_off"):
                     body, ctype, code = '{"err":"bad cmd"}', "application/json", 400
+                elif robot not in relay.visible_robots(who):
+                    body, ctype, code = '{"err":"not your arm"}', "application/json", 403
                 else:
                     body = json.dumps(await relay.command(robot, cmd))
                     ctype, code = "application/json", 200
@@ -359,14 +563,13 @@ async def role_serve(args):
     tokens = dict(p.split(":", 1) for p in os.environ.get("RELAY_TOKENS", "").split(",") if p)
     if not tokens and args.token and args.robot:
         tokens = {args.robot: args.token}
-    if not tokens:
-        raise SystemExit("set RELAY_TOKENS='robot:token,...' (or --robot/--token)")
     admin = os.environ.get("RELAY_ADMIN_TOKEN", "")
     if not admin:
         raise SystemExit("set RELAY_ADMIN_TOKEN for the fleet UI")
-    relay = Relay(tokens, admin)
+    relay = Relay(args.state, tokens, admin)
     srv = await asyncio.start_server(relay.handle, "0.0.0.0", args.port)
-    print(f"[relay] serving on :{args.port} for robots {sorted(tokens)}", flush=True)
+    print(f"[relay] serving on :{args.port}; fleet: {sorted(relay.fleet['robots'])} "
+          f"(state: {args.state})", flush=True)
     async with srv:
         await asyncio.gather(srv.serve_forever(), _http_ui(relay, args))
 
@@ -565,6 +768,8 @@ def main():
     s.add_argument("--port", type=int, default=8443)
     s.add_argument("--ui-port", type=int, default=8080)
     s.add_argument("--robot"), s.add_argument("--token")
+    s.add_argument("--state", default=os.environ.get("RELAY_STATE", "fleet.json"),
+                   help="fleet registry file (robots+users+links; admin edits persist here)")
 
     r = sub.add_parser("robot")
     r.add_argument("--relay", required=True)
