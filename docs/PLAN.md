@@ -249,12 +249,12 @@ Exit check: `--check` passes + live sim teleop from the headset + a pick_place t
 IK reaches a probe target, link names consistent across xml/urdf — each ✗ prints the fix.
 Plus repo doctor: deps, docker bridge, ports, announcer, headset reachability.
 
-**Stage 4 — hardware seam doc (phase B).**
-The serve protocol IS the integration point and is already arm-agnostic: newline-JSON
-`{"q": [...], "g": 0..1}` + `{"start_joints": [...]}` handshake + optional ack. Write
-`docs/add-an-arm.md`: phase A checklist (above) + phase B = "implement this protocol over
-your driver" with `yam_real_serve.py` as the reference (safety: clamp, hold-on-disconnect,
-torque-off stay robot-side). SO-101 hardware driver (feetech/lerobot) = its own later step.
+**Stage 4 — hardware seam doc (phase B). DONE 2026-06-12, split by audience:**
+`docs/integrate-your-hardware.md` (the common case: connect YOUR unit of a supported
+embodiment — sim sanity check, serve, fleet one-liner, first contact) and
+`docs/add-an-embodiment.md` (the advanced case: new arm MODEL — ArmSpec + consistent
+MJCF/URDF + the serve wire protocol & safety contract). Both linked from the README
+("I want to…" table). SO-101 hardware driver (feetech/lerobot) = its own later step.
 
 **Stage 5 — GitHub-ready.**
 Commit the working tree (FIRST — two threads of uncommitted work), LICENSE (decide; deps

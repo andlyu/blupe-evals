@@ -1,80 +1,72 @@
 # blupe-evals
 
-Teleop a single **YAM** arm with [XRoboToolkit](https://xr-robotics.github.io/):
-Quest controller → XRoboToolkit → YAM in **MuJoCo sim** first (no hardware), then
-the **real YAM** on a Jetson Orin via `i2rt`.
+**Teleoperate robot arms from a Quest headset — anywhere — and turn every policy run into
+a judged, shareable evaluation report.**
 
-This is a fresh, minimal repo. We deliberately do **not** reuse the custom Quest VR
-path from `blupe-eval-console` — the only thing carried over is the vendored YAM
-MuJoCo model in [`assets/yam/`](assets/yam/). Full background and hardware notes:
-[`docs/XROBOTOOLKIT-YAM-HANDOFF.md`](docs/XROBOTOOLKIT-YAM-HANDOFF.md).
-
-## Layout
+One operator computer (the headset talks to it), one robot computer (owns the arm + safety),
+optionally a cloud relay between them so neither site needs a VPN or open ports. Sim twin
+first, real hardware second; the whole eval loop (trials, verdicts, success-rate reports)
+works on both.
 
 ```
-assets/yam/            vendored YAM model (scene.xml, yam.xml, yam.urdf, assets/*.stl)
-scripts/
-  teleop_yam_mujoco.py    sim teleop (start here)
-  teleop_yam_hardware.py  real-arm teleop via i2rt (stub — Orin only)
-docs/                  handoff + notes
+OPERATOR (laptop + Quest, same Wi-Fi)         CLOUD (optional)        ROBOT SITE
+Quest ──input──► xr-bridge (docker)           relay + fleet UI        agent (dials OUT)
+Quest ◄─video─── eval_yam_vr.py  ◄─ cameras ──── relay channels ────► camera_relay
+eval ──joints──► serve (robot-side safety: clamp · hold · torque-off) ─► your arm
 ```
 
-## Install (Python 3.10)
+## I want to…
 
-Three external pieces, none cleanly on PyPI:
+| …do this | read |
+|---|---|
+| **Connect my arm** (a supported model: YAM, SO-101) | [docs/integrate-your-hardware.md](docs/integrate-your-hardware.md) |
+| **Add a new arm model** (a new embodiment, sim assets + driver) | [docs/add-an-embodiment.md](docs/add-an-embodiment.md) |
+| Run evals and get a report | below: *The eval loop* |
+| Operate the fleet / onboard a customer | fleet UI (`relay.py serve`): Add arm, Add customer, link/unlink |
+| Fix a known papercut fast | `.claude/skills/small-errors/SKILL.md` |
+| Understand the live deployment | [docs/SESSION-HANDOFF.md](docs/SESSION-HANDOFF.md) |
 
-1. **XRoboToolkit PC Service** — the host bridge service (gRPC) the Quest connects to.
-   - Windows: one-click installer.
-   - Linux / Jetson Orin: build from source (`RoboticsService/`, less documented).
-2. **`xrobotoolkit_sdk`** — Python bindings to read XR state, from
-   [XRoboToolkit-PC-Service-Pybind](https://github.com/XR-Robotics) (`setup_orin.sh` on Orin).
-3. **`xrobotoolkit_teleop`** — the framework, from
-   [XRoboToolkit-Teleop-Sample-Python](https://github.com/XR-Robotics) (`setup_conda.sh`, Python 3.10).
-
-Then this repo's small deps:
+## Quickstart (operator computer, sim — no robot needed)
 
 ```bash
-pip install -e .   # tyro, numpy
+git clone https://github.com/andlyu/blupe-evals && cd blupe-evals
+python3.10 -m venv .venv && .venv/bin/pip install -r requirements.txt
+docker build -t xr-bridge docker/xr-bridge          # the XR input appliance
+docker run -d --rm --name xr-bridge -p 63901:63901 -p 8765:8765 xr-bridge
+.venv/bin/python scripts/xrtk_announce.py &          # headset discovers you: no IP typing
+XR_INPUT=bridge .venv/bin/python scripts/eval_yam_vr.py --quest-ip <quest-ip> --cameras none
 ```
 
-## Connect the Quest
+Headset (XRoboToolkit Quest app, sideloaded once): **Network panel → tap the popped-up IP →
+Controller + Send ON**; **Camera panel → ZEDMINI → Listen → this computer's IP → Confirm**.
+You're teleoperating the sim arm. No headset handy? `scripts/preview_server.py` mirrors the
+exact operator view to a browser at `:8810` with keyboard control.
+
+## The eval loop
+
+Start the eval with a task: `--task red-plate-pickup --stages reach grasp lift place
+--policy scripts/policies/pick_place.py:run`. Then, from inside the headset:
+
+1. **TELEOP** to the pick spot → **MARK A**; drop spot → **MARK B** (one-time per scene).
+2. **POLICY** (X) — each run auto-records a trial (video + event timeline) and ends with a
+   SUCCESS/FAIL modal.
+3. Afterwards: `eval_report.py serve` to score failures (stage + 0–1 progress),
+   `eval_report.py render` → a self-contained `report.html` with success rate, mean
+   progress, failure-by-stage histogram, and every trial's video.
+
+## Pieces
 
 ```
-Quest app ──Wi-Fi──► PC Service (gRPC) ──local──► xrobotoolkit_sdk ──► this code
+scripts/eval_yam_vr.py     the operator process: state machine, headset video, trials, HUD
+scripts/arms.py            embodiment registry (ArmSpec: assets, EE frames, dof, caps)
+scripts/eval_report.py     judge UI + report renderer       scripts/policies/   scripted policies
+scripts/stereo_sender.py   headset video transport          scripts/xrtk_announce.py  IP popup
+relay/relay.py             cloud relay + fleet UI + robot agent + operator client (stdlib-only)
+YAM_control/               YAM reference serve (safety contract) + camera relay + CAN tools
+docker/xr-bridge/          XR input appliance (vendored PC service + sdk bindings)
+assets/<arm>/              per-embodiment models (MJCF + URDF, consistent names)
+docs/refs/                 vendored upstream docs (read before integrating!)
 ```
 
-- One-time: Quest **Developer Mode** → sideload the XRoboToolkit Quest APK (adb/SideQuest).
-- Per session: Quest + host on the **same Wi-Fi** → run the **PC Service** on the host →
-  in the Quest app **Network → enter the host IP**, toggle **Controller** + **Send** ON →
-  Status: connected.
-
-## Run (sim)
-
-```bash
-python scripts/teleop_yam_mujoco.py
-# options: --xml-path --robot-urdf-path --scale-factor --visualize-placo / --no-visualize-placo
-```
-
-Hold the **right grip** (clutch, >0.5) to engage; move the controller to drive the arm.
-
-## Model name gotchas (verified against the vendored assets)
-
-The same link has two different names depending on the file — easy to mix up:
-
-| Thing            | Name in file        | Used by                         |
-| ---------------- | ------------------- | ------------------------------- |
-| EE link (URDF)   | `link_6`            | placo IK (`link_name` in config)|
-| EE body (MuJoCo) | `link6`             | MuJoCo sim / visualization      |
-| EE site (i2rt)   | `grasp_site`        | real hardware                   |
-| Joints (URDF)    | `joint1`…`joint6`   | —                               |
-
-The handoff originally guessed `link6` for the placo target; the correct URDF link is
-**`link_6`**, which is what `scripts/teleop_yam_mujoco.py` uses.
-
-## Next: real YAM
-
-Everything runs on the **Jetson Orin** (`andrew@192.168.0.185`, arm64) — the only box
-reaching the arm on CAN. Implement `scripts/teleop_yam_hardware.py` (placo IK targets →
-i2rt `command_joint_pos`), modeled on XRoboToolkit's `teleop_dual_ur5e_hardware.py`.
-Mind the **~400 ms motor watchdog** and the safe **torque-off** sequence — see the
-hardware script's docstring and the handoff.
+Python 3.10 · macOS arm64 + Linux (robot side) · safety lives robot-side in the serve:
+velocity clamp, hold-on-disconnect, torque-off — transport changes can never touch it.
