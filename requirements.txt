@@ -1,0 +1,19 @@
+# Operator-computer dependencies (the machine the headset talks to).
+# Pinned to the versions of the working reference rig (macOS arm64, Python 3.10).
+# Install:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# The robot computer does NOT use this file — it needs only the relay agent
+# (stdlib-only relay/relay.py) + your arm's serve + opencv for camera_relay.
+# The XR input bridge runs in Docker (docker/xr-bridge) and vendors its own deps.
+
+# Teleop framework (IK targets, controller plumbing). STOCK upstream works — no patches.
+# Pinned to the commit the reference rig runs; clean working tree verified 2026-06-12.
+xrobotoolkit_teleop @ git+https://github.com/XR-Robotics/XRoboToolkit-Teleop-Sample-Python.git@79e5cb8
+
+mujoco==3.9.0          # sim + offscreen rendering for the headset view
+placo==0.9.23          # IK (policies, teleop targets)
+av==17.1.0             # H.264 encode: headset video + trial recordings
+opencv-python==4.13.0.92  # cameras, HUD drawing, compositing
+numpy==2.2.6
+tyro==1.0.13           # CLI for every script
+glfw==2.10.0           # MuJoCo GL backend

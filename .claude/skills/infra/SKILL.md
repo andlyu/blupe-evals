@@ -9,6 +9,10 @@ description: >
 
 # infra — operating & debugging the teleop stack
 
+**Before debugging anything: check the `small-errors` skill** — known papercuts with
+30-second fixes (dead joystick, doze fallout, stale IPs). This skill is for issues that
+need actual investigation; confirmed quick fixes graduate to small-errors.
+
 Endpoints, tokens, start commands, and the live architecture diagram live in
 `docs/SESSION-HANDOFF.md` (keep that current). This skill is the *operating discipline* +
 the issue log.
@@ -53,12 +57,76 @@ camera → camera_relay → cloud relay ──► fleet-UI browser <img>   ← c
 - **① reader:** must be one drain-thread per camera (fixed in ISSUE-001; never read two
   network streams sequentially in one loop — TCP queues, staleness grows without bound).
 - **② tiles:** dead streams must show "NO SIGNAL", never a frozen last frame.
-- **③ sender:** must have a small SO_SNDBUF + drop-on-backpressure (stereo_sender has it;
-  legacy mono path does NOT — sleep builds minutes of backlog).
+- **③ sender:** must have a small SO_SNDBUF + drop-on-backpressure (stereo_sender AND
+  camera_relay have it since ISSUE-004; legacy mono path does NOT — sleep builds minutes
+  of backlog).
+- **Probe trap:** a FRESH connection can show 0.1 s freshness while every LONG-LIVED stream
+  is seconds behind (new conns start at the relay's current frame; old conns carry their
+  queue). Test sustained: hold one connection ≥15 s, drain continuously, clock the LAST frame.
 - **④ headset:** fresh LISTEN/panel-open = fresh queue. Clock in headset vs wall clock is
   the final end-to-end measurement.
 
 ## Issue log (append; newest on top)
+
+### ISSUE-004 · 2026-06-11 · Cameras seconds behind on EVERY long-lived stream (headset + viewer)
+**Symptom:** camera video "incredibly behind" (multi-second, drifting) in both the headset
+and the fleet-UI browser — yet a fresh probe connection measured 0.1 s freshness. That
+contradiction IS the diagnosis: new connections start at the current frame; long-lived ones
+carry their backlog (see "Probe trap" in the playbook above).
+**Root cause (two, both in `camera_relay.py`'s per-client send loop):**
+1. Blocking `wfile.write` with a default-size TCP send buffer — any throughput dip (Wi-Fi
+   hiccup, cloud-relay congestion) queued frames that were all still delivered in order;
+   once behind, a stream stayed behind forever. Same disease as ISSUE-001 cause 2, one hop
+   earlier in the pipeline.
+2. The loop re-sent the LATEST jpeg at 30 Hz even when no new frame existed — duplicate
+   frames doubled bandwidth on the constrained path, making the queueing more likely (and
+   it's the known received-fps ≠ freshness trap from ISSUE-001).
+**Fix (deployed to the Orin):** only-new-frame sends (identity check on the jpeg buffer) +
+`SO_SNDBUF` 128 KB + `select()` writability check that DROPS the frame when the client
+stalls. Slow consumers now get FEWER frames, never OLDER frames (choppy beats laggy for
+teleop). Verified: last frame of a 15 s sustained stream was 0.1 s old.
+**Also:** when operator and robot share a LAN (home), point the eval DIRECTLY at the Orin
+(`--cameras http://192.168.0.185:8089/{0,2} --serve-host 192.168.0.185 --serve-port 5599`)
+— routing through GCP from ten feet away adds internet RTT and an unneeded choke point.
+Relay endpoints (`127.0.0.1:18089/:15599`) are for remote operation.
+
+### ISSUE-003 · 2026-06-11 · GREEN screen in stereo camera view after changing Wi-Fi
+**Symptom:** at a cafe (network hop home→Starbucks→venue), the headset's ZEDMINI camera
+view showed a solid GREEN screen on Listen, even with the correct new IP typed. Green =
+the app's video texture allocated but its decoder never received a single frame.
+**Root cause:** when a device changes networks, its established TCP sessions die WITHOUT a
+FIN — the peer keeps them ESTABLISHED forever. `StereoVisionServer._serve` handled one
+control client at a time with a blocking read, so it sat blocked on the morning's half-dead
+session; the Quest's NEW connection completed its handshake in the kernel backlog (netstat:
+ESTABLISHED with the 191-byte OPEN_CAMERA sitting in Recv-Q, never read) and was never
+accepted. Each further Listen press queued another zombie.
+**Diagnostic that cracked it:** `netstat -an | grep 13579` showing TWO established sessions
+— the old network's pair still present + a new pair with bytes stuck in Recv-Q. If Recv-Q
+is nonzero on a port we serve, the app behind it is not reading — find what it's blocked on.
+**Fix:** newest-connection-wins preemption in `stereo_sender.py` — every accept closes the
+previous control conn (unblocking its reader thread) and takes over; only the CURRENT
+session may stop the video stream. Regression test: `fake_quest_stereo.py` run with a
+parked zombie connection on :13579 (see scripts) — must still PASS.
+**Lesson:** any of-ours TCP server that serves "the one operator" must treat a new
+connection as the operator moving networks, not as an intruder: preempt, never queue.
+
+### ISSUE-002 · 2026-06-11 · Typing IPs into the headset every session
+**Symptom:** every headset launch needed the Mac IP pecked into the Network panel on the
+in-VR keyboard (and once into the camera panel) — slow, error-prone, every session.
+**Root cause:** the Quest app ALREADY auto-discovers the PC service — it listens on UDP
+:29888 and pops a one-click IP-select dialog on a valid announce. Our PC service runs inside
+Docker on macOS, so its announce (a) broadcasts onto the container's bridge subnet, never
+the LAN, and (b) would advertise the container IP anyway. Doubly broken → silent fallback
+to manual typing. Compounding: the Network-panel IP field is *never persisted by design*
+(discovery is the intended UX); the camera-panel IP IS persisted (PlayerPrefs) after the
+first entry + clean app exit.
+**Fix:** `scripts/xrtk_announce.py` — replays the exact announce packet natively on the Mac
+every 5 s (subnet broadcast + `--unicast <quest-ip>` belt-and-braces, since Android may
+filter subnet broadcasts and the client binds 0.0.0.0). Start it with the Mac stack
+(runbook in SESSION-HANDOFF.md). Wire format + client parse rules:
+`docs/refs/xrobotoolkit/discovery-announce.md`.
+**Lesson:** when an upstream tool demands tedious manual config, read its source for the
+automation it already has — ours was broken by our own containerization, not missing.
 
 ### ISSUE-001 · 2026-06-11 · Headset showed old/black video while browser was live
 **Symptom:** headset video "not streaming", later recognized as *old frames*; fleet-UI

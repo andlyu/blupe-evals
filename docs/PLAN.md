@@ -221,7 +221,53 @@ direction-agnostic byte streams (joints JSON, camera frames), so this swaps tran
 `RobotLink`/the relays without touching robot-side safety (clamp, hold-on-drop, watchdog).
 Needed from us: hosted relay + token issuance + dial-out wrappers on both ends + kill endpoint.
 
+## Multi-arm + open release (decided 2026-06-12)
+
+Decisions: next arm = **SO-101** (sim first, hardware after); distribution = **open GitHub
+repo** (no closed components for now); audience = **pilot customers we onboard** (docs may
+assume the YAM/Orin/Quest recipe, SO-101 broadens it).
+
+This makes PLAN Part 2 concrete. Staged, each stage independently shippable:
+
+**Stage 1 — ArmProfile + registry (the de-hardcoding).**
+`arms/<name>/arm.json` + assets per arm; YAM becomes the first bundle. Profile fields:
+`n_joints, ee_link, mjcf, urdf, home_keyframe, max_vel, serve {host, port}, gripper
+{open, close}, cameras (default)`. `eval_yam_vr.py --arm yam` (default) loads it;
+`eval_yam_states` constants (N_ARM=6, EE, MAX_VEL) become profile-driven via `E.load_arm()`;
+policies take paths from the profile. Exit check: YAM runs exactly as today via its bundle.
+SO-101 is 5-DOF + gripper — the registry must survive n_joints ≠ 6 everywhere ([:6] sweeps).
+
+**Stage 2 — SO-101 sim bundle (phase A of add-an-arm).**
+Vendor the MJCF from mujoco_menagerie (`trs_so_arm100`; verify license + that it matches
+SO-101 rev), GENERATE the URDF from the MJCF (one source of truth — the gen_yam_urdf.py
+pattern; teleop-integration.md's headline rule: identical link/joint names), scene.xml with
+actuators + `home` keyframe + vis-target mocap + offwidth 1920, fill the profile, register.
+Exit check: `--check` passes + live sim teleop from the headset + a pick_place trial in sim.
+
+**Stage 3 — `arm check` validator + doctor (the guided-install experience).**
+`scripts/arm_check.py --arm so101`: placo loads URDF, MuJoCo loads scene, home applies,
+IK reaches a probe target, link names consistent across xml/urdf — each ✗ prints the fix.
+Plus repo doctor: deps, docker bridge, ports, announcer, headset reachability.
+
+**Stage 4 — hardware seam doc (phase B).**
+The serve protocol IS the integration point and is already arm-agnostic: newline-JSON
+`{"q": [...], "g": 0..1}` + `{"start_joints": [...]}` handshake + optional ack. Write
+`docs/add-an-arm.md`: phase A checklist (above) + phase B = "implement this protocol over
+your driver" with `yam_real_serve.py` as the reference (safety: clamp, hold-on-disconnect,
+torque-off stay robot-side). SO-101 hardware driver (feetech/lerobot) = its own later step.
+
+**Stage 5 — GitHub-ready.**
+Commit the working tree (FIRST — two threads of uncommitted work), LICENSE (decide; deps
+are MIT/Apache), `.gitignore` runs/ + tokens, README = quickstart for pilots (today's
+runbook + headset ritual + report workflow), pyproject + uv pins, config file
+(`blupe.toml`: arm, hosts, task) to replace the CLI sprawl, one-command `up` script.
+CI smoke (fake-quest headless e2e) once offscreen GL on runners is sorted.
+
+Order: 1 → 2 → 3 can ship before 4/5; 5's commit step should happen IMMEDIATELY regardless.
+
 ## Decisions still to pin
 1. Sim-first — enforced gate vs. recommended.
 2. Minimum report contents; video/episode capture v1 vs. later.
 3. Input seam scope now (Quest only vs. Quest + keyboard).
+4. LICENSE for the open release (Apache-2.0 recommended; deps MIT/Apache-compatible).
+5. Does `runs/` (trial videos) ever belong in git? (recommend: no — .gitignore + zip export).

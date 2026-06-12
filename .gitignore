@@ -22,3 +22,10 @@ logs/
 data/
 *.log
 .gstack/
+
+# Eval trial recordings + reports (gigabytes; zip a session dir to share)
+runs/
+
+# Machine/scene-local state (marked waypoints; Claude permission allowlist may hold tokens)
+scripts/policies/waypoints.json
+.claude/settings.local.json

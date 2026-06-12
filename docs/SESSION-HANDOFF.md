@@ -4,6 +4,123 @@ Everything below was built and verified in one session (commits `96d24f1..e68150
 went from "everything on the Orin" to a **three-site production-shaped topology** with a cloud
 relay and fleet UI. One issue is open (headset video — see "Open issues #1").
 
+## ⚡ Session pass-off — 2026-06-11 end of day (read this first if you're a new session)
+
+**Where things stand:** BACK HOME. Mac `192.168.0.231` (NOTE: the router re-leased — it used
+to be `.190`; get a DHCP reservation), Quest `192.168.0.30`, Orin `192.168.0.185`. Everything
+LAN-direct (no cloud hop at home — infra ISSUE-004): eval cameras/serve point straight at the
+Orin. Running on the Mac: `eval_yam_vr.py` (task `red-plate-pickup`, log `/tmp/eval_live.log`),
+`xrtk_announce.py`, relay operator, docker `xr-bridge`, `eval_report.py serve` (:7799).
+**The eval pipeline ran its first REAL session today: 7 trials in `runs/2026-06-11_red-plate-
+pickup/`, all judged in-VR, 43% success.** Failures still need stage+score via the judge UI.
+
+**OPEN — hardware:** the arm's **motor 3 is silent on CAN** (serve exits rc=1: "fail to
+communicate with the motor 3"); bus itself is clean (ERROR-ACTIVE, 0 errors), motors 1-2
+answer. Next: power-cycle the arm → fleet UI Check; if still dead, reseat joint-3
+connectors (CAN daisy-chain + power). Until fixed, CONNECT shows "ROBOT OFF".
+
+**OPEN — process:** NOTHING IS COMMITTED (working tree spans two threads' work since
+`1d0a536`). Other known gaps: stub timeline never enters POLICY (verdict modal untested
+headlessly), mono video path lacks every robustness fix (legacy), TLS/tokens/systemd
+hardening backlog, true stereo-3D needs a calibrated camera pair + per-eye HUD (transport
+supports it; docs/refs/xrobotoolkit/stereo-vision.md), camera-channel drop root cause behind
+the grabber's auto-reopen never chased (watch `[camera] ... reopening` frequency).
+
+**The headset ritual (after killing the app / doze):** app open → Network panel → tap popup
+IP → Controller+Send ON (controller lives here; a red NO-CONTROLLER-INPUT banner in the HUD
+means redo this) → Camera panel → ZEDMINI → Listen → Confirm (video lives here; IP is saved
+per network). Trials: just run POLICY — recording is automatic, verdict modal after each run.
+
+**Skills grown this session — check them BEFORE debugging:** `small-errors` (papercut
+symptom→fix: dead stick, doze, stale IPs, no popup, B collision), `infra` (issue log now
+ISSUE-001..004 + "probe trap" rule: fresh connections lie about long-lived stream staleness;
+test sustained), `logging` ([lat] conventions; from the parallel thread).
+
+**Shipped this session** (all UNCOMMITTED — see inventory below):
+- **Fleet management / customer onboarding (2026-06-12, DEPLOYED to the relay VM):** the
+  relay now keeps a persisted fleet registry (`/opt/fleet.json` on the VM: robots + customers
+  + links; seeded from the old RELAY_TOKENS env). Fleet UI admin card: **Add arm** (mints a
+  robot token + install one-liner; card appears offline → flips online when the agent dials
+  in), **Add customer** (mints a token + scoped UI URL), per-arm **link/unlink chips**.
+  Customer tokens see/control ONLY their linked arms (UI + `/api/cmd` + `/cam/` + the
+  operator DATA PLANE: `auth_operator` accepts a user token only while linked — unlink
+  revokes new connections instantly). Report card + `/api/fleet` are admin-only. All
+  mutations live, no restarts. e2e-tested locally (grant/revoke/persistence assertions).
+  WART: yam-1 and mac-1 still share one legacy token — mint fresh ones. TLS still pending
+  (tokens travel plaintext) — now customer-facing, so hardening priority went UP.
+- **Stereo video transport is the default** (`--video stereo`): Quest dials Mac `:13579`
+  (ZEDMINI flow), double-wide canvas = both cameras side by side + ONE HUD bar, wide sim
+  render on VIEW toggle. Protocol: `docs/refs/xrobotoolkit/stereo-vision.md`.
+- **Robustness fixes, each root-caused live**: newest-connection-wins preemption (green-screen
+  zombie, infra ISSUE-003), send-each-frame-once (3 s Quest decode backlog), SO_SNDBUF+drop
+  (doze backlog), camera auto-reopen after 3 s dead (NO SIGNAL self-heals), announce
+  broadcast on the interface's REAL broadcast (not /24 guess).
+- **No more IP typing**: `scripts/xrtk_announce.py` replays the PC-service discovery packet
+  Docker was eating (infra ISSUE-002, `docs/refs/xrobotoolkit/discovery-announce.md`).
+- **Per-stage latency tracking** (lag diagnosis, e2e-verified headless): every tier prints a
+  `[lat]` line with `stage=avg/max ms` over the window. Eval (every 2 s, next to `[dbg]`):
+  `input_age` (XR tick age at use; bridge mode only), `ik`, `loop_busy` (>20 ms avg = can't
+  hold 50 Hz), `cmd_queue` (set_target→socket write; ~8–10 ms by design, decoupled 50 Hz
+  sender), `cmd_write`, `arm_rtt` — Mac-clock round trip: command write → serve APPLIES it →
+  `{"ack": t}` echo (protocol grew optional `"t"` in commands; old serve = no acks, harmless),
+  `cam_age` = freshest camera frame age at composite. Stereo sender (every 5 s):
+  `vid_queue` (submit→encode), `vid_encode`, `vid_send`, `vid_skip`/`vid_drop` counters.
+  Serve, Orin-side (every 5 s): `gap` (inter-command = network+sender jitter), `apply`.
+  Clocks are NOT synced across machines — every number is single-clock (RTT trick for
+  cross-machine). Helper: `LatencyStats` in `stereo_sender.py`; `xrobotoolkit_sdk.get_input_age_s()`.
+  Full stage map, log-file locations, and conventions: **`.claude/skills/logging/SKILL.md`**.
+- **Browser operator console + report sessions (2026-06-12):** `preview_server.py` serves a
+  live mirror of the EXACT headset canvas at `http://<mac>:8810/` (MJPEG; a watcher alone
+  makes the eval render — no Quest needed) with full keyboard control (arrows/Enter = menu,
+  a/x/b/y = shortcuts; `/key` endpoint). Report sessions: fleet UI (`:8080`) gained
+  **New report / Finish report / Status** buttons → `/api/report` → proxied over a relay
+  channel to the Mac, which registers as node `mac-1` (`relay.py robot --robot mac-1
+  --allow 8810`; token added to VM RELAY_TOKENS; UI hides `mac-*` from arm cards).
+  New report = rotate to fresh `runs/<date>_<task>_<HHMMSS>/` + record the WHOLE operator
+  view to `session.mp4` (SessionTape, wall-clock pts). Finish = stop tape + render
+  `report.html`. Gotcha: relay HTTP proxies must read by Content-Length, NOT to EOF — the
+  agent-side splice holds the channel open until both directions close. `setsid` does not
+  exist on macOS (Orin-only recipe). Demo capture: `scripts/record_mirror.py` (standalone
+  mirror→mp4), ffmpeg now installed on the Mac for side-by-side composition.
+- Testing: `scripts/fake_quest_stereo.py` = headless fake Quest; run against
+  `XR_INPUT=stub eval_yam_vr.py --cameras none --serve-port 5599` (stub PRESSES buttons —
+  fake serve only!). MuJoCo `offwidth` raised to 1920 in `assets/yam/scene.xml`.
+
+**Eval report system v1 — BUILT & verified with real in-VR trials (this thread):**
+`eval_yam_vr.py --task <name> --stages reach grasp lift place` auto-records **one trial per
+POLICY run** (no button: entering POLICY starts video+meta, the post-run SUCCESS/FAIL verdict
+modal — stick l/r + click — saves the result and closes the trial; re-entering POLICY with a
+verdict pending saves the old trial unjudged). Operator-view canvas →
+`runs/<date>_<task>/trial_NNN/video.mp4` + `meta.json` with timestamped
+state/gripper/connect/policy events; REC badge in HUD. Recordings are full-frame even when
+the headset view is letterboxed (`--screen-scale`, default 0.85). HUD menu = 2x4 centered
+grid; stick up/down jumps rows.
+Judge: `eval_report.py serve` → http://127.0.0.1:7799 (play video, success/fail, failed
+stage + 0-1 score, notes → saved into meta.json; mp4 served with Range for Safari).
+Report: `eval_report.py render` → self-contained `report.html` (success rate, mean progress,
+failure-by-stage histogram, per-trial videos). Scoring: success=1.0 else
+(completed_stages + score)/n. NOTE: mean-progress only counts scored trials — binary in-VR
+fails contribute nothing until staged+scored in the judge. Verified headlessly AND with a
+real 7-trial in-VR session (videos, verdicts, event timelines all correct).
+**Operator UX shipped alongside:** 2x4 centered menu grid (stick up/down = rows), `--screen-
+scale 0.85` letterbox ("move the screen back"; recordings stay full-frame), red NO-CONTROLLER-
+INPUT banner (liveness = head-pose jitter, bridge mode), policy-verdict modal owns the stick
+while up (A/X/B/Y safety shortcuts stay live). Camera relay (Orin) got only-new-frames +
+SO_SNDBUF+drop (ISSUE-004) — slow consumers get FEWER frames, never OLDER frames.
+**File ownership to avoid parallel-edit conflicts:** this thread owns `scripts/eval_yam_vr.py`,
+`scripts/stereo_sender.py`, `scripts/eval_report.py` (new), `docs/SESSION-HANDOFF.md`.
+Parallel threads: don't edit those; everything else is fair game.
+
+**Uncommitted working tree** (nothing committed since `1d0a536`; spans BOTH threads' work —
+coordinate before committing): modified — `eval_yam_vr.py`, `YAM_control/camera_relay.py`
+(deployed to Orin), `YAM_control/yam_real_serve.py` (ack protocol), `xrobotoolkit_sdk.py`,
+`scene.xml`, `SESSION-HANDOFF.md`, `refs/xrobotoolkit/INDEX.md`,
+`.claude/skills/infra/SKILL.md`, `policies/gripper_forward.py`;
+new — `stereo_sender.py`, `eval_report.py`, `xrtk_announce.py`, `fake_quest_stereo.py`, `show_poses.py`,
+`refs/xrobotoolkit/stereo-vision.md`, `refs/xrobotoolkit/discovery-announce.md`,
+`.claude/skills/small-errors/`, `.claude/skills/logging/`, `runs/2026-06-11_red-plate-pickup/`
+(7 real trial videos + metas — decide whether runs/ belongs in git or .gitignore).
+
 ## Architecture as deployed (live right now)
 
 ```
@@ -40,9 +157,13 @@ eval ──► localhost:18089 (cameras) ─┴─ operator client ──► rel
 ```bash
 docker start xr-bridge || docker run -d --rm --name xr-bridge -p 63901:63901 -p 8765:8765 xr-bridge
 .venv/bin/python relay/relay.py operator --relay 35.185.232.107:8443 --robot yam-1 --token $(cat /tmp/relay_token) &
+.venv/bin/python scripts/xrtk_announce.py --unicast 192.168.0.30 &   # headset IP popup, no typing
 XR_INPUT=bridge .venv/bin/python scripts/eval_yam_vr.py --quest-ip 192.168.0.30 \
   --serve-host 127.0.0.1 --serve-port 15599 \
   --cameras http://127.0.0.1:18089/0 http://127.0.0.1:18089/2     # logs: /tmp/eval_live.log
+# ^ REMOTE (cloud-relay) endpoints. At home go LAN-direct (no GCP hop; infra ISSUE-004):
+#   --serve-host 192.168.0.185 --serve-port 5599 \
+#   --cameras http://192.168.0.185:8089/0 http://192.168.0.185:8089/2
 ```
 
 **Orin** (agent is the only must; serve/cameras can be started from the fleet UI):
@@ -54,9 +175,14 @@ setsid nohup ~/miniforge3/envs/xr/bin/python ~/blupe-evals/relay/relay.py robot 
 # CAN after every reboot/replug (sudo): bash ~/blupe-evals/YAM_control/setup_can.sh
 ```
 
-**Headset:** Network panel → `192.168.0.190` → Controller+Send ON. Remote Vision → source
-`192.168.0.190` → LISTEN. Menu: stick L/R + click; A=TELEOP X=POLICY B=GO_HOME Y=QUIT;
-CONNECT toggles real-arm follow; VIEW toggles cameras↔sim; trigger = gripper.
+**Headset (no typing):** with `xrtk_announce.py` running on the Mac, launching the app pops
+an IP-select dialog — tap `192.168.0.190` (that IS the Network-panel connect) → Controller+
+Send ON. Video (stereo, default): Camera panel → source **ZEDMINI** (default) → Listen →
+IP pre-fills after the FIRST ever entry (PlayerPrefs; exit the app cleanly once) → Confirm.
+Shows both cameras side by side, ONE HUD bar across; keep the app in FLAT mode (B toggles
+flat↔3D AND collides with B=GO_HOME — avoid B). Video (`--video mono` legacy): Remote
+Vision → source `192.168.0.190` → LISTEN. Menu: stick L/R + click; A=TELEOP X=POLICY
+B=GO_HOME Y=QUIT; CONNECT toggles real-arm follow; VIEW toggles cameras↔sim; trigger = gripper.
 
 **Operate-the-arm sequence:** power arm → fleet UI **Turn ON** (runs preflight: CAN, motors
 via `start_joints` handshake, cameras; starts what's down) → headset LISTEN + CONNECT → drive.
@@ -84,6 +210,16 @@ via `start_joints` handshake, cameras; starts what's down) → headset LISTEN + 
    of a second; the stereo flow (Quest dials us, fresh session per panel-open) also resets this
    inherently. Measured: camera composite encodes at ~4 Mbit/s, 62 KB keyframes (content is NOT
    the issue; cv2 URL reads verified at 24–31 fps with real content).
+   **Transport rework SHIPPED (2026-06-11):** stereo (ZEDMINI) flow is now the eval's default
+   (`--video stereo`; `--video mono` = legacy). Quest dials us on :13579 → we stream a
+   double-wide H.264 canvas back; VIEW toggle works over it (cameras: both side by side at
+   full size; sim: one wide render; ONE HUD bar across the whole frame — view in the app's
+   FLAT mode). Both structural fixes built into `stereo_sender.py`: SO_SNDBUF 128 KB + drop-
+   frames-on-backpressure (no doze backlog), fresh session per panel-open. Headless e2e PASSED
+   (`scripts/fake_quest_stereo.py` plays the Quest side; run it against
+   `XR_INPUT=stub … eval_yam_vr.py --cameras none`). **Real-headset test pending.** Protocol
+   doc: `docs/refs/xrobotoolkit/stereo-vision.md`. KNOWN COLLISION: in stereo view the Quest
+   app uses **B = flat↔3D toggle** — same button as our B=GO_HOME shortcut.
 2. **Fleet UI camera view** ("Turn ON lets us view cameras"). Design ready: relay gains
    `Relay.open_channel(robot_id, port)` (reuse pending/open machinery), HTTP route
    `/cam/<robot>/<idx>?token=` that opens a channel to robot :8089, writes a raw
@@ -117,6 +253,16 @@ via `start_joints` handshake, cameras; starts what's down) → headset LISTEN + 
 - `patch_framework.py` never existed (stale ORIN-SETUP.md): superseded by generating a
   consistent `yam.urdf` from the MJCF (`scripts/gen_yam_urdf.py`). Stock framework works.
 - Background subagents get auto-denied permissions — run privileged work inline.
+- **`XR_INPUT=stub` PRESSES BUTTONS** (it simulates a full session, including CONNECT): a
+  headless test eval will dial whatever serve it's pointed at and drive it. Point test evals
+  at a `yam_real_serve.py --fake` instance, NEVER at a real arm's serve.
+- **Docker breaks the PC-service LAN announce** (UDP :29888 → headset's one-click IP popup):
+  the container broadcasts onto its own bridge subnet with the container IP. That's the ONLY
+  reason we ever typed IPs into the Network panel. `scripts/xrtk_announce.py` replays the
+  packet natively (details: `docs/refs/xrobotoolkit/discovery-announce.md`).
+- **MuJoCo offscreen render width is capped by `<global offwidth=…>`** in the scene XML
+  (default 640!) — `mujoco.Renderer(width=…)` above it raises. `assets/yam/scene.xml` is now
+  1920 for the stereo double-wide canvas.
 
 ## Commits this session (oldest first)
 
