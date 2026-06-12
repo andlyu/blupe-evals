@@ -21,10 +21,19 @@ it converts "nothing works" into "only the robot link can be wrong".
 
 The **serve** is the small TCP server that owns your motors and the safety rules
 (velocity clamp, hold-on-disconnect, torque-off). Supported embodiments ship a reference
-serve — YAM: `YAM_control/yam_real_serve.py` (i2rt/CAN). Run it next to the arm and
-verify the handshake: connecting to `:5599` must immediately yield one line,
-`{"start_joints": [...]}`, with the arm's REAL current joints. No handshake = the serve
-can't talk to the motors yet — fix that before anything else (power, bus, driver).
+serve — YAM: `YAM_control/yam_real_serve.py` (i2rt/CAN). Start it, start the cameras,
+then **verify your whole side with one command** (stdlib-only, safe — reads the handshake,
+never moves the arm):
+
+```bash
+python3 scripts/check_robot_setup.py --robot <your-arm-id> --token <your-token>
+```
+
+Four PASS/FAIL lines — serve handshake, camera frames, outbound relay reachability, token
+validity — each FAIL printing its exact fix, in dependency order. ALL GREEN means the
+agent one-liner is the only thing left. (You can also verify end to end from anywhere:
+`curl "http://<relay-host>:8080/api/status?token=<your-customer-token>"` returns your
+arms' live state as JSON.)
 
 If your unit needs a custom serve (different driver/firmware), the wire protocol and the
 non-negotiable safety contract are specified in
