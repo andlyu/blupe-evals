@@ -146,11 +146,20 @@ The robot agent:
 Example YAM policy config:
 
 ```bash
+--policy noop='cd /home/andrew/blupe-evals && \
+  /home/andrew/miniforge3/envs/xr/bin/python scripts/run_policy.py \
+  scripts/policies/noop.py:run \
+  --serve-host 127.0.0.1 --serve-port 5599' \
 --policy pick_place='cd /home/andrew/blupe-evals && \
   /home/andrew/miniforge3/envs/xr/bin/python scripts/run_policy.py \
   scripts/policies/pick_place.py:run \
-  --serve-host 127.0.0.1 --serve-port 5599'
+  --serve-host 127.0.0.1 --serve-port 5599' \
+--default-policy noop
 ```
+
+Start with `noop` from the fleet UI. It exercises the full robot-side `run_policy` path
+without commanding motion. Switch the default to a task policy only after the no-op path
+starts, logs, and stops correctly.
 
 ### Operator-side eval policy path
 

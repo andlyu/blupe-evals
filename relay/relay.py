@@ -7,7 +7,8 @@ One stdlib file, three roles (PLAN "Customer transport"):
             that lists arms/operators and can turn an arm ON (with preflight verification)
             or OFF (kill serve + guaranteed torque-off).
   robot     runs at the robot site; dials OUT to the relay, bridges relay channels to local
-            services on an allowlist, and executes fleet commands (preflight/arm_on/arm_off).
+            services on an allowlist, and executes fleet commands
+            (preflight/arm_on/arm_off/run_policy/stop_policy).
   operator  runs at the operator site; dials OUT and exposes the robot's services on LOCAL
             ports (5599 -> 15599, 8089 -> 18089), so the eval runs unchanged.
 
@@ -38,6 +39,7 @@ import json
 import os
 import secrets
 import shlex
+import signal
 import time
 import urllib.parse
 
@@ -87,6 +89,7 @@ class Robot:
         self.since = time.time()
         self.channels = {}            # conn_id -> {"port": p, "peer": str, "since": t}
         self.last_preflight = None    # {"t": ..., "data": {...}}
+        self.info = {}                # latest robot-agent heartbeat metadata
 
 
 class Relay:
@@ -230,6 +233,8 @@ class Relay:
                         fut = self.cmd_waiters.pop(req, None)
                         if fut is not None and not fut.done():
                             fut.set_result(msg.get("data", {}))
+                    elif msg.get("ping") is not None:
+                        rob.info = msg
             finally:
                 if self.robots.get(robot_id) is rob:
                     del self.robots[robot_id]
@@ -290,14 +295,16 @@ class Relay:
             raise
 
     # ---- fleet commands ------------------------------------------------------ #
-    async def command(self, robot_id, cmd):
+    async def command(self, robot_id, cmd, **params):
         rob = self.robots.get(robot_id)
         if rob is None:
             return {"ok": False, "err": f"robot '{robot_id}' offline"}
         req = next(self.ids)
         fut = asyncio.get_running_loop().create_future()
         self.cmd_waiters[req] = fut
-        _send(rob.writer, {"cmd": cmd, "req": req})
+        msg = {"cmd": cmd, "req": req}
+        msg.update({k: v for k, v in params.items() if v not in (None, "")})
+        _send(rob.writer, msg)
         try:
             await rob.writer.drain()
             data = await asyncio.wait_for(fut, timeout=CMD_TIMEOUT_S)
@@ -327,6 +334,7 @@ class Relay:
                               "for_s": round(time.time() - c["since"])}
                              for c in r.channels.values()] if r else [],
                 "last_preflight": r.last_preflight if r else None,
+                "policy": r.info.get("policy", {}) if r else {},
             }
         return out
 
@@ -392,8 +400,12 @@ async function report(action, btn){ btn.disabled = true;
         document.getElementById('report-out').textContent = JSON.stringify(r, null, 2); }
   finally { btn.disabled = false; } }
 async function cmd(robot, c, btn){ btn.disabled = true; btn.textContent = c + '…';
-  const labels = {arm_on:'Turn ON',arm_off:'Turn OFF',preflight:'Check'};
-  const r = await api('/api/cmd?robot=' + encodeURIComponent(robot) + '&cmd=' + encodeURIComponent(c));
+  const labels = {arm_on:'Turn ON',arm_off:'Turn OFF',preflight:'Check',
+                  run_policy:'Run policy',stop_policy:'Stop policy'};
+  const sel = document.getElementById('policy-' + robot);
+  const pol = c === 'run_policy' && sel ? '&policy=' + encodeURIComponent(sel.value) : '';
+  const r = await api('/api/cmd?robot=' + encodeURIComponent(robot) +
+                      '&cmd=' + encodeURIComponent(c) + pol);
   document.getElementById('out-' + robot).textContent = JSON.stringify(r, null, 2);
   btn.disabled = false; btn.textContent = labels[c];
   if (c === 'arm_on' && r.ok && r.data && (r.data.result === 'ON' || r.data.result === 'already on'))
@@ -416,6 +428,10 @@ function card(id){                                          // built ONCE; refre
       <span class="muted" id="linkmsg-${id}"></span></div>` : '';
   el.innerHTML = `<span class="name" id="nm-${id}">${id}</span> <span class="on" id="st-${id}"></span>
     <div class="ops" id="ops-${id}"></div>${admin}
+    <div class="ops">policy: <span id="policy-status-${id}">unknown</span>
+      <select id="policy-${id}"></select>
+      <button class="primary" id="policy-run-${id}" onclick="cmd('${id}','run_policy',this)">Run policy</button>
+      <button id="policy-stop-${id}" onclick="cmd('${id}','stop_policy',this)">Stop policy</button></div>
     <button class="primary" onclick="cmd('${id}','arm_on',this)">Turn ON</button>
     <button class="danger" onclick="cmd('${id}','arm_off',this)">Turn OFF</button>
     <button onclick="cmd('${id}','preflight',this)">Check</button>
@@ -441,6 +457,18 @@ async function refresh(){
       : s[id].channels.length
         ? s[id].channels.map(c => `port ${c.port} ← ${c.peer} (${c.for_s}s)`).join('<br>')
         : 'no operator connected';
+    const p = s[id].policy || {};
+    const names = p.configured || [];
+    const policySel = document.getElementById('policy-' + id);
+    policySel.innerHTML = names.length
+      ? names.map(n => `<option value="${n}">${n}</option>`).join('')
+      : '<option value="">none configured</option>';
+    if (p.default && names.includes(p.default)) policySel.value = p.default;
+    const running = p.running ? `running ${p.running} (${p.running_s || 0}s)` : 'idle';
+    document.getElementById('policy-status-' + id).textContent =
+      names.length ? `${running}; configured: ${names.join(', ')}` : 'none configured';
+    document.getElementById('policy-run-' + id).disabled = !on || !names.length || !!p.running;
+    document.getElementById('policy-stop-' + id).disabled = !on || !p.running;
     if (ME.role === 'admin'){
       document.getElementById('links-' + id).innerHTML = (s[id].linked || []).map(u =>
         `<b>${u}</b> <button onclick="unlink('${id}','${u}')" title="unlink">✕</button>`)
@@ -628,12 +656,12 @@ async def _http_ui(relay, args):
             elif url.path == "/api/cmd":
                 robot = q.get("robot", [""])[0]
                 cmd = q.get("cmd", [""])[0]
-                if cmd not in ("preflight", "arm_on", "arm_off"):
+                if cmd not in ("preflight", "arm_on", "arm_off", "run_policy", "stop_policy"):
                     body, ctype, code = '{"err":"bad cmd"}', "application/json", 400
                 elif robot not in relay.visible_robots(who):
                     body, ctype, code = '{"err":"not your arm"}', "application/json", 403
                 else:
-                    body = json.dumps(await relay.command(robot, cmd))
+                    body = json.dumps(await relay.command(robot, cmd, policy=q.get("policy", [""])[0]))
                     ctype, code = "application/json", 200
             else:
                 body, ctype, code = "not found", "text/plain", 404
@@ -680,7 +708,16 @@ class Arm:
     def __init__(self, args):
         self.args = args
         self.proc = None
+        self.policy_proc = None
+        self.policy_id = None
+        self.policy_started = None
         self.lock = asyncio.Lock()
+        self.policies = {}
+        for item in args.policy or []:
+            name, sep, cmd = item.partition("=")
+            if sep and name.strip() and cmd.strip():
+                self.policies[name.strip()] = cmd.strip()
+        self.default_policy = args.default_policy or (next(iter(self.policies), ""))
 
     async def _sh(self, cmd, timeout=10):
         p = await asyncio.create_subprocess_shell(
@@ -698,6 +735,22 @@ class Arm:
             return json.loads(line.decode()).get("start_joints")
         except Exception:
             return None
+
+    async def _tail(self, path, lines=12):
+        try:
+            _, out = await self._sh(f"tail -{int(lines)} {shlex.quote(path)}", timeout=3)
+            return out
+        except Exception:
+            return ""
+
+    def policy_status(self):
+        running = self.policy_proc is not None and self.policy_proc.returncode is None
+        return {
+            "configured": sorted(self.policies),
+            "default": self.default_policy,
+            "running": self.policy_id if running else None,
+            "running_s": round(time.time() - self.policy_started) if running and self.policy_started else 0,
+        }
 
     async def _shutdown_serve(self):
         """Ask the serve to torque off and exit via its own protocol."""
@@ -773,6 +826,8 @@ class Arm:
             return await self._arm_off()
 
     async def _arm_off(self):
+        if self.policy_proc is not None and self.policy_proc.returncode is None:
+            await self._stop_policy_locked()
         killed = []
         graceful, detail = await self._shutdown_serve()
         if graceful:
@@ -803,6 +858,67 @@ class Arm:
             killed.insert(0, detail)
         return {"result": result, "killed": killed or ["nothing running"], "turnoff_tail": tail}
 
+    async def run_policy(self, policy=None):
+        async with self.lock:
+            return await self._run_policy_locked(policy)
+
+    async def _run_policy_locked(self, policy=None):
+        if self.policy_proc is not None and self.policy_proc.returncode is None:
+            return {"result": "policy already running", "policy": self.policy_id,
+                    "status": self.policy_status()}
+        policy_id = policy or self.default_policy
+        cmd = self.policies.get(policy_id)
+        if not cmd:
+            return {"result": "REFUSED: no such policy configured", "policy": policy_id,
+                    "configured": sorted(self.policies)}
+        sj = await self._handshake()
+        if sj is None:
+            return {"result": "REFUSED: serve is off; Turn ON first", "policy": policy_id}
+        self.policy_proc = await asyncio.create_subprocess_shell(
+            f"exec {cmd}", start_new_session=True,
+            stdout=open(self.args.policy_log, "ab"), stderr=asyncio.subprocess.STDOUT)
+        self.policy_id = policy_id
+        self.policy_started = time.time()
+        await asyncio.sleep(0.5)
+        if self.policy_proc.returncode is not None:
+            tail = await self._tail(self.args.policy_log)
+            rc = self.policy_proc.returncode
+            self.policy_proc = None
+            self.policy_id = None
+            self.policy_started = None
+            return {"result": f"policy exited rc={rc}", "policy": policy_id, "log": tail}
+        return {"result": "POLICY started", "policy": policy_id, "pid": self.policy_proc.pid,
+                "start_joints": sj}
+
+    async def stop_policy(self):
+        async with self.lock:
+            return await self._stop_policy_locked()
+
+    async def _stop_policy_locked(self):
+        if self.policy_proc is None or self.policy_proc.returncode is not None:
+            self.policy_proc = None
+            self.policy_id = None
+            self.policy_started = None
+            return {"result": "no policy running"}
+        policy_id = self.policy_id
+        try:
+            os.killpg(self.policy_proc.pid, signal.SIGTERM)
+            await asyncio.wait_for(self.policy_proc.wait(), timeout=5)
+            result = "POLICY stopped"
+        except (ProcessLookupError, PermissionError):
+            result = "POLICY already exited"
+        except asyncio.TimeoutError:
+            try:
+                os.killpg(self.policy_proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            result = "POLICY killed"
+        tail = await self._tail(self.args.policy_log)
+        self.policy_proc = None
+        self.policy_id = None
+        self.policy_started = None
+        return {"result": result, "policy": policy_id, "log": tail}
+
 
 async def _robot_data(args, conn_id, port):
     try:
@@ -821,7 +937,8 @@ async def role_robot(args):
     allow = set(args.allow)
     host, rport = args.relay.rsplit(":", 1)
     arm = Arm(args)
-    cmds = {"preflight": arm.preflight, "arm_on": arm.arm_on, "arm_off": arm.arm_off}
+    cmds = {"preflight": arm.preflight, "arm_on": arm.arm_on, "arm_off": arm.arm_off,
+            "run_policy": arm.run_policy, "stop_policy": arm.stop_policy}
     while True:
         try:
             reader, writer = await asyncio.open_connection(host, int(rport))
@@ -831,13 +948,16 @@ async def role_robot(args):
 
             async def ping():
                 while True:
-                    await asyncio.sleep(PING_S)
-                    _send(writer, {"ping": time.time()})
+                    _send(writer, {"ping": time.time(), "policy": arm.policy_status()})
                     await writer.drain()
+                    await asyncio.sleep(PING_S)
 
-            async def run_cmd(name, req):
+            async def run_cmd(name, req, msg):
                 try:
-                    data = await cmds[name]()
+                    if name == "run_policy":
+                        data = await cmds[name](msg.get("policy"))
+                    else:
+                        data = await cmds[name]()
                 except Exception as e:
                     data = {"result": f"agent error: {type(e).__name__}: {e}"}
                 _send(writer, {"resp": req, "data": data})
@@ -852,7 +972,7 @@ async def role_robot(args):
                         break
                     msg = json.loads(line.decode())
                     if msg.get("cmd") in cmds:
-                        asyncio.create_task(run_cmd(msg["cmd"], msg.get("req")))
+                        asyncio.create_task(run_cmd(msg["cmd"], msg.get("req"), msg))
                     elif msg.get("open") is not None:
                         port = msg["open"]
                         if port in allow:
@@ -928,6 +1048,10 @@ def main():
         "~/i2rt/.venv/bin/python ~/blupe-evals/YAM_control/turn_off.py --channel can0"))
     r.add_argument("--camera-cmd", default=os.path.expanduser(
         "~/miniforge3/envs/xr/bin/python ~/blupe-evals/YAM_control/camera_relay.py --devices 0 2"))
+    r.add_argument("--policy", action="append", default=[],
+                   help="policy mapping, e.g. pick_place='cd /repo && python scripts/run_policy.py scripts/policies/pick_place.py:run'")
+    r.add_argument("--default-policy", default="", help="policy id used when the UI does not specify one")
+    r.add_argument("--policy-log", default="/tmp/policy_managed.log")
 
     o = sub.add_parser("operator")
     o.add_argument("--relay", required=True)
