@@ -580,8 +580,19 @@ def main(quest_ip: str, port: int = 12345, policy: Optional[str] = None,
     jt = c.solver.add_joints_task()
     jt.set_joints({j: 0.0 for j in c.placo_robot.joint_names()})
     jt.configure("reg", "soft", 1e-4)
+    if spec.orientation_weight != 1.0:         # <6-DOF arms: position pinned, orientation
+        for ee_name, ee_task in c.effector_task.items():   # best-effort via the wrist's DOFs
+            ee_task.configure(ee_name, "soft", 1.0, spec.orientation_weight)
 
     m, d = c.mj_model, c.mj_data
+    grip_aid = None                    # sim gripper actuator (arms that model one, e.g. so101)
+    if spec.gripper_joint:
+        grip_aid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_ACTUATOR, spec.gripper_joint)
+        if grip_aid < 0:
+            grip_aid = None
+        else:
+            print(f"[eval] sim gripper: right trigger TOGGLES actuator "
+                  f"{spec.gripper_joint!r} (press = open<->close)", flush=True)
     home_qpos = m.key("home").qpos[:E.N_ARM].copy()
     mujoco.mj_resetDataKeyframe(m, d, m.key("home").id)
     mujoco.mj_forward(m, d)
@@ -823,10 +834,10 @@ def main(quest_ip: str, port: int = 12345, policy: Optional[str] = None,
                 c._update_mocap_target()
                 c._send_command()                      # raw IK target -> d.ctrl
                 LAT.note("ik", time.monotonic() - t_ik)
-                if c.active.get("right_hand", False):   # gripping: drive to IK target, rate-capped
-                    step = E.MAX_VEL * dt
+                if any(c.active.values()):              # any clutch held: drive to IK target,
+                    step = E.MAX_VEL * dt               # rate-capped (bimanual: either hand)
                     d.ctrl[:E.N_ARM] = prev_ctrl + np.clip(d.ctrl[:E.N_ARM] - prev_ctrl, -step, step)
-                else:                                   # not gripping: HOLD current pose (no move)
+                else:                                   # no clutch: HOLD current pose (no move)
                     d.ctrl[:E.N_ARM] = prev_ctrl
             elif state in ("GO_HOME", "QUIT"):
                 cur = d.ctrl[:E.N_ARM].copy()
@@ -838,14 +849,20 @@ def main(quest_ip: str, port: int = 12345, policy: Optional[str] = None,
                     state = "HOLD"                 # stay alive so the headset can reconnect
                     print("[eval] state = HOLD (home reached)", flush=True)
 
+            # Gripper = YAM pattern everywhere: trigger press TOGGLES open<->closed.
+            trig = (c.xr_client.get_key_value_by_name("right_trigger") or 0.0) > 0.5
+            if trig and not trig_prev:                           # rising edge -> toggle
+                gripper_open = not gripper_open
+                print(f"[eval] gripper -> {'OPEN' if gripper_open else 'CLOSED'}", flush=True)
+                if recorder is not None and recorder.recording:
+                    recorder.event("gripper", "open" if gripper_open else "closed")
+            trig_prev = trig
+            if grip_aid is not None:                             # sim-modeled gripper (so101/droid)
+                glo, ghi = m.actuator_ctrlrange[grip_aid]
+                open_v, closed_v = (ghi, glo) if spec.gripper_open_high else (glo, ghi)
+                d.ctrl[grip_aid] = open_v if gripper_open else closed_v
+
             if connect_arm and link is not None and link.status == "connected":
-                trig = (c.xr_client.get_key_value_by_name("right_trigger") or 0.0) > 0.5  # index finger as a button
-                if trig and not trig_prev:                       # rising edge -> toggle open<->closed
-                    gripper_open = not gripper_open
-                    print(f"[eval] gripper -> {'OPEN' if gripper_open else 'CLOSED'}", flush=True)
-                    if recorder is not None and recorder.recording:
-                        recorder.event("gripper", "open" if gripper_open else "closed")
-                trig_prev = trig
                 if state == "POLICY" and robot.gripper is not None:
                     gripper = robot.gripper                      # the policy owns the gripper
                 else:

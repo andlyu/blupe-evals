@@ -1,0 +1,37 @@
+<mujoco model="so101_scene">
+  <!-- SO-101 (TheRobotStudio, new-calib model) + mocap target, mirroring assets/yam/scene.xml.
+       Upstream scene kept as scene_upstream.xml. nq=6: joints 0-4 = arm, 5 = gripper. -->
+  <include file="so101_new_calib.xml"/>
+
+  <statistic center="0.2 0 0.2" extent="0.7"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <global azimuth="120" elevation="-20" offwidth="1920" offheight="720"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="flat" rgb1="0 0 0" rgb2="0 0 0" width="512" height="512"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8"
+             width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <body name="right_target" pos="0.2 0.0 0.25" quat="1 0 0 0" mocap="true">
+      <geom name="rt_x" type="cylinder" size="0.004 0.04" pos="0.04 0 0" zaxis="1 0 0" rgba="1 0 0 1" contype="0" conaffinity="0" group="1"/>
+      <geom name="rt_y" type="cylinder" size="0.004 0.04" pos="0 0.04 0" zaxis="0 1 0" rgba="0 1 0 1" contype="0" conaffinity="0" group="1"/>
+      <geom name="rt_z" type="cylinder" size="0.004 0.04" pos="0 0 0.04" zaxis="0 0 1" rgba="0 0 1 1" contype="0" conaffinity="0" group="1"/>
+      <site type="sphere" size="0.008" rgba="0 0 1 1" group="1"/>
+    </body>
+  </worldbody>
+
+  <keyframe>
+    <!-- new-calib zero = mid-range, a sane upright home; last value = gripper joint -->
+    <key name="home" qpos="0 0 0 0 0 0" ctrl="0 0 0 0 0 0"/>
+  </keyframe>
+</mujoco>
