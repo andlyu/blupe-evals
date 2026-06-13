@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_yam"
+version = "0.1.0"
+description = "i2rt YAM follower integration for LeRobot (talks to yam_real_serve over TCP)"
+readme = "README.md"
+requires-python = ">=3.10"
+# Only dependency is lerobot itself: YamFollower reaches the arm through the serve
+# socket, so i2rt and its heavy deps (numpy 2.x, python-can, mujoco...) stay isolated
+# in the serve's own venv. That decoupling is deliberate — see README.
+dependencies = ["lerobot>=0.4"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lerobot_robot_yam*"]
+exclude = ["*.egg-info"]
+
+# LeRobot discovers robot plugins by importing installed distributions whose name
+# starts with `lerobot_`. The register_subclass decorator (fired on import of the
+# package below) is what actually registers `--robot.type=yam_follower`.

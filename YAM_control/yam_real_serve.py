@@ -12,6 +12,8 @@ Wire (newline-delimited JSON, matches blupe-eval-console/link.py):
   server->client ack:   {"ack": t}                      (echo of t AFTER the command is applied —
                                                         the sender computes RTT on ITS OWN clock;
                                                         only sent when t is present)
+  client->server obs:   {"obs": true}                   (pull current joints; lerobot follower)
+  server->client obs:   {"joints": [6 arm + gripper]}   (radians; gripper normalized 0..1)
   client->server quit:  {"shutdown": true}              (-> torque OFF)
 
 Gripper: i2rt's gripper is NORMALIZED [0,1] (0=closed, 1=open) — never raw motor radians. We follow
@@ -139,6 +141,11 @@ def main():
                         print("[serve] shutdown -> torque off", flush=True)
                         disable_motorchain(robot)
                         return
+                    if msg.get("obs"):                 # observation pull (lerobot YamFollower):
+                        cur = np.asarray(robot.get_joint_pos(), dtype=float)   # 6 arm + gripper
+                        f.write((json.dumps({"joints": [float(x) for x in cur]}) + "\n").encode())
+                        f.flush()
+                        continue
                     q = msg.get("q")
                     if q is None:
                         continue
