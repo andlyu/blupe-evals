@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Robot-side setup checker — run this ON the robot computer; every line is PASS or a fix.
 
-    python3 scripts/check_robot_setup.py --relay 35.185.232.107:8443 --robot yam-2 --token <tok>
+    python3 scripts/check_robot_setup.py --relay 35.203.190.87:8443
 
 STDLIB ONLY (like the agent): works on a bare python3, no venv needed.
 
@@ -10,7 +10,7 @@ Checks, in dependency order:
   2. cameras    your camera endpoint serves MJPEG frames on :8089 (each --cam index)
   3. relay      the cloud relay is reachable (one OUTBOUND tcp connect — the only thing
                 your site ever needs network-wise)
-  4. token      your arm token is accepted (verified via a harmless operator-role hello;
+  4. token      optional: a customer/operator token is accepted (verified via a harmless operator-role hello;
                 does NOT disturb a running agent)
 
 Exit 0 = everything green: run the agent one-liner and your arm card flips online.
@@ -101,8 +101,8 @@ def check_token(relay, robot, token):
         msg = json.loads(line) if line.strip() else {}
         if msg.get("err") == "auth":
             return result("token", False, f"relay rejected the token for '{robot}'",
-                          "use the exact token from your onboarding one-liner "
-                          "(fleet admin can re-issue via Add arm)")
+                          "use a customer token linked to this arm "
+                          "(fleet admin can create/link customers in the UI)")
         if msg.get("ok"):
             return result("token", True, f"accepted; agent for '{robot}' is ONLINE "
                           "(an operator channel opened and was closed)")
@@ -115,9 +115,9 @@ def check_token(relay, robot, token):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--relay", default="35.185.232.107:8443")
+    ap.add_argument("--relay", default="35.203.190.87:8443")
     ap.add_argument("--robot", help="your arm id (from onboarding)")
-    ap.add_argument("--token", help="your arm token (from onboarding)")
+    ap.add_argument("--token", help="optional customer/operator token linked to this arm")
     ap.add_argument("--serve-host", default="127.0.0.1")
     ap.add_argument("--serve-port", type=int, default=5599)
     ap.add_argument("--cam-port", type=int, default=8089)
@@ -131,7 +131,7 @@ def main():
     if a.robot and a.token:
         oks.append(check_token(a.relay, a.robot, a.token))
     else:
-        print("  [    ] token: skipped (pass --robot and --token to verify your credentials)")
+        print("  [    ] token: skipped (pass --robot and --token to verify operator access)")
 
     print()
     if all(oks):
