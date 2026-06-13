@@ -215,7 +215,7 @@ processing.** Diagrams: `docs/remote-topology.png` (where things run, ports, bui
 
 For customers, **no VPN — the robot node dials OUT to a relay we host** (outbound-only TLS
 on 443: WSS v1, WebRTC/LiveKit endgame with camera frames as video tracks). The relay gives
-us auth (per-robot tokens), tenancy, audit/metering, and a server-side kill switch. No VPN
+us operator/customer auth, tenancy, audit/metering, and a server-side kill switch. No VPN
 for anyone — WE use the same relay (dogfood from day one). Our seams are already
 direction-agnostic byte streams (joints JSON, camera frames), so this swaps transports in
 `RobotLink`/the relays without touching robot-side safety (clamp, hold-on-drop, watchdog).

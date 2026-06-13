@@ -13,14 +13,14 @@ YAM's driver (i2rt) pins `numpy==2.2.6` and pulls `python-can`, `mujoco`, `mink`
 … A typical LeRobot environment is built on `numpy 1.x` (and on a Jetson, the NVIDIA-built
 torch is ABI-locked to it). Forcing i2rt into that env risks breaking the whole rig.
 
-So `YamFollower` never imports i2rt. It talks over TCP to **`yam_real_serve.py`**, which runs
+So `YamFollower` never imports i2rt. It talks over TCP to **`yam_serve.py`**, which runs
 in i2rt's own venv and already owns the arm and all the safety (velocity clamp,
 hold-on-disconnect, torque-off). LeRobot and i2rt stay in separate interpreters — even
 separate Python versions — and exchange only joint vectors.
 
 ```
 LeRobot env (numpy 1.x, torch)              i2rt venv (numpy 2.x, python-can)
-  YamFollower(Robot) ──TCP :5599──►  yam_real_serve.py  ──CAN──►  YAM
+  YamFollower(Robot) ──TCP :5599──►  yam_serve.py  ──CAN──►  YAM
   --robot.type=yam_follower          (clamp · hold · torque-off)
 ```
 
@@ -33,7 +33,11 @@ pip install -e .            # in your lerobot environment; only dep is lerobot>=
 ## Use
 
 1. On the robot computer, start the serve (i2rt venv):
-   `~/i2rt/.venv/bin/python YAM_control/yam_real_serve.py --channel can0`
+   ```bash
+   cd ~/lerobot-robot-yam
+   PYTHONPATH=$HOME/i2rt:$HOME/lerobot-robot-yam \
+     $HOME/i2rt/.venv/bin/python -m lerobot_robot_yam.yam_serve --channel can0
+   ```
 2. Point a lerobot command at the follower:
    ```bash
    lerobot-record \
@@ -43,6 +47,25 @@ pip install -e .            # in your lerobot environment; only dep is lerobot>=
      ...
    ```
    Cameras can point at local devices or at `camera_relay.py`'s MJPEG URLs.
+
+## Hardware Check
+
+When the YAM is physically set up and `can0` is free, start the serve above in one terminal.
+Then run this from the LeRobot environment:
+
+```bash
+cd ~/lerobot-robot-yam
+PYTHONPATH=$HOME/lerobot-robot-yam \
+  $HOME/miniforge3/envs/blapa-jetson-env/bin/python -m lerobot_robot_yam.examples.read_and_cycle \
+  --read-seconds 5 \
+  --low 0.5 --high 0.9 --cycles 5
+```
+
+This connects through `YamFollower`, prints `joint_1.pos` through `joint_6.pos` plus
+`gripper.pos` for five seconds, then holds the current arm pose while cycling the gripper
+between `0.5` and `0.9` five times. By default it disconnects with `{"shutdown": true}`,
+so the serve turns motor torque off at the end. Add `--keep-serve` if you want the serve
+to keep holding the last pose.
 
 ## Units (read this before trusting a dataset)
 

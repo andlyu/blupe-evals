@@ -49,8 +49,8 @@ test sustained), `logging` ([lat] conventions; from the parallel thread).
   "blupe-node" packaging, TLS before less-trusted customers.
 - **Fleet management / customer onboarding (2026-06-12, DEPLOYED to the relay VM):** the
   relay now keeps a persisted fleet registry (`/opt/fleet.json` on the VM: robots + customers
-  + links; seeded from the old RELAY_TOKENS env). Fleet UI admin card: **Add arm** (mints a
-  robot token + install one-liner; card appears offline → flips online when the agent dials
+  + links; seeded from the old RELAY_TOKENS env). Fleet UI admin card: **Add arm** (returns an
+  install one-liner with no robot token; card appears offline → flips online when the agent dials
   in), **Add customer** (mints a token + scoped UI URL), per-arm **link/unlink chips**.
   Customer tokens see/control ONLY their linked arms (UI + `/api/cmd` + `/cam/` + the
   operator DATA PLANE: `auth_operator` accepts a user token only while linked — unlink
@@ -194,7 +194,7 @@ XR_INPUT=bridge .venv/bin/python scripts/eval_yam_vr.py --quest-ip 192.168.0.30 
 ```bash
 ssh andrew@192.168.0.185
 setsid nohup ~/miniforge3/envs/xr/bin/python ~/blupe-evals/relay/relay.py robot \
-  --relay 35.185.232.107:8443 --robot yam-1 --token <robot token> \
+  --relay 35.203.190.87:8443 --robot yam-1 \
   > /tmp/relay_agent.log 2>&1 < /dev/null &
 # CAN after every reboot/replug (sudo): bash ~/blupe-evals/YAM_control/setup_can.sh
 ```

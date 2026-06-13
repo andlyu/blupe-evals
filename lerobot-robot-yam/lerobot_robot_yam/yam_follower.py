@@ -118,13 +118,19 @@ class YamFollower(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
         goal = {k.removesuffix(".pos"): float(v) for k, v in action.items() if k.endswith(".pos")}
+        current: dict[str, float] | None = None
+
+        missing_joints = [joint for joint in self.config.joints if joint not in goal]
+        if missing_joints or self.config.max_relative_target is not None:
+            q = self._read_joints()
+            current = {m: float(q[i]) for i, m in enumerate(self.motor_names)}
+            for joint in missing_joints:
+                goal[joint] = current[joint]
 
         if self.config.max_relative_target is not None:   # extra cap on top of serve clamp
-            q = self._read_joints()
-            cur = {m: q[i] for i, m in enumerate(self.motor_names)}
             cap = self.config.max_relative_target
             for m in goal:
-                c = cur.get(m, goal[m])
+                c = current.get(m, goal[m]) if current is not None else goal[m]
                 goal[m] = max(c - cap, min(c + cap, goal[m]))
 
         msg: dict = {"q": [goal[j] for j in self.config.joints]}
