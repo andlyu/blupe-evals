@@ -27,12 +27,13 @@ EVAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_yam_vr.py"
 LOG = "/tmp/eval_live.log"
 
 # Per-arm launch profiles. Sim arms: no cameras, dead-end serve port (CONNECT is a no-op).
-# yam = the production profile (Orin serve + cameras + task recording).
+# yam = the production profile through the relay operator tunnel.
 PROFILES = {
-    "yam": ["--serve-host", "192.168.0.185", "--serve-port", "5599",
-            "--cameras", "http://192.168.0.185:8089/0", "http://192.168.0.185:8089/2",
+    "yam": ["--serve-host", "127.0.0.1", "--serve-port", "15599",
+            "--cameras", "http://127.0.0.1:18089/0", "http://127.0.0.1:18089/2",
             "--task", "red-plate-demo", "--stages", "reach", "grasp", "lift", "place",
-            "--policy", "scripts/policies/pick_place.py:run"],
+            "--policy", "scripts/policies/pick_place.py:run",
+            "--direct-serve-control"],
 }
 SIM_ARGS = ["--cameras", "none", "--serve-port", "5596"]
 
