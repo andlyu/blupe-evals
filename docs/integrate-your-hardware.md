@@ -135,6 +135,18 @@ The relay UI does not stream policy actions itself. It sends a lifecycle command
 {"cmd": "run_policy", "policy": "<policy-id>", "req": 123}
 ```
 
+The UI only sends a policy id. It does not accept an arbitrary shell command from the
+browser. Each policy id must be configured when the robot agent starts:
+
+```bash
+--policy <policy-id>='<exact shell command>'
+```
+
+The command should `cd` to the repo/workspace first, then invoke the right Python/env. If
+the command needs environment variables, put them inside the command with `env VAR=value`.
+Keep the whole command in quotes so spaces and `&&` remain part of that single policy
+mapping.
+
 The robot agent:
 
 1. verifies the YAM serve is ON
@@ -143,7 +155,7 @@ The robot agent:
 4. streams/logs status back to the relay
 5. supports stop/cancel by calling the policy `stop()` hook or killing the process
 
-Example YAM policy config:
+Example YAM policy flags:
 
 ```bash
 --policy noop='cd /home/andrew/blupe-evals && \
@@ -160,6 +172,37 @@ Example YAM policy config:
 Start with `noop` from the fleet UI. It exercises the full robot-side `run_policy` path
 without commanding motion. Switch the default to a task policy only after the no-op path
 starts, logs, and stops correctly.
+
+Full agent shape:
+
+```bash
+python /home/andrew/blupe-evals/relay/relay.py robot \
+  --relay 35.203.190.87:8443 \
+  --robot yam-1 \
+  --serve-cmd "env PYTHONPATH=/home/andrew/i2rt:/home/andrew/lerobot-robot-yam \
+    /home/andrew/i2rt/.venv/bin/python -m lerobot_robot_yam.yam_serve \
+    --channel can0 --host 127.0.0.1" \
+  --policy noop='cd /home/andrew/blupe-evals && \
+    /home/andrew/miniforge3/envs/xr/bin/python scripts/run_policy.py \
+    scripts/policies/noop.py:run \
+    --serve-host 127.0.0.1 --serve-port 5599' \
+  --policy pick_place='cd /home/andrew/blupe-evals && \
+    /home/andrew/miniforge3/envs/xr/bin/python scripts/run_policy.py \
+    scripts/policies/pick_place.py:run \
+    --serve-host 127.0.0.1 --serve-port 5599' \
+  --default-policy noop \
+  --policy-log /tmp/policy_managed.log
+```
+
+Validation order:
+
+1. Fleet UI → **Turn ON**.
+2. Fleet UI → **Run policy** with `noop`.
+3. On the robot computer, verify `/tmp/policy_managed.log` shows the runner connected,
+   printed joints, and completed.
+4. Fleet UI → **Stop policy** should return `no policy running` after `noop` completes, or
+   stop the active process if a longer policy is running.
+5. Only then run a motion policy such as `pick_place`.
 
 ### Operator-side eval policy path
 
