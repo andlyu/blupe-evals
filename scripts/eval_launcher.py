@@ -37,6 +37,21 @@ PROFILES = {
 SIM_ARGS = ["--cameras", "none", "--serve-port", "5596"]
 
 
+def _policy_from_args(args):
+    try:
+        return args[args.index("--policy") + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _profile_args(arm):
+    return PROFILES.get(arm, SIM_ARGS)
+
+
+def _profile_policy(arm):
+    return _policy_from_args(_profile_args(arm))
+
+
 class Launcher:
     def __init__(self, quest_ip):
         self.quest_ip = quest_ip
@@ -55,14 +70,17 @@ class Launcher:
             subprocess.run(["pkill", "-f", "eval_yam_vr[.]py"], capture_output=True)
             time.sleep(1.5)                       # let :8810/:13579 free up
             argv = [sys.executable, EVAL, "--quest-ip", self.quest_ip, "--arm", arm]
-            argv += PROFILES.get(arm, SIM_ARGS)
+            argv += _profile_args(arm)
             env = dict(os.environ, XR_INPUT=os.environ.get("XR_INPUT", "bridge"))
             with open(LOG, "ab") as log:
                 self.proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
                                              start_new_session=True, env=env)
             self.arm = arm
-            print(f"[launcher] {arm} -> pid {self.proc.pid}", flush=True)
+            policy = _profile_policy(arm)
+            print(f"[launcher] {arm} -> pid {self.proc.pid}; policy={policy or 'none'}",
+                  flush=True)
             return {"ok": True, "arm": arm, "pid": self.proc.pid,
+                    "policy": policy, "policy_attached": policy is not None,
                     "console": "http://this-host:8810/"}
 
     def _stop_locked(self):
@@ -79,8 +97,13 @@ class Launcher:
 
     def status(self):
         alive = self.proc is not None and self.proc.poll() is None
+        current_arm = self.arm if alive else None
+        current_policy = _profile_policy(current_arm) if current_arm else None
         return {"ok": True, "arm": self.arm if alive else None, "running": alive,
-                "arms": {n: {"status": s.status, "dof": s.dof, "notes": s.notes}
+                "policy": current_policy, "policy_attached": current_policy is not None,
+                "arms": {n: {"status": s.status, "dof": s.dof, "notes": s.notes,
+                             "policy": _profile_policy(n),
+                             "policy_attached": _profile_policy(n) is not None}
                          for n, s in arms.ARMS.items()}}
 
 
@@ -95,12 +118,13 @@ the same page after every switch; reload it once the new arm is up (~8 s).</p>
 async function refresh(){
   const s = await (await fetch('/status')).json();
   document.getElementById('cur').textContent =
-    s.running ? 'running: ' + s.arm : 'nothing running';
+    s.running ? `running: ${s.arm} · policy: ${s.policy || 'none'}` : 'nothing running';
   document.getElementById('cards').innerHTML = Object.entries(s.arms).map(([n, a]) =>
     `<div style="background:#1e2128;border-radius:10px;padding:12px 16px;margin:10px 0;max-width:640px">
      <b>${n}</b> <span style="color:#889">dof ${a.dof}${a.status !== 'ready' ? ' · ' + a.status : ''}</span>
      <button style="float:right;padding:6px 14px;cursor:pointer" ${a.status !== 'ready' ? 'disabled' : ''}
        onclick="launch('${n}', this)">${s.arm === n && s.running ? 'Relaunch' : 'Launch'}</button>
+     <div style="color:#8ad;font-size:13px;margin-top:6px">policy: ${a.policy || 'none'}</div>
      <div style="color:#99a;font-size:13px;margin-top:6px">${a.notes}</div></div>`).join('');
 }
 async function launch(n, btn){

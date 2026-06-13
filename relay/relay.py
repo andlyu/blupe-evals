@@ -380,11 +380,16 @@ async function simRefresh(){
   const s = await api('/api/sim?action=status');
   if (!s.ok){ document.getElementById('sim-arms').textContent = s.err || 'launcher offline'; return; }
   const label = n => n === 'yam' ? 'yam (real)' : n + ' (sim)';
+  const policy = a => a && a.policy ? a.policy : 'none';
+  const currentPolicy = s.running && s.arm ? (s.policy || policy(s.arms[s.arm])) : 'none';
   const current = s.running && s.arm ? `current: ${label(s.arm)}` : 'current: none';
-  document.getElementById('sim-arms').innerHTML = `<div class="ops">${current}</div>` +
+  document.getElementById('sim-arms').innerHTML =
+    `<div class="ops">${current}; policy: ${currentPolicy}</div>` +
     Object.entries(s.arms).map(([n, a]) =>
-    `<button ${a.status !== 'ready' ? 'disabled' : ''} class="${s.arm === n ? 'primary' : ''}"
-       onclick="simLaunch('${n}', this)">${label(n)}${s.arm === n && s.running ? ' \\u25cf running' : ''}</button>`).join(' ');
+    `<div class="ops"><button ${a.status !== 'ready' ? 'disabled' : ''}
+       class="${s.arm === n ? 'primary' : ''}"
+       onclick="simLaunch('${n}', this)">${label(n)}${s.arm === n && s.running ? ' \\u25cf running' : ''}</button>
+       <span class="muted">policy: ${policy(a)}</span></div>`).join('');
 }
 async function simLaunch(n, btn){ btn.disabled = true; btn.textContent = n + '\\u2026';
   const r = await api('/api/sim?action=launch&arm=' + encodeURIComponent(n));
@@ -412,9 +417,10 @@ async function report(action, btn){ btn.disabled = true;
         document.getElementById('report-out').textContent = JSON.stringify(r, null, 2); }
   finally { btn.disabled = false; } }
 async function cmd(robot, c, btn){ btn.disabled = true; btn.textContent = c + '…';
-  const r = await api('/api/cmd?robot=' + robot + '&cmd=' + c);
+  const labels = {arm_on:'Turn ON',arm_off:'Turn OFF',preflight:'Check'};
+  const r = await api('/api/cmd?robot=' + encodeURIComponent(robot) + '&cmd=' + encodeURIComponent(c));
   document.getElementById('out-' + robot).textContent = JSON.stringify(r, null, 2);
-  btn.disabled = false; btn.textContent = ({arm_on:'Turn ON',arm_off:'Turn OFF',preflight:'Check'})[c];
+  btn.disabled = false; btn.textContent = labels[c];
   if (c === 'arm_on' && r.ok && r.data && (r.data.result === 'ON' || r.data.result === 'already on'))
     showCams(robot, true);                                  // ON => show what the arm sees
   refresh(); }
