@@ -350,11 +350,6 @@ UI_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Blupe fleet
   <button class="primary" onclick="addArm()">Add arm</button>
   <button class="primary" onclick="addCustomer()">Add customer</button>
   <pre id="admin-out"></pre></div>
-<div class="arm" id="sim-card" style="display:none"><span class="name">Operator launcher</span>
-  <div class="ops">choose what the operator console/headset controls on the Mac:
-  <b>yam</b> = real YAM arm, other profiles = sim-only standards. Same console (:8810).</div>
-  <div id="sim-arms">loading…</div>
-  <pre id="sim-out"></pre></div>
 <div class="arm" id="report-card" style="display:none"><span class="name">Eval report</span>
   <div class="ops">runs on the operator Mac: rotates to a fresh trial session + records the
   full operator view (session.mp4); Finish renders report.html</div>
@@ -373,28 +368,8 @@ async function whoami(){ ME = await api('/api/me');
   if (ME.role === 'admin'){
     document.getElementById('admin-card').style.display = '';
     document.getElementById('report-card').style.display = '';
-    document.getElementById('sim-card').style.display = '';
-    simRefresh(); }
+  }
   if (ME.role === 'admin') await loadFleet(); }
-async function simRefresh(){
-  const s = await api('/api/sim?action=status');
-  if (!s.ok){ document.getElementById('sim-arms').textContent = s.err || 'launcher offline'; return; }
-  const label = n => n === 'yam' ? 'yam (real)' : n + ' (sim)';
-  const policy = a => a && a.policy ? a.policy : 'none';
-  const currentPolicy = s.running && s.arm ? (s.policy || policy(s.arms[s.arm])) : 'none';
-  const current = s.running && s.arm ? `current: ${label(s.arm)}` : 'current: none';
-  document.getElementById('sim-arms').innerHTML =
-    `<div class="ops">${current}; policy: ${currentPolicy}</div>` +
-    Object.entries(s.arms).map(([n, a]) =>
-    `<div class="ops"><button ${a.status !== 'ready' ? 'disabled' : ''}
-       class="${s.arm === n ? 'primary' : ''}"
-       onclick="simLaunch('${n}', this)">${label(n)}${s.arm === n && s.running ? ' \\u25cf running' : ''}</button>
-       <span class="muted">policy: ${policy(a)}</span></div>`).join('');
-}
-async function simLaunch(n, btn){ btn.disabled = true; btn.textContent = n + '\\u2026';
-  const r = await api('/api/sim?action=launch&arm=' + encodeURIComponent(n));
-  document.getElementById('sim-out').textContent = JSON.stringify(r, null, 2);
-  setTimeout(simRefresh, 9000); simRefresh(); }
 async function loadFleet(){ const r = await api('/api/fleet?action=list');
   if (r.ok) USERS = Object.keys(r.fleet.users); }
 async function fleetAct(params){
@@ -649,21 +624,6 @@ async def _http_ui(relay, args):
                     body, ctype, code = '{"err":"bad report request"}', "application/json", 400
                 else:
                     body = await _proxy_mac(relay, op, 8810, f"/report/{action}")
-                    ctype, code = "application/json", 200
-            elif url.path == "/api/sim" and not is_admin:
-                body, ctype, code = '{"err":"admin only"}', "application/json", 403
-            elif url.path == "/api/sim":
-                # Sim-arm launcher on the operator Mac (eval_launcher.py :8809): list the
-                # registered arm standards / relaunch the eval with one (sim, no hardware).
-                action = q.get("action", [""])[0]
-                arm = q.get("arm", [""])[0]
-                op = q.get("op", ["mac-1"])[0]
-                if action not in ("status", "launch") or not op.startswith("mac-") or \
-                        (action == "launch" and not arm.replace("-", "").isalnum()):
-                    body, ctype, code = '{"err":"bad sim request"}', "application/json", 400
-                else:
-                    path = "/status" if action == "status" else f"/launch?arm={arm}"
-                    body = await _proxy_mac(relay, op, 8809, path)
                     ctype, code = "application/json", 200
             elif url.path == "/api/cmd":
                 robot = q.get("robot", [""])[0]
