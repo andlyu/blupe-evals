@@ -42,6 +42,22 @@ Controller + Send ON**; **Camera panel → ZEDMINI → Listen → this computer'
 You're teleoperating the sim arm. No headset handy? `scripts/preview_server.py` mirrors the
 exact operator view to a browser at `:8810` with keyboard control.
 
+## Hardware setup (let Claude do it)
+
+On the **robot computer** (e.g. the Jetson/Orin wired to the YAM), open Claude Code and paste:
+
+> SSH into the Jetson at andrew@192.168.0.185. Clone git@github.com:andlyu/blupe-evals.git
+> into /home/andrew/blupe-evals. Read docs/integrate-your-hardware.md first. Set up the
+> relay for YAM robot yam-1 using the VM relay service at 35.203.190.87:8443.
+
+[docs/integrate-your-hardware.md](docs/integrate-your-hardware.md) is the integration flow
+Claude follows — bring up the CAN bus, start a serve that speaks the
+[serve protocol](docs/serve-protocol.md), run `scripts/check_robot_setup.py` (PASS/FAIL
+doctor), and join the fleet through `35.203.190.87:8443`. The prompt above points the serve at
+the **lerobot** YAM driver; the doc's own reference serve is `YAM_control/yam_real_serve.py`
+(i2rt/CAN) — either satisfies the same contract. Orin specifics:
+[docs/ORIN-SETUP.md](docs/ORIN-SETUP.md).
+
 ## The eval loop
 
 Start the eval with a task: `--task red-plate-pickup --stages reach grasp lift place
