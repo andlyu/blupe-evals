@@ -332,11 +332,14 @@ UI_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Blupe fleet
 <h1>Blupe fleet</h1>
 <div class="arm" id="admin-card" style="display:none">
   <span class="name">Fleet admin</span>
-  <div class="ops">arms get an install one-liner; customers get a UI link scoped to the
-  arms you link to them</div>
   <button class="primary" onclick="addArm()">Add arm</button>
   <button class="primary" onclick="addCustomer()">Add customer</button>
   <pre id="admin-out"></pre></div>
+<div class="arm" id="sim-card" style="display:none"><span class="name">Simulators</span>
+  <div class="ops">launch a SIM robot on the operator Mac (no hardware) — same console
+  (:8810) and headset flow, different arm standard</div>
+  <div id="sim-arms">loading…</div>
+  <pre id="sim-out"></pre></div>
 <div class="arm" id="report-card" style="display:none"><span class="name">Eval report</span>
   <div class="ops">runs on the operator Mac: rotates to a fresh trial session + records the
   full operator view (session.mp4); Finish renders report.html</div>
@@ -354,7 +357,20 @@ async function whoami(){ ME = await api('/api/me');
   if (ME.role === 'admin'){
     document.getElementById('admin-card').style.display = '';
     document.getElementById('report-card').style.display = '';
-    await loadFleet(); } }
+    document.getElementById('sim-card').style.display = '';
+    simRefresh(); }
+  if (ME.role === 'admin') await loadFleet(); }
+async function simRefresh(){
+  const s = await api('/api/sim?action=status');
+  if (!s.ok){ document.getElementById('sim-arms').textContent = s.err || 'launcher offline'; return; }
+  document.getElementById('sim-arms').innerHTML = Object.entries(s.arms).map(([n, a]) =>
+    `<button ${a.status !== 'ready' ? 'disabled' : ''} class="${s.arm === n ? 'primary' : ''}"
+       onclick="simLaunch('${n}', this)">${n}${s.arm === n && s.running ? ' \\u25cf' : ''}</button>`).join(' ');
+}
+async function simLaunch(n, btn){ btn.disabled = true; btn.textContent = n + '\\u2026';
+  const r = await api('/api/sim?action=launch&arm=' + n);
+  document.getElementById('sim-out').textContent = JSON.stringify(r, null, 2);
+  setTimeout(simRefresh, 9000); simRefresh(); }
 async function loadFleet(){ const r = await api('/api/fleet?action=list');
   if (r.ok) USERS = Object.keys(r.fleet.users); }
 async function fleetAct(params){ const r = await api('/api/fleet?' + params);
@@ -437,6 +453,36 @@ whoami().then(refresh); setInterval(refresh, 5000);
 </script></body></html>"""
 
 
+async def _proxy_mac(relay, op, port, path):
+    """One HTTP GET to an operator-node service over a relay channel; returns the body.
+    Reads by Content-Length, NOT to EOF — the agent-side splice keeps the channel open
+    until both directions close, so EOF never comes."""
+    try:
+        rr, rw = await relay.open_channel(op, port)
+        rw.write(f"GET {path} HTTP/1.1\r\nHost: op\r\nConnection: close\r\n\r\n".encode())
+        await rw.drain()
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            data = await asyncio.wait_for(rr.read(65536), CMD_TIMEOUT_S)
+            if not data:
+                break
+            raw += data
+        head, _, payload = raw.partition(b"\r\n\r\n")
+        clen = 0
+        for h in head.split(b"\r\n"):
+            if h.lower().startswith(b"content-length:"):
+                clen = int(h.split(b":")[1])
+        while len(payload) < clen:
+            data = await asyncio.wait_for(rr.read(65536), CMD_TIMEOUT_S)
+            if not data:
+                break
+            payload += data
+        rw.close()
+        return payload.decode() if payload else '{"ok": false, "err": "bad upstream response"}'
+    except Exception as e:
+        return json.dumps({"ok": False, "err": f"operator node: {e}"})
+
+
 async def _http_ui(relay, args):
     async def handle(reader, writer):
         try:
@@ -499,34 +545,22 @@ async def _http_ui(relay, args):
                 if action not in ("new", "finish", "status") or not op.startswith("mac-"):
                     body, ctype, code = '{"err":"bad report request"}', "application/json", 400
                 else:
-                    try:
-                        rr, rw = await relay.open_channel(op, 8810)
-                        rw.write(f"GET /report/{action} HTTP/1.1\r\nHost: op\r\n"
-                                 f"Connection: close\r\n\r\n".encode())
-                        await rw.drain()
-                        # Read by Content-Length, NOT to EOF: the agent-side splice keeps the
-                        # channel open until BOTH directions close, so EOF never comes.
-                        raw = b""
-                        while b"\r\n\r\n" not in raw:
-                            data = await asyncio.wait_for(rr.read(65536), CMD_TIMEOUT_S)
-                            if not data:
-                                break
-                            raw += data
-                        head, _, payload = raw.partition(b"\r\n\r\n")
-                        clen = 0
-                        for h in head.split(b"\r\n"):
-                            if h.lower().startswith(b"content-length:"):
-                                clen = int(h.split(b":")[1])
-                        while len(payload) < clen:
-                            data = await asyncio.wait_for(rr.read(65536), CMD_TIMEOUT_S)
-                            if not data:
-                                break
-                            payload += data
-                        rw.close()
-                        body = payload.decode() if payload \
-                            else '{"ok": false, "err": "bad upstream response"}'
-                    except Exception as e:
-                        body = json.dumps({"ok": False, "err": f"operator node: {e}"})
+                    body = await _proxy_mac(relay, op, 8810, f"/report/{action}")
+                    ctype, code = "application/json", 200
+            elif url.path == "/api/sim" and not is_admin:
+                body, ctype, code = '{"err":"admin only"}', "application/json", 403
+            elif url.path == "/api/sim":
+                # Sim-arm launcher on the operator Mac (eval_launcher.py :8809): list the
+                # registered arm standards / relaunch the eval with one (sim, no hardware).
+                action = q.get("action", [""])[0]
+                arm = q.get("arm", [""])[0]
+                op = q.get("op", ["mac-1"])[0]
+                if action not in ("status", "launch") or not op.startswith("mac-") or \
+                        (action == "launch" and not arm.replace("-", "").isalnum()):
+                    body, ctype, code = '{"err":"bad sim request"}', "application/json", 400
+                else:
+                    path = "/status" if action == "status" else f"/launch?arm={arm}"
+                    body = await _proxy_mac(relay, op, 8809, path)
                     ctype, code = "application/json", 200
             elif url.path == "/api/cmd":
                 robot = q.get("robot", [""])[0]
