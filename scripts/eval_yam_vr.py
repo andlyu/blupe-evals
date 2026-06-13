@@ -107,8 +107,8 @@ def draw_hud(rgb, menu, highlight, state, connect_arm, link_status=None, rec_lab
                 cv2.rectangle(rgb, (ox, oy), (ox + obw, oy + 44), (255, 230, 0), 3)
             cv2.putText(rgb, lab, (ox + 16, oy + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                         (255, 255, 255), 2)
-    if connect_arm and link_status != "connected":      # CONNECT on but arm not actually linked
-        msg = "CONNECTING..." if link_status == "connecting" else "ROBOT OFF - start serve"
+    if connect_arm and link_status != "connected":      # direct CONNECT on but not linked
+        msg = "CONNECTING..." if link_status == "connecting" else "DIRECT LINK OFF"
         (tw, th), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
         cv2.rectangle(rgb, (w - tw - 26, 8), (w - 6, 8 + th + 18), (200, 40, 40), -1)
         cv2.putText(rgb, msg, (w - tw - 16, 8 + th + 9), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -565,7 +565,8 @@ def main(quest_ip: str, port: int = 12345, policy: Optional[str] = None,
          task: Optional[str] = None, stages: list[str] = [],
          serve_host: str = "127.0.0.1", serve_port: int = 5599,
          preview_port: int = 8810,     # browser mirror of the headset canvas; 0 = off
-         arm: str = "yam"):            # arm standard from scripts/arms.py (yam | so101 | ...)
+         arm: str = "yam",             # arm standard from scripts/arms.py (yam | so101 | ...)
+         direct_serve_control: bool = False):
     spec = arms.get(arm)
     E.N_ARM = spec.dof                 # eval_yam_states constants follow the spec: every
     E.EE = spec.ee_body                # E.N_ARM/E.EE reference below resolves per-arm
@@ -604,7 +605,8 @@ def main(quest_ip: str, port: int = 12345, policy: Optional[str] = None,
 
     state, connect_arm, highlight, centered, prev_sel = "HOLD", False, 0, True, False
     prev = {b: False for b in E.SHORTCUT}
-    menu = list(E.MENU) + ["VIEW", "RELAUNCH", "MARK A"]   # VIEW = cameras<->sim; RELAUNCH =
+    menu = [m for m in E.MENU if direct_serve_control or m != "CONNECT"] + ["VIEW", "RELAUNCH", "MARK A"]
+    # VIEW = cameras<->sim; RELAUNCH =
     # soft reset; MARK A/B = capture the CURRENT pose as a policy waypoint (teleop there first)
 
     recorder = None                              # --task arms trial recording (eval report v1)
@@ -658,6 +660,9 @@ def main(quest_ip: str, port: int = 12345, policy: Optional[str] = None,
             view_sim = not view_sim
             print(f"[eval] view -> {'SIM' if view_sim else 'CAMERAS'}", flush=True)
         elif opt == "CONNECT":
+            if not direct_serve_control:
+                print("[eval] CONNECT disabled; use fleet UI robot-side policy/serve control", flush=True)
+                return
             connect_arm = not connect_arm
             if connect_arm:
                 link = RobotLink(serve_host, serve_port)
