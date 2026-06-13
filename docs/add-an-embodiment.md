@@ -44,27 +44,11 @@ owns the hardware and the safety. Reference implementation:
 `YAM_control/yam_real_serve.py` (~200 lines over i2rt/CAN). Write the equivalent over the
 new embodiment's driver (SO-101: lerobot `so101_follower`; its gripper is 0..100 → /100).
 
-### The serve wire protocol
-
-Newline-delimited JSON over TCP (default `:5599`):
-
-```
-server -> client, once on connect:   {"start_joints": [q1..qN]}     # no-jump seed
-client -> server, ~50 Hz:            {"q": [q1..qN], "g": 0..1}     # joint targets + gripper
-client -> server, optional field:    {"q": ..., "t": <any>}         # if present, echo after APPLY:
-server -> client:                    {"ack": <t>}                   #   -> sender-side RTT probe
-client -> server, on quit:           {"shutdown": true}             # -> cut motor torque
-```
-
-### The safety contract (non-negotiable, lives in the serve)
-
-Robot-side on purpose — no network or operator bug can bypass it:
-1. **Velocity-clamp every command** (rad/s cap) — the backstop even if the operator stack
-   misbehaves.
-2. **Hold the last pose on disconnect** — a dropped link freezes the arm, never drops it.
-3. **Torque off on `shutdown` and on your own exit** (Ctrl-C, crash handlers).
-4. **`start_joints` reports the arm's REAL current joints** so the client ramps from where
-   the arm actually is — this is what prevents the first-command jump.
+The complete serve contract — wire messages, units, joint order, timing tolerances, the
+non-negotiable safety rules, and an implementation skeleton — is specified in
+**[serve-protocol.md](serve-protocol.md)**. Read it before writing a line; it encodes
+several lessons that were paid for in hardware time (the no-jump handshake, hold-on-
+disconnect, the control-thread-before-torque-off ordering, bounded-force gripper).
 
 Once the reference serve exists, every physical unit of this embodiment onboards through
 [integrate-your-hardware.md](integrate-your-hardware.md) — fleet token, agent one-liner,

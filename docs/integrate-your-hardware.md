@@ -35,9 +35,9 @@ agent one-liner is the only thing left. (You can also verify end to end from any
 `curl "http://<relay-host>:8080/api/status?token=<your-customer-token>"` returns your
 arms' live state as JSON.)
 
-If your unit needs a custom serve (different driver/firmware), the wire protocol and the
-non-negotiable safety contract are specified in
-[add-an-embodiment.md](add-an-embodiment.md#the-serve-wire-protocol) — it's ~200 lines.
+If your unit needs a custom serve (different driver/firmware), the complete contract —
+wire messages, units, joint order, timing tolerances, the safety rules, and a skeleton —
+is **[serve-protocol.md](serve-protocol.md)**; implementations run ~200 lines.
 
 ## 3. Join the fleet (one click + one paste)
 
@@ -70,7 +70,7 @@ your side is exposed to the internet.
 
 | Service | Where | Interface |
 |---|---|---|
-| **Serve** (owns motors + safety) | TCP `:5599` | newline-JSON: sends `{"start_joints":[...]}` once on connect; accepts `{"q":[...], "g":0..1}` at ~50 Hz and `{"shutdown":true}`; echoes `{"ack":t}` if a command carries `"t"`. Ships for supported drivers; custom = ~200 lines ([protocol + safety contract](add-an-embodiment.md#the-serve-wire-protocol)). |
+| **Serve** (owns motors + safety) | TCP `:5599` | newline-JSON: sends `{"start_joints":[...]}` once on connect; accepts `{"q":[...], "g":0..1}` at ~50 Hz and `{"shutdown":true}`; echoes `{"ack":t}` if a command carries `"t"`. Ships for supported drivers; custom = ~200 lines (full spec: [serve-protocol.md](serve-protocol.md)). |
 | **Cameras** | HTTP `:8089` | `GET /<idx>` → multipart MJPEG. Just run `YAM_control/camera_relay.py --devices 0 2` for any UVC cameras; custom cameras only need to mimic that one GET. |
 | **Lifecycle commands** | agent flags | three shell commands the fleet buttons run on your box: `--serve-cmd` (Turn ON), `--turnoff-cmd` (Turn OFF / guaranteed torque-off), `--camera-cmd`. |
 

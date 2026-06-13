@@ -51,7 +51,7 @@ def check_serve(host, port):
     except Exception as e:
         return result("serve", False, f"connected but no valid start_joints handshake ({e})",
                       "the serve must send {\"start_joints\": [...]} immediately on connect "
-                      "(see docs/add-an-embodiment.md, wire protocol)")
+                      "(full spec: docs/serve-protocol.md)")
 
 
 def check_camera(host, port, idx):
