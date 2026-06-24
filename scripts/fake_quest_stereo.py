@@ -1,10 +1,10 @@
 """Fake Quest for headless stereo-video testing: plays the headset's side of the ZEDMINI flow.
 
-Drives stereo_sender.StereoVisionServer (standalone, or inside eval_yam_vr.py --video stereo)
+Drives stereo_sender.StereoVisionServer (standalone, or inside mac_quest_bridge.py --video stereo)
 exactly like the Quest app does: listen on a local video port, dial the control port, send
 OPEN_CAMERA, then count the framed H.264 packets that come back. Exit 0 = video flowed.
 
-    XR_INPUT=stub .venv/bin/python scripts/eval_yam_vr.py --quest-ip 127.0.0.1 --cameras none &
+    XR_INPUT=stub .venv/bin/python scripts/mac_quest_bridge.py --quest-ip 127.0.0.1 --cameras none &
     .venv/bin/python scripts/fake_quest_stereo.py        # [fake-quest] PASS: 30/30 packets ...
 """
 

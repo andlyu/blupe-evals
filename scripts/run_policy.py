@@ -23,8 +23,11 @@ from typing import Callable
 
 import numpy as np
 
+from trajectory_recorder import TrajectoryRecorder
+
 N_ARM = 6
 DEFAULT_MAX_VEL = 0.6
+JOINT_NAMES = [f"joint_{i + 1}" for i in range(N_ARM)]
 
 
 @dataclass
@@ -92,15 +95,18 @@ class ServeRobot:
 class SafeRobot:
     """Velocity-clamped, killable policy wrapper."""
 
-    def __init__(self, robot: ServeRobot, max_vel: float):
+    def __init__(self, robot: ServeRobot, max_vel: float, recorder: TrajectoryRecorder | None = None):
         self.robot = robot
         self.max_vel = max_vel
+        self.recorder = recorder
         self._armed = False
         self._last_t = None
-        self._last = np.asarray(robot.read().joint_pos, dtype=float)[:N_ARM].copy()
+        self._last_obs = robot.read()
+        self._last = np.asarray(self._last_obs.joint_pos, dtype=float)[:N_ARM].copy()
 
     def arm(self) -> None:
-        self._last = np.asarray(self.robot.read().joint_pos, dtype=float)[:N_ARM].copy()
+        self._last_obs = self.robot.read()
+        self._last = np.asarray(self._last_obs.joint_pos, dtype=float)[:N_ARM].copy()
         self._last_t = None
         self._armed = True
 
@@ -108,12 +114,15 @@ class SafeRobot:
         self._armed = False
 
     def read(self) -> Observation:
-        return self.robot.read()
+        self._last_obs = self.robot.read()
+        return self._last_obs
 
     def command(self, joint_pos, gripper=None) -> None:
         if not self._armed:
             return
         now = time.monotonic()
+        # Use the capped command step as rollout time so inference stalls do not
+        # stretch dataset timestamps.
         dt = (now - self._last_t) if self._last_t is not None else 0.005
         dt = min(max(dt, 1e-4), 0.1)
         self._last_t = now
@@ -121,6 +130,16 @@ class SafeRobot:
         desired = np.asarray(joint_pos, dtype=float)[:N_ARM]
         self._last = self._last + np.clip(desired - self._last, -step, step)
         self.robot.command(self._last, gripper)
+        if self.recorder is not None:
+            action_gripper = float(gripper if gripper is not None else self._last_obs.gripper)
+            self.recorder.record_step(
+                observation_state=np.asarray(self._last_obs.joint_pos, dtype=float)[:N_ARM],
+                action=self._last.copy(),
+                desired_action=desired.copy(),
+                gripper=action_gripper,
+                observation_gripper=float(self._last_obs.gripper),
+                dt_s=dt,
+            )
 
 
 def main() -> int:
@@ -131,6 +150,12 @@ def main() -> int:
     ap.add_argument("--connect-timeout", type=float, default=5.0)
     ap.add_argument("--max-vel", type=float, default=DEFAULT_MAX_VEL)
     ap.add_argument("--max-runtime", type=float, default=0.0, help="seconds; 0 disables")
+    ap.add_argument("--collect-trajectory", action="store_true")
+    ap.add_argument("--trajectory-root", default="trajectories/pending")
+    ap.add_argument("--trajectory-dir", default="")
+    ap.add_argument("--trajectory-run-id", default="")
+    ap.add_argument("--trajectory-task", default="")
+    ap.add_argument("--trajectory-units", default="radians")
     args = ap.parse_args()
 
     stop_evt = Event()
@@ -144,7 +169,21 @@ def main() -> int:
 
     run = load_run(args.policy)
     robot = ServeRobot(args.serve_host, args.serve_port, args.connect_timeout)
-    safe = SafeRobot(robot, args.max_vel)
+    recorder = None
+    if args.collect_trajectory or args.trajectory_dir:
+        run_id = args.trajectory_run_id or time.strftime("run_%Y%m%d_%H%M%S")
+        trajectory_dir = Path(args.trajectory_dir) if args.trajectory_dir else Path(args.trajectory_root) / run_id
+        recorder = TrajectoryRecorder(
+            trajectory_dir,
+            run_id=run_id,
+            policy=args.policy,
+            task=args.trajectory_task,
+            joint_names=JOINT_NAMES,
+            units=args.trajectory_units,
+        )
+    else:
+        recorder = TrajectoryRecorder.from_env(policy=args.policy, joint_names=JOINT_NAMES)
+    safe = SafeRobot(robot, args.max_vel, recorder=recorder)
     started = time.monotonic()
 
     def stop() -> bool:
@@ -155,12 +194,22 @@ def main() -> int:
 
     print(f"[runner] connected start_joints={np.round(robot.start_joints, 4).tolist()}", flush=True)
     print(f"[runner] policy={args.policy} serve={args.serve_host}:{args.serve_port}", flush=True)
+    if recorder is not None:
+        print(f"[runner] collecting trajectory -> {recorder.trajectory_dir}", flush=True)
     safe.arm()
+    status = "complete"
+    error = ""
     try:
         run(safe, stop)
+    except BaseException as exc:
+        status = "error"
+        error = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         safe.disarm()
         robot.close()
+        if recorder is not None:
+            recorder.finalize(status=status, error=error)
     print("[runner] policy complete", flush=True)
     return 0
 

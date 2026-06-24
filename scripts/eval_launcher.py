@@ -1,9 +1,9 @@
-"""Eval launcher — switch the running arm from a browser (http://<mac>:8809/).
+"""Mac <-> Quest bridge launcher — switch the running arm from a browser.
 
-A tiny supervisor that owns the eval process: pick an arm from scripts/arms.py and it
-kills the current eval and boots the chosen one. The operator console stays at :8810
-(the new eval re-binds it). Sim arms run serve-less; "yam" launches the full real-robot
-config (Orin cameras + serve via the usual ports).
+A tiny supervisor that owns the Mac-to-Quest bridge process: pick an arm from
+scripts/arms.py and it kills the current bridge and boots the chosen one. The operator
+console stays at :8810 (the new bridge re-binds it). Sim arms run serve-less; real
+profiles can use relay camera and serve tunnels.
 
 Run:  XR_INPUT=bridge .venv/bin/python scripts/eval_launcher.py     # from the repo root
 """
@@ -23,30 +23,51 @@ import tyro
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import arms
 
-EVAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_yam_vr.py")
+EVAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mac_quest_bridge.py")
 LOG = "/tmp/eval_live.log"
+
+
+def _read_token(path="/tmp/relay_token"):
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return ""
+
+
+def _yam_profile():
+    token = os.environ.get("RELAY_OPERATOR_TOKEN") or _read_token()
+    return ["--serve-host", "127.0.0.1", "--serve-port", "15599",
+            "--cameras", "http://127.0.0.1:18089/0", "http://127.0.0.1:18089/2",
+            "--task", "red-plate-demo", "--stages", "reach", "grasp", "lift", "place",
+            "--relay-policy-url", os.environ.get("RELAY_POLICY_URL", "http://35.203.190.87"),
+            "--relay-policy-token", token,
+            "--relay-policy-robot", os.environ.get("RELAY_POLICY_ROBOT", "yam-1"),
+            "--relay-policy", os.environ.get("RELAY_POLICY", "pick_place")]
+
 
 # Per-arm launch profiles. Sim arms: no cameras, dead-end serve port (CONNECT is a no-op).
 # yam = the production profile through the relay operator tunnel.
 PROFILES = {
-    "yam": ["--serve-host", "127.0.0.1", "--serve-port", "15599",
-            "--cameras", "http://127.0.0.1:18089/0", "http://127.0.0.1:18089/2",
-            "--task", "red-plate-demo", "--stages", "reach", "grasp", "lift", "place",
-            "--policy", "scripts/policies/pick_place.py:run",
-            "--direct-serve-control"],
+    "yam": _yam_profile,
 }
 SIM_ARGS = ["--cameras", "none", "--serve-port", "5596"]
 
 
 def _policy_from_args(args):
-    try:
-        return args[args.index("--policy") + 1]
-    except (ValueError, IndexError):
-        return None
+    for flag in ("--relay-policy", "--policy"):
+        try:
+            value = args[args.index(flag) + 1]
+            return value if flag == "--policy" else f"relay:{value or 'default'}"
+        except (ValueError, IndexError):
+            pass
+    return None
 
 
 def _profile_args(arm):
-    return PROFILES.get(arm, SIM_ARGS)
+    profile = PROFILES.get(arm)
+    if profile is None:
+        return SIM_ARGS
+    return profile() if callable(profile) else profile
 
 
 def _profile_policy(arm):
@@ -68,7 +89,8 @@ class Launcher:
             return {"ok": False, "err": f"arm {arm!r} is {spec.status}"}
         with self.lock:
             self._stop_locked()
-            subprocess.run(["pkill", "-f", "eval_yam_vr[.]py"], capture_output=True)
+            for pat in ("mac_quest_bridge[.]py", "eval_yam_vr[.]py"):
+                subprocess.run(["pkill", "-f", pat], capture_output=True)
             time.sleep(1.5)                       # let :8810/:13579 free up
             argv = [sys.executable, EVAL, "--quest-ip", self.quest_ip, "--arm", arm]
             argv += _profile_args(arm)

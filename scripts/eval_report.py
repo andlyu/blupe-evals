@@ -1,4 +1,4 @@
-"""Judge recorded eval trials and render the report — companion to eval_yam_vr.py --task.
+"""Judge recorded eval trials and render the report — companion to mac_quest_bridge.py --task.
 
 Trials live in runs/<session>/trial_NNN/ (video.mp4 + meta.json), written by TrialRecorder.
 
@@ -29,7 +29,7 @@ def latest_session(runs_dir="runs"):
     dirs = [os.path.join(runs_dir, d) for d in sorted(os.listdir(runs_dir))
             if os.path.isdir(os.path.join(runs_dir, d))] if os.path.isdir(runs_dir) else []
     if not dirs:
-        sys.exit(f"no sessions under {runs_dir}/ — run eval_yam_vr.py --task <name> first")
+        sys.exit(f"no sessions under {runs_dir}/ — run mac_quest_bridge.py --task <name> first")
     return dirs[-1]
 
 

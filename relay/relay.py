@@ -46,6 +46,8 @@ import urllib.parse
 PING_S = 15
 OPEN_TIMEOUT_S = 10
 CMD_TIMEOUT_S = 45
+CONTROL_PORT = 5599
+CONTROL_CLOSE_TIMEOUT_S = 4
 
 
 async def _read_hello(reader):
@@ -69,15 +71,41 @@ async def _splice(a_reader, a_writer, b_reader, b_writer, tag, on_close=None):
         except (ConnectionError, asyncio.IncompleteReadError, OSError):
             pass
 
-    await asyncio.gather(pipe(a_reader, b_writer), pipe(b_reader, a_writer))
+    tasks = [
+        asyncio.create_task(pipe(a_reader, b_writer)),
+        asyncio.create_task(pipe(b_reader, a_writer)),
+    ]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
     for w in (a_writer, b_writer):
         try:
             w.close()
         except OSError:
             pass
+    await asyncio.gather(*tasks, return_exceptions=True)
     if on_close:
         on_close()
     print(f"[relay] {tag} closed", flush=True)
+
+
+def _policy_running(info):
+    return bool((info.get("policy") or {}).get("running"))
+
+
+def _policy_started(data):
+    result = str((data or {}).get("result") or "")
+    return "POLICY started" in result or "policy already running" in result
+
+
+def _policy_stopped(data):
+    result = str((data or {}).get("result") or "")
+    return (
+        "POLICY stopped" in result
+        or "POLICY killed" in result
+        or "POLICY already exited" in result
+        or "no policy running" in result
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -90,6 +118,8 @@ class Robot:
         self.channels = {}            # conn_id -> {"port": p, "peer": str, "since": t}
         self.last_preflight = None    # {"t": ..., "data": {...}}
         self.info = {}                # latest robot-agent heartbeat metadata
+        self.command_lock = asyncio.Lock()
+        self.policy_active = False     # relay-side lease; pings/commands reconcile it
 
 
 class Relay:
@@ -198,6 +228,32 @@ class Relay:
             return {"ok": True, "fleet": self.fleet}
         return {"ok": False, "err": "bad action"}
 
+    def _control_busy(self, rob):
+        return bool(rob.command_lock.locked() or rob.policy_active or _policy_running(rob.info))
+
+    async def _close_channels(self, rob, port, reason):
+        matches = [
+            (conn_id, meta)
+            for conn_id, meta in list(rob.channels.items())
+            if meta.get("port") == port
+        ]
+        for _conn_id, meta in matches:
+            for writer in meta.get("_writers", ()):
+                try:
+                    writer.close()
+                except OSError:
+                    pass
+            meta["closing"] = reason
+        deadline = time.monotonic() + CONTROL_CLOSE_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if not any(c.get("port") == port for c in rob.channels.values()):
+                break
+            await asyncio.sleep(0.05)
+        remaining = [
+            conn_id for conn_id, meta in rob.channels.items() if meta.get("port") == port
+        ]
+        return {"closed": len(matches), "remaining": len(remaining), "reason": reason}
+
     # ---- transport ---------------------------------------------------------- #
     async def handle(self, reader, writer):
         peer = writer.get_extra_info("peername")
@@ -235,6 +291,7 @@ class Relay:
                             fut.set_result(msg.get("data", {}))
                     elif msg.get("ping") is not None:
                         rob.info = msg
+                        rob.policy_active = _policy_running(msg)
             finally:
                 if self.robots.get(robot_id) is rob:
                     del self.robots[robot_id]
@@ -258,6 +315,10 @@ class Relay:
                 _send(writer, {"err": f"robot '{robot_id}' offline"})
                 writer.close()
                 return
+            if port == CONTROL_PORT and self._control_busy(rob):
+                _send(writer, {"err": "control busy: policy/transition active"})
+                writer.close()
+                return
             conn_id = next(self.ids)
             fut = asyncio.get_running_loop().create_future()
             self.pending[conn_id] = fut
@@ -272,7 +333,12 @@ class Relay:
                 return
             _send(writer, {"ok": True})
             await writer.drain()
-            rob.channels[conn_id] = {"port": port, "peer": str(peer), "since": time.time()}
+            rob.channels[conn_id] = {
+                "port": port,
+                "peer": str(peer),
+                "since": time.time(),
+                "_writers": (writer, w2),
+            }
             await _splice(reader, writer, r2, w2, f"{robot_id}:{port}#{conn_id}",
                           on_close=lambda: rob.channels.pop(conn_id, None))
         else:
@@ -299,21 +365,55 @@ class Relay:
         rob = self.robots.get(robot_id)
         if rob is None:
             return {"ok": False, "err": f"robot '{robot_id}' offline"}
-        req = next(self.ids)
-        fut = asyncio.get_running_loop().create_future()
-        self.cmd_waiters[req] = fut
-        msg = {"cmd": cmd, "req": req}
-        msg.update({k: v for k, v in params.items() if v not in (None, "")})
-        _send(rob.writer, msg)
-        try:
-            await rob.writer.drain()
-            data = await asyncio.wait_for(fut, timeout=CMD_TIMEOUT_S)
-        except Exception as e:
-            self.cmd_waiters.pop(req, None)
-            return {"ok": False, "err": f"no answer: {e}"}
-        if cmd in ("preflight", "arm_on"):
-            rob.last_preflight = {"t": time.time(), "data": data}
-        return {"ok": True, "data": data}
+        async with rob.command_lock:
+            control_transition = None
+            if cmd == "run_policy":
+                rob.policy_active = True
+                control_transition = await self._close_channels(
+                    rob, CONTROL_PORT, "run_policy"
+                )
+                if control_transition["remaining"]:
+                    rob.policy_active = False
+                    return {
+                        "ok": True,
+                        "data": {
+                            "result": "REFUSED: teleop still active; try policy again",
+                            "control": control_transition,
+                        },
+                    }
+            elif cmd == "arm_off":
+                control_transition = await self._close_channels(
+                    rob, CONTROL_PORT, "arm_off"
+                )
+
+            req = next(self.ids)
+            fut = asyncio.get_running_loop().create_future()
+            self.cmd_waiters[req] = fut
+            msg = {"cmd": cmd, "req": req}
+            msg.update({k: v for k, v in params.items() if v not in (None, "")})
+            _send(rob.writer, msg)
+            try:
+                await rob.writer.drain()
+                data = await asyncio.wait_for(fut, timeout=CMD_TIMEOUT_S)
+            except Exception as e:
+                self.cmd_waiters.pop(req, None)
+                if cmd == "run_policy":
+                    rob.policy_active = False
+                return {"ok": False, "err": f"no answer: {e}"}
+
+            if control_transition is not None:
+                data["control"] = control_transition
+            if cmd in ("preflight", "arm_on"):
+                rob.last_preflight = {"t": time.time(), "data": data}
+            if cmd == "run_policy":
+                rob.policy_active = _policy_started(data)
+            elif cmd == "policy_status":
+                rob.policy_active = bool((data or {}).get("running"))
+            elif cmd in ("stop_policy", "arm_off") and _policy_stopped(data):
+                rob.policy_active = False
+            elif cmd == "arm_off":
+                rob.policy_active = False
+            return {"ok": True, "data": data}
 
     def status(self, visible=None):
         """Registered + live robots merged; offline arms still get a card (onboarding UX:
@@ -366,6 +466,11 @@ UI_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Blupe fleet
   <button onclick="report('status',this)">Status</button>
   <a href="/reports" target="_blank" style="margin-left:12px">Public reports &#8599;</a>
   <pre id="report-out"></pre></div>
+<div class="arm" id="launcher-card" style="display:none"><span class="name">Operator launcher</span>
+  <div class="ops">choose what the operator console/headset controls on the Mac:
+    <b>yam</b> = real YAM arm through the relay; all other profiles are sim-only.</div>
+  <div id="launcher-arms" class="ops">loading…</div>
+  <pre id="launcher-out"></pre></div>
 <div id="arms">loading…</div>
 <script>
 const TOKEN = new URLSearchParams(location.search).get('token') || '';
@@ -376,8 +481,9 @@ async function whoami(){ ME = await api('/api/me');
   if (ME.role === 'admin'){
     document.getElementById('admin-card').style.display = '';
     document.getElementById('report-card').style.display = '';
+    document.getElementById('launcher-card').style.display = '';
   }
-  if (ME.role === 'admin') await loadFleet(); }
+  if (ME.role === 'admin') { await loadFleet(); await launcher('status'); } }
 async function loadFleet(){ const r = await api('/api/fleet?action=list');
   if (r.ok) USERS = Object.keys(r.fleet.users); }
 async function fleetAct(params){
@@ -399,15 +505,48 @@ async function report(action, btn){ btn.disabled = true;
   try { const r = await api('/api/report?action=' + action);
         document.getElementById('report-out').textContent = JSON.stringify(r, null, 2); }
   finally { btn.disabled = false; } }
-async function cmd(robot, c, btn){ btn.disabled = true; btn.textContent = c + '…';
-  const labels = {arm_on:'Turn ON',arm_off:'Turn OFF',preflight:'Check',
-                  run_policy:'Run policy',stop_policy:'Stop policy'};
+async function launcher(action, arm, btn){
+  if (btn){ btn.disabled = true; btn.textContent = action === 'launch' ? 'launching…' : 'loading…'; }
+  try {
+    const qs = action === 'launch' ? '&arm=' + encodeURIComponent(arm || '') : '';
+    const r = await api('/api/launcher?action=' + action + qs);
+    document.getElementById('launcher-out').textContent = JSON.stringify(r, null, 2);
+    if (r.ok) drawLauncher(r);
+    return r;
+  } finally {
+    if (btn) setTimeout(() => launcher('status'), action === 'launch' ? 2500 : 0);
+  }
+}
+function drawLauncher(r){
+  const s = r.status || r;
+  const arms = s.arms || {};
+  const cur = s.running ? s.arm : '';
+  const html = Object.entries(arms).map(([n, a]) => {
+    const sim = n === 'yam' ? 'real' : 'sim';
+    const active = s.running && cur === n;
+    const disabled = a.status !== 'ready';
+    const label = active ? 'Relaunch' : 'Launch';
+    return `<button onclick="launcher('launch','${n}',this)" ${disabled ? 'disabled' : ''}
+              class="${n === 'yam' ? 'primary' : ''}"
+              style="margin:4px 6px 4px 0">${n}${active ? ' ●' : ''}</button>
+            <span style="color:#889;margin-right:12px">${sim}${a.policy ? ' · ' + a.policy : ''}</span>`;
+  }).join('') || '<span class="muted">operator launcher unavailable</span>';
+  document.getElementById('launcher-arms').innerHTML =
+    `<div style="margin-bottom:8px">current: <b>${cur || 'none'}</b>` +
+    `${s.policy ? ' · policy: ' + s.policy : ''}</div>${html}`;
+}
+async function cmd(robot, c, btn, collect){ const originalLabel = btn.textContent;
+  btn.disabled = true; btn.textContent = c + '…';
   const sel = document.getElementById('policy-' + robot);
-  const pol = c === 'run_policy' && sel ? '&policy=' + encodeURIComponent(sel.value) : '';
+  const selectedPolicy = c === 'run_policy' && sel ? sel.value : '';
+  const pol = selectedPolicy ? '&policy=' + encodeURIComponent(selectedPolicy) : '';
+  const collectParam = c === 'run_policy' && collect ? '&collect=1' : '';
+  const taskParam = c === 'run_policy' && collect && selectedPolicy
+    ? '&task=' + encodeURIComponent(selectedPolicy) : '';
   const r = await api('/api/cmd?robot=' + encodeURIComponent(robot) +
-                      '&cmd=' + encodeURIComponent(c) + pol);
+                      '&cmd=' + encodeURIComponent(c) + pol + collectParam + taskParam);
   document.getElementById('out-' + robot).textContent = JSON.stringify(r, null, 2);
-  btn.disabled = false; btn.textContent = labels[c];
+  btn.disabled = false; btn.textContent = originalLabel;
   if (c === 'arm_on' && r.ok && r.data && (r.data.result === 'ON' || r.data.result === 'already on'))
     showCams(robot, true);                                  // ON => show what the arm sees
   refresh(); }
@@ -431,6 +570,7 @@ function card(id){                                          // built ONCE; refre
     <div class="ops">policy: <span id="policy-status-${id}">unknown</span>
       <select id="policy-${id}"></select>
       <button class="primary" id="policy-run-${id}" onclick="cmd('${id}','run_policy',this)">Run policy</button>
+      <button class="primary" id="policy-collect-${id}" onclick="cmd('${id}','run_policy',this,true)">Collect run</button>
       <button id="policy-stop-${id}" onclick="cmd('${id}','stop_policy',this)">Stop policy</button></div>
     <button class="primary" onclick="cmd('${id}','arm_on',this)">Turn ON</button>
     <button class="danger" onclick="cmd('${id}','arm_off',this)">Turn OFF</button>
@@ -465,9 +605,12 @@ async function refresh(){
       : '<option value="">none configured</option>';
     if (p.default && names.includes(p.default)) policySel.value = p.default;
     const running = p.running ? `running ${p.running} (${p.running_s || 0}s)` : 'idle';
+    const tr = p.trajectory && p.trajectory.run_id ? `; collecting: ${p.trajectory.run_id}` :
+      (p.last_trajectory && p.last_trajectory.run_id ? `; last: ${p.last_trajectory.run_id}` : '');
     document.getElementById('policy-status-' + id).textContent =
-      names.length ? `${running}; configured: ${names.join(', ')}` : 'none configured';
+      names.length ? `${running}${tr}; configured: ${names.join(', ')}` : 'none configured';
     document.getElementById('policy-run-' + id).disabled = !on || !names.length || !!p.running;
+    document.getElementById('policy-collect-' + id).disabled = !on || !names.length || !!p.running;
     document.getElementById('policy-stop-' + id).disabled = !on || !p.running;
     if (ME.role === 'admin'){
       document.getElementById('links-' + id).innerHTML = (s[id].linked || []).map(u =>
@@ -487,6 +630,7 @@ async function refresh(){
   }
 }
 whoami().then(refresh); setInterval(refresh, 5000);
+setInterval(() => { if (ME.role === 'admin') launcher('status'); }, 10000);
 </script></body></html>"""
 
 
@@ -627,7 +771,7 @@ async def _http_ui(relay, args):
 
             if url.path == "/" :
                 body, ctype, code = UI_HTML, "text/html", 200
-            elif not token_ok:
+            elif not token_ok and url.path != "/api/cmd":
                 body, ctype, code = '{"err":"bad token"}', "application/json", 403
             elif url.path == "/api/me":
                 body, ctype, code = json.dumps({"role": who[0], "id": who[1]}), \
@@ -653,15 +797,43 @@ async def _http_ui(relay, args):
                 else:
                     body = await _proxy_mac(relay, op, 8810, f"/report/{action}")
                     ctype, code = "application/json", 200
+            elif url.path == "/api/launcher" and not is_admin:
+                body, ctype, code = '{"err":"admin only"}', "application/json", 403
+            elif url.path == "/api/launcher":
+                # Proxy to the operator Mac's launcher (:8809): status lists real+sim
+                # arm profiles; launch switches the headset/console target.
+                action = q.get("action", ["status"])[0]
+                op = q.get("op", ["mac-1"])[0]
+                arm = q.get("arm", [""])[0]
+                if action not in ("status", "launch") or not op.startswith("mac-"):
+                    body, ctype, code = '{"err":"bad launcher request"}', "application/json", 400
+                else:
+                    path = "/status" if action == "status" else (
+                        "/launch?arm=" + urllib.parse.quote(arm)
+                    )
+                    upstream = await _proxy_mac(relay, op, 8809, path)
+                    try:
+                        data = json.loads(upstream)
+                        body = json.dumps({"ok": bool(data.get("ok")), "status": data})
+                    except Exception:
+                        body = upstream
+                    ctype, code = "application/json", 200
             elif url.path == "/api/cmd":
                 robot = q.get("robot", [""])[0]
                 cmd = q.get("cmd", [""])[0]
-                if cmd not in ("preflight", "arm_on", "arm_off", "run_policy", "stop_policy"):
+                legacy_ok = relay.auth_robot_token(robot, q.get("token", [""])[0])
+                if cmd not in ("preflight", "arm_on", "arm_off", "run_policy",
+                               "stop_policy", "policy_status"):
                     body, ctype, code = '{"err":"bad cmd"}', "application/json", 400
-                elif robot not in relay.visible_robots(who):
+                elif not legacy_ok and (not token_ok or robot not in relay.visible_robots(who)):
                     body, ctype, code = '{"err":"not your arm"}', "application/json", 403
                 else:
-                    body = json.dumps(await relay.command(robot, cmd, policy=q.get("policy", [""])[0]))
+                    body = json.dumps(await relay.command(
+                        robot, cmd,
+                        policy=q.get("policy", [""])[0],
+                        collect=q.get("collect", [""])[0],
+                        task=q.get("task", [""])[0],
+                    ))
                     ctype, code = "application/json", 200
             else:
                 body, ctype, code = "not found", "text/plain", 404
@@ -711,6 +883,8 @@ class Arm:
         self.policy_proc = None
         self.policy_id = None
         self.policy_started = None
+        self.current_trajectory = None
+        self.last_trajectory = None
         self.lock = asyncio.Lock()
         self.policies = {}
         for item in args.policy or []:
@@ -718,6 +892,15 @@ class Arm:
             if sep and name.strip() and cmd.strip():
                 self.policies[name.strip()] = cmd.strip()
         self.default_policy = args.default_policy or (next(iter(self.policies), ""))
+
+    @staticmethod
+    def _truthy(value):
+        return str(value or "").lower() in {"1", "true", "yes", "on"}
+
+    def _finish_current_trajectory(self):
+        if self.current_trajectory is not None:
+            self.last_trajectory = dict(self.current_trajectory)
+            self.current_trajectory = None
 
     async def _sh(self, cmd, timeout=10):
         p = await asyncio.create_subprocess_shell(
@@ -727,14 +910,31 @@ class Arm:
 
     async def _handshake(self, timeout=6):
         """Connect to the serve and read start_joints — proves motors enumerate + respond."""
+        w = None
         try:
             r, w = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", self.args.serve_port), timeout=3)
             line = await asyncio.wait_for(r.readline(), timeout=timeout)
-            w.close()
             return json.loads(line.decode()).get("start_joints")
         except Exception:
             return None
+        finally:
+            if w is not None:
+                w.close()
+                try:
+                    await w.wait_closed()
+                except Exception:
+                    pass
+
+    async def _wait_for_handshake(self, timeout=8.0):
+        """Wait for the single-client serve to become available after teleop closes."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            sj = await self._handshake(timeout=1)
+            if sj is not None:
+                return sj
+            await asyncio.sleep(0.2)
+        return None
 
     async def _tail(self, path, lines=12):
         try:
@@ -745,12 +945,19 @@ class Arm:
 
     def policy_status(self):
         running = self.policy_proc is not None and self.policy_proc.returncode is None
+        if not running:
+            self._finish_current_trajectory()
         return {
             "configured": sorted(self.policies),
             "default": self.default_policy,
             "running": self.policy_id if running else None,
             "running_s": round(time.time() - self.policy_started) if running and self.policy_started else 0,
+            "trajectory": self.current_trajectory if running else None,
+            "last_trajectory": self.last_trajectory,
         }
+
+    async def get_policy_status(self):
+        return self.policy_status()
 
     async def _shutdown_serve(self):
         """Ask the serve to torque off and exit via its own protocol."""
@@ -858,11 +1065,11 @@ class Arm:
             killed.insert(0, detail)
         return {"result": result, "killed": killed or ["nothing running"], "turnoff_tail": tail}
 
-    async def run_policy(self, policy=None):
+    async def run_policy(self, policy=None, collect=None, task=""):
         async with self.lock:
-            return await self._run_policy_locked(policy)
+            return await self._run_policy_locked(policy, collect=collect, task=task)
 
-    async def _run_policy_locked(self, policy=None):
+    async def _run_policy_locked(self, policy=None, collect=None, task=""):
         if self.policy_proc is not None and self.policy_proc.returncode is None:
             return {"result": "policy already running", "policy": self.policy_id,
                     "status": self.policy_status()}
@@ -871,12 +1078,37 @@ class Arm:
         if not cmd:
             return {"result": "REFUSED: no such policy configured", "policy": policy_id,
                     "configured": sorted(self.policies)}
-        sj = await self._handshake()
+        sj = await self._wait_for_handshake()
         if sj is None:
             return {"result": "REFUSED: serve is off; Turn ON first", "policy": policy_id}
+        env = None
+        trajectory = None
+        if self._truthy(collect):
+            run_policy_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in policy_id)
+            run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{run_policy_id}"
+            root = os.path.abspath(self.args.trajectory_root)
+            out_dir = os.path.join(root, run_id)
+            trajectory = {
+                "run_id": run_id,
+                "dir": out_dir,
+                "policy": policy_id,
+                "task": task or policy_id,
+            }
+            env = dict(os.environ)
+            env.update({
+                "BLUPE_COLLECT_TRAJECTORY": "1",
+                "BLUPE_TRAJECTORY_ROOT": root,
+                "BLUPE_TRAJECTORY_DIR": out_dir,
+                "BLUPE_TRAJECTORY_RUN_ID": run_id,
+                "BLUPE_TRAJECTORY_POLICY": policy_id,
+                "BLUPE_TRAJECTORY_TASK": task or policy_id,
+                "BLUPE_TRAJECTORY_UNITS": "radians",
+            })
+            self.current_trajectory = trajectory
         self.policy_proc = await asyncio.create_subprocess_shell(
             f"exec {cmd}", start_new_session=True,
-            stdout=open(self.args.policy_log, "ab"), stderr=asyncio.subprocess.STDOUT)
+            stdout=open(self.args.policy_log, "ab"), stderr=asyncio.subprocess.STDOUT,
+            env=env)
         self.policy_id = policy_id
         self.policy_started = time.time()
         await asyncio.sleep(0.5)
@@ -886,9 +1118,16 @@ class Arm:
             self.policy_proc = None
             self.policy_id = None
             self.policy_started = None
-            return {"result": f"policy exited rc={rc}", "policy": policy_id, "log": tail}
-        return {"result": "POLICY started", "policy": policy_id, "pid": self.policy_proc.pid,
+            self._finish_current_trajectory()
+            resp = {"result": f"policy exited rc={rc}", "policy": policy_id, "log": tail}
+            if trajectory is not None:
+                resp["trajectory"] = trajectory
+            return resp
+        resp = {"result": "POLICY started", "policy": policy_id, "pid": self.policy_proc.pid,
                 "start_joints": sj}
+        if trajectory is not None:
+            resp["trajectory"] = trajectory
+        return resp
 
     async def stop_policy(self):
         async with self.lock:
@@ -899,8 +1138,10 @@ class Arm:
             self.policy_proc = None
             self.policy_id = None
             self.policy_started = None
-            return {"result": "no policy running"}
+            self._finish_current_trajectory()
+            return {"result": "no policy running", "last_trajectory": self.last_trajectory}
         policy_id = self.policy_id
+        trajectory = self.current_trajectory
         try:
             os.killpg(self.policy_proc.pid, signal.SIGTERM)
             await asyncio.wait_for(self.policy_proc.wait(), timeout=5)
@@ -917,7 +1158,11 @@ class Arm:
         self.policy_proc = None
         self.policy_id = None
         self.policy_started = None
-        return {"result": result, "policy": policy_id, "log": tail}
+        self._finish_current_trajectory()
+        resp = {"result": result, "policy": policy_id, "log": tail}
+        if trajectory is not None:
+            resp["trajectory"] = trajectory
+        return resp
 
 
 async def _robot_data(args, conn_id, port):
@@ -938,7 +1183,8 @@ async def role_robot(args):
     host, rport = args.relay.rsplit(":", 1)
     arm = Arm(args)
     cmds = {"preflight": arm.preflight, "arm_on": arm.arm_on, "arm_off": arm.arm_off,
-            "run_policy": arm.run_policy, "stop_policy": arm.stop_policy}
+            "run_policy": arm.run_policy, "stop_policy": arm.stop_policy,
+            "policy_status": arm.get_policy_status}
     while True:
         try:
             reader, writer = await asyncio.open_connection(host, int(rport))
@@ -955,7 +1201,11 @@ async def role_robot(args):
             async def run_cmd(name, req, msg):
                 try:
                     if name == "run_policy":
-                        data = await cmds[name](msg.get("policy"))
+                        data = await cmds[name](
+                            msg.get("policy"),
+                            collect=msg.get("collect"),
+                            task=msg.get("task", ""),
+                        )
                     else:
                         data = await cmds[name]()
                 except Exception as e:
@@ -1052,6 +1302,8 @@ def main():
                    help="policy mapping, e.g. pick_place='cd /repo && python scripts/run_policy.py scripts/policies/pick_place.py:run'")
     r.add_argument("--default-policy", default="", help="policy id used when the UI does not specify one")
     r.add_argument("--policy-log", default="/tmp/policy_managed.log")
+    r.add_argument("--trajectory-root", default="trajectories/pending",
+                   help="raw pending trajectory output root for collect-policy runs")
 
     o = sub.add_parser("operator")
     o.add_argument("--relay", required=True)

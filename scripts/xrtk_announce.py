@@ -34,11 +34,11 @@ def build_packet(ip: str) -> bytes:
             + struct.pack("<Q", int(time.time())) + bytes([0xA5]))
 
 
-def lan_ip() -> str:
-    """The Mac's outbound LAN IP (no traffic actually sent)."""
+def lan_ip(target: str = "8.8.8.8") -> str:
+    """The Mac's source IP for reaching target (no traffic actually sent)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 53))
+        s.connect((target, 53))
         return s.getsockname()[0]
     finally:
         s.close()
@@ -58,7 +58,7 @@ def main(ip: Optional[str] = None, unicast: list[str] = [],
          interval: float = 5.0, port: int = PORT):
     """ip: address to advertise (default: this host's LAN IP). unicast: also send straight
     to these hosts (e.g. the Quest) in case the AP/Android filters subnet broadcasts."""
-    ip = ip or lan_ip()
+    ip = ip or lan_ip(unicast[0] if unicast else "8.8.8.8")
     guess24 = ".".join(ip.split(".")[:3] + ["255"])   # /24, same as the real service
     dests = list(dict.fromkeys(                       # dedup, keep order
         [b for b in (iface_broadcast(ip), guess24, "255.255.255.255") if b] + list(unicast)))
