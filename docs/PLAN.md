@@ -232,8 +232,8 @@ This makes PLAN Part 2 concrete. Staged, each stage independently shippable:
 **Stage 1 — ArmProfile + registry (the de-hardcoding).**
 `arms/<name>/arm.json` + assets per arm; YAM becomes the first bundle. Profile fields:
 `n_joints, ee_link, mjcf, urdf, home_keyframe, max_vel, serve {host, port}, gripper
-{open, close}, cameras (default)`. `eval_yam_vr.py --arm yam` (default) loads it;
-`eval_yam_states` constants (N_ARM=6, EE, MAX_VEL) become profile-driven via `E.load_arm()`;
+{open, close}, cameras (default)`. `mac_quest_bridge.py --arm yam` (default) loads it;
+`eval_states` constants (N_ARM=6, EE, MAX_VEL) become profile-driven via `E.load_arm()`;
 policies take paths from the profile. Exit check: YAM runs exactly as today via its bundle.
 SO-101 is 5-DOF + gripper — the registry must survive n_joints ≠ 6 everywhere ([:6] sweeps).
 

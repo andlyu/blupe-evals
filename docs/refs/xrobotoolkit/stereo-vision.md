@@ -13,7 +13,7 @@ Verified against both ends' upstream source:
 
 Our implementations: `scripts/stereo_sender.py` (server + standalone CLI),
 `scripts/fake_quest_stereo.py` (plays the Quest's side — headless e2e test),
-`scripts/eval_yam_vr.py --video stereo` (integrated: VIEW toggles cameras ↔ stereo sim render).
+`scripts/mac_quest_bridge.py --video stereo` (integrated: VIEW toggles cameras ↔ stereo sim render).
 
 ## Sequence
 

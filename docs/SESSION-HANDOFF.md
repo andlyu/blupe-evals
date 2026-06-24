@@ -9,7 +9,7 @@ relay and fleet UI. One issue is open (headset video — see "Open issues #1").
 **Where things stand:** BACK HOME. Mac `192.168.0.231` (NOTE: the router re-leased — it used
 to be `.190`; get a DHCP reservation), Quest `192.168.0.30`, Orin `192.168.0.185`. Everything
 LAN-direct (no cloud hop at home — infra ISSUE-004): eval cameras/serve point straight at the
-Orin. Running on the Mac: `eval_yam_vr.py` (task `red-plate-pickup`, log `/tmp/eval_live.log`),
+Orin. Running on the Mac: `mac_quest_bridge.py` (task `red-plate-pickup`, log `/tmp/eval_live.log`),
 `xrtk_announce.py`, relay operator, docker `xr-bridge`, `eval_report.py serve` (:7799).
 **The eval pipeline ran its first REAL session today: 7 trials in `runs/2026-06-11_red-plate-
 pickup/`, all judged in-VR, 43% success.** Failures still need stage+score via the judge UI.
@@ -107,11 +107,11 @@ test sustained), `logging` ([lat] conventions; from the parallel thread).
   arm). REAL-hardware drivers/serves NOT wired yet (per-arm notes in arms.py + refs);
   policies still assume YAM (warned at startup). OpenArm bases sit at floor level —
   upstream pedestal.xml/cell.xml exist if we want a mounted look.
-  `XR_INPUT=stub eval_yam_vr.py --cameras none --serve-port 5599` (stub PRESSES buttons —
+  `XR_INPUT=stub mac_quest_bridge.py --cameras none --serve-port 5599` (stub PRESSES buttons —
   fake serve only!). MuJoCo `offwidth` raised to 1920 in `assets/yam/scene.xml`.
 
 **Eval report system v1 — BUILT & verified with real in-VR trials (this thread):**
-`eval_yam_vr.py --task <name> --stages reach grasp lift place` auto-records **one trial per
+`mac_quest_bridge.py --task <name> --stages reach grasp lift place` auto-records **one trial per
 POLICY run** (no button: entering POLICY starts video+meta, the post-run SUCCESS/FAIL verdict
 modal — stick l/r + click — saves the result and closes the trial; re-entering POLICY with a
 verdict pending saves the old trial unjudged). Operator-view canvas →
@@ -131,12 +131,12 @@ scale 0.85` letterbox ("move the screen back"; recordings stay full-frame), red 
 INPUT banner (liveness = head-pose jitter, bridge mode), policy-verdict modal owns the stick
 while up (A/X/B/Y safety shortcuts stay live). Camera relay (Orin) got only-new-frames +
 SO_SNDBUF+drop (ISSUE-004) — slow consumers get FEWER frames, never OLDER frames.
-**File ownership to avoid parallel-edit conflicts:** this thread owns `scripts/eval_yam_vr.py`,
+**File ownership to avoid parallel-edit conflicts:** this thread owns `scripts/mac_quest_bridge.py`,
 `scripts/stereo_sender.py`, `scripts/eval_report.py` (new), `docs/SESSION-HANDOFF.md`.
 Parallel threads: don't edit those; everything else is fair game.
 
 **Uncommitted working tree** (nothing committed since `1d0a536`; spans BOTH threads' work —
-coordinate before committing): modified — `eval_yam_vr.py`, `YAM_control/camera_relay.py`
+coordinate before committing): modified — `mac_quest_bridge.py`, `YAM_control/camera_relay.py`
 (deployed to Orin), `YAM_control/yam_real_serve.py` (ack protocol), `xrobotoolkit_sdk.py`,
 `scene.xml`, `SESSION-HANDOFF.md`, `refs/xrobotoolkit/INDEX.md`,
 `.claude/skills/infra/SKILL.md`, `policies/gripper_forward.py`;
@@ -150,7 +150,7 @@ new — `stereo_sender.py`, `eval_report.py`, `xrtk_announce.py`, `fake_quest_st
 ```
 OPERATOR (this Mac + Quest, same Wi-Fi)        CLOUD                ROBOT SITE (Orin + YAM)
 Quest ──input :63901──► Docker xr-bridge       GCP e2-micro         agent (dials OUT)
-Quest ◄─video :12345─── eval_yam_vr.py         35.185.232.107       ├─ yam_real_serve :5599
+Quest ◄─video :12345─── mac_quest_bridge.py         35.185.232.107       ├─ yam_real_serve :5599
 eval ──► localhost:15599 (joints) ──┐          :8443 relay          │  (vel clamp·hold·torque-off)
 eval ──► localhost:18089 (cameras) ─┴─ operator client ──► relay ◄──┴─ camera_relay :8089 (MJPEG)
                                                :8080 fleet UI
@@ -182,7 +182,7 @@ eval ──► localhost:18089 (cameras) ─┴─ operator client ──► rel
 docker start xr-bridge || docker run -d --rm --name xr-bridge -p 63901:63901 -p 8765:8765 xr-bridge
 .venv/bin/python relay/relay.py operator --relay 35.185.232.107:8443 --robot yam-1 --token $(cat /tmp/relay_token) &
 .venv/bin/python scripts/xrtk_announce.py --unicast 192.168.0.30 &   # headset IP popup, no typing
-XR_INPUT=bridge .venv/bin/python scripts/eval_yam_vr.py --quest-ip 192.168.0.30 \
+XR_INPUT=bridge .venv/bin/python scripts/mac_quest_bridge.py --quest-ip 192.168.0.30 \
   --serve-host 127.0.0.1 --serve-port 15599 \
   --cameras http://127.0.0.1:18089/0 http://127.0.0.1:18089/2     # logs: /tmp/eval_live.log
 # ^ REMOTE (cloud-relay) endpoints. At home go LAN-direct (no GCP hop; infra ISSUE-004):
@@ -241,7 +241,7 @@ via `start_joints` handshake, cameras; starts what's down) → headset LISTEN + 
    FLAT mode). Both structural fixes built into `stereo_sender.py`: SO_SNDBUF 128 KB + drop-
    frames-on-backpressure (no doze backlog), fresh session per panel-open. Headless e2e PASSED
    (`scripts/fake_quest_stereo.py` plays the Quest side; run it against
-   `XR_INPUT=stub … eval_yam_vr.py --cameras none`). **Real-headset test pending.** Protocol
+   `XR_INPUT=stub … mac_quest_bridge.py --cameras none`). **Real-headset test pending.** Protocol
    doc: `docs/refs/xrobotoolkit/stereo-vision.md`. KNOWN COLLISION: in stereo view the Quest
    app uses **B = flat↔3D toggle** — same button as our B=GO_HOME shortcut.
 2. **Fleet UI camera view** ("Turn ON lets us view cameras"). Design ready: relay gains

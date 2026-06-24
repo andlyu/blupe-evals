@@ -13,7 +13,7 @@ description: >
 
 | Process | Host | File | How it gets there |
 |---|---|---|---|
-| `eval_yam_vr.py` (+ `stereo_sender` — same process) | Mac | `/tmp/eval_live.log` | shell redirect in the start command (SESSION-HANDOFF "How to start") |
+| `mac_quest_bridge.py` (+ `stereo_sender` — same process) | Mac | `/tmp/eval_live.log` | shell redirect in the start command (SESSION-HANDOFF "How to start") |
 | relay operator | Mac | none by default | add `> /tmp/relay_operator.log 2>&1` if you need it |
 | relay agent | Orin | `/tmp/relay_agent.log` | the setsid/nohup start command |
 | `yam_real_serve.py` (fleet-started) | Orin | `/tmp/serve_managed.log` | agent spawns it (`relay.py` ~line 430), **append** mode — restarts accumulate |
@@ -75,7 +75,7 @@ the sender (`{"q":…, "t":…}` → serve applies → `{"ack": t}`; `t` optiona
 just don't ack). Same trick for any future cross-machine probe.
 
 **Verify changes headlessly:** fake serve (`yam_real_serve.py --fake --port 5597`) +
-`XR_INPUT=stub eval_yam_vr.py --quest-ip 127.0.0.1 --cameras none --serve-port 5597`,
+`XR_INPUT=stub mac_quest_bridge.py --quest-ip 127.0.0.1 --cameras none --serve-port 5597`,
 then `grep "\[lat\]"` both logs. Stereo path: `stereo_sender.py --listen-port 23579` +
 `fake_quest_stereo.py --control-port 23579 --video-port 23457` (note: fake quest exits
 after 30 packets — shorter than the 5 s report window, so no `[lat]` line is expected

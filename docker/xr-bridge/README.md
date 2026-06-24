@@ -45,6 +45,6 @@ read that as "input lost" (clutch released) per the spec.
 ## Eval against the bridge (native macOS)
 
 ```bash
-XR_INPUT=bridge .venv/bin/python scripts/eval_yam_vr.py --quest-ip <quest-ip> \
+XR_INPUT=bridge .venv/bin/python scripts/mac_quest_bridge.py --quest-ip <quest-ip> \
     --serve-host <orin-ip>   # omit serve-host for sim-only
 ```

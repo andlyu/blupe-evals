@@ -206,7 +206,7 @@ Validation order:
 
 ### Operator-side eval policy path
 
-The older eval path runs policy inside `eval_yam_vr.py` on the operator machine:
+The older eval path runs policy inside `mac_quest_bridge.py` on the operator machine:
 
 ```bash
 --policy scripts/policies/pick_place.py:run

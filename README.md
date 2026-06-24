@@ -11,7 +11,7 @@ works on both.
 ```
 OPERATOR (laptop + Quest, same Wi-Fi)         CLOUD (optional)        ROBOT SITE
 Quest ──input──► xr-bridge (docker)           relay + fleet UI        agent (dials OUT)
-Quest ◄─video─── eval_yam_vr.py  ◄─ cameras ──── relay channels ────► camera_relay
+Quest ◄─video─── mac_quest_bridge.py  ◄─ cameras ──── relay channels ────► camera_relay
 eval ──joints──► serve (robot-side safety: clamp · hold · torque-off) ─► your arm
 ```
 
@@ -34,7 +34,7 @@ python3.10 -m venv .venv && .venv/bin/pip install -r requirements.txt
 docker build -t xr-bridge docker/xr-bridge          # the XR input appliance
 docker run -d --rm --name xr-bridge -p 63901:63901 -p 8765:8765 xr-bridge
 .venv/bin/python scripts/xrtk_announce.py &          # headset discovers you: no IP typing
-XR_INPUT=bridge .venv/bin/python scripts/eval_yam_vr.py --quest-ip <quest-ip> --cameras none
+XR_INPUT=bridge .venv/bin/python scripts/mac_quest_bridge.py --quest-ip <quest-ip> --cameras none
 ```
 
 Headset (XRoboToolkit Quest app, sideloaded once): **Network panel → tap the popped-up IP →
@@ -73,7 +73,7 @@ Start the eval with a task: `--task red-plate-pickup --stages reach grasp lift p
 ## Pieces
 
 ```
-scripts/eval_yam_vr.py     the operator process: state machine, headset video, trials, HUD
+scripts/mac_quest_bridge.py     the operator process: state machine, headset video, trials, HUD
 scripts/arms.py            embodiment registry (ArmSpec: assets, EE frames, dof, caps)
 scripts/eval_report.py     judge UI + report renderer       scripts/policies/   scripted policies
 scripts/stereo_sender.py   headset video transport          scripts/xrtk_announce.py  IP popup

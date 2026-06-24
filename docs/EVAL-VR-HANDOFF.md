@@ -16,8 +16,8 @@ teleop/policy/home**, sim-first, graduating to the real arm (M2).
 - **Teleop velocity cap** — rate-independent rad/s clamp so teleop is smooth (no jumps); go-home
   eases at a rad/s cap too (PLAN Part 1 #6).
 
-## One process: `scripts/eval_yam_vr.py`
-Runs the control loop **headless** + streams the live sim. Reuses `eval_yam_states.py` for the
+## One process: `scripts/mac_quest_bridge.py`
+Runs the control loop **headless** + streams the live sim. Reuses `eval_states.py` for the
 gate (SimRobot / SafeRobot / Console / policy loader) and the menu constants.
 - **Controls:** right thumbstick L/R = move menu cursor, **click stick = select**; shortcuts
   A=TELEOP, X=POLICY, B=GO_HOME, Y=QUIT. (Nav moved L→R stick at user request.)
@@ -49,7 +49,7 @@ source ~/miniforge3/etc/profile.d/conda.sh && conda activate xr
 APP=~/roboticsservice/opt/apps/roboticsservice
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$APP:$APP/lib:$APP/SDK/arm64" DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority MUJOCO_GL=glfw
 cd ~/blupe-evals
-python scripts/eval_yam_vr.py --quest-ip 192.168.0.30 --policy scripts/policies/gripper_forward.py:run
+python scripts/mac_quest_bridge.py --quest-ip 192.168.0.30 --policy scripts/policies/gripper_forward.py:run
 ```
 
 ## Open items / next
@@ -64,8 +64,8 @@ python scripts/eval_yam_vr.py --quest-ip 192.168.0.30 --policy scripts/policies/
 - Commit the eval scripts (currently uncommitted on the working tree).
 
 ## Files
-- `scripts/eval_yam_vr.py` — integrated eval + live headset stream (the main entry).
-- `scripts/eval_yam_states.py` — on-monitor variant + the gate/state classes (reused by vr).
+- `scripts/mac_quest_bridge.py` — integrated eval + live headset stream (the main entry).
+- `scripts/eval_states.py` — on-monitor variant + the gate/state classes (reused by vr).
 - `scripts/orin/sim_video_sender.py` — standalone stream tester (orbiting arm).
 - `scripts/policies/gripper_forward.py` — demo policy.
 - `scripts/gen_yam_urdf.py`, `scripts/test_yam_ik.py` — model gen + verify.
