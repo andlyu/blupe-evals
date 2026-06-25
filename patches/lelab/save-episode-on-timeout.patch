@@ -1,0 +1,16 @@
+diff --git a/lelab/record.py b/lelab/record.py
+--- a/lelab/record.py
++++ b/lelab/record.py
+@@
+             else:
+-                # Recording completed due to timeout - trigger re-record behavior
+-                logger.info("⏰ RECORDING PHASE COMPLETED DUE TO TIMEOUT - triggering re-record")
++                # Recording completed because the requested episode duration elapsed.
++                # That is a successful episode; only an explicit rerecord event should
++                # discard the buffer and repeat the same episode.
++                logger.info("⏰ RECORDING PHASE COMPLETED DUE TO TIMEOUT - proceeding to save episode")
+                 print(
+-                    f"⏰ STATUS CHANGE: Recording timeout reached for episode {current_episode} - re-recording"
++                    f"⏰ STATUS CHANGE: Recording timeout reached for episode {current_episode} - saving episode"
+                 )
+-                web_events["rerecord_episode"] = True
