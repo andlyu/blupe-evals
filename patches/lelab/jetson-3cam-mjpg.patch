@@ -1,0 +1,14 @@
+diff --git a/lelab/record.py b/lelab/record.py
+--- a/lelab/record.py
++++ b/lelab/record.py
+@@
+         backend_name = camera_data.get("backend")
+         backend = Cv2Backends[backend_name] if backend_name else default_backend
+         fourcc = camera_data.get("fourcc") or None
++        if fourcc is None and backend == Cv2Backends.V4L2 and len(cameras) >= 3:
++            # Three USB cameras on the Jetson need compressed capture; the UI
++            # currently omits the saved robot camera fourcc from recording requests.
++            fourcc = "MJPG"
+ 
+         camera_configs[camera_name] = OpenCVCameraConfig(
+             index_or_path=camera_data.get("camera_index", 0),
