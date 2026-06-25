@@ -6,7 +6,13 @@ def test_dashboard_targets_station_hub_api_only():
     assert "getJson('/api/stations')" in HUB_DASHBOARD_HTML
     assert "/api/stations/${encodeURIComponent(station.id)}/camera/" in HUB_DASHBOARD_HTML
     assert "/record/start" in HUB_DASHBOARD_HTML
+    assert "Connect + Read Joints" in HUB_DASHBOARD_HTML
+    assert "/api/stations/${encodeURIComponent(id)}/connect" in HUB_DASHBOARD_HTML
     assert "/teleop/claim" in HUB_DASHBOARD_HTML
+    assert "/api/stations/${encodeURIComponent(id)}/nudge" in HUB_DASHBOARD_HTML
+    assert "/api/stations/${encodeURIComponent(id)}/gripper" in HUB_DASHBOARD_HTML
+    assert "follower" in HUB_DASHBOARD_HTML
+    assert "leader" in HUB_DASHBOARD_HTML
     assert "/dataset?station=" in HUB_DASHBOARD_HTML
     assert "192.168." not in HUB_DASHBOARD_HTML
     assert "8091" not in HUB_DASHBOARD_HTML

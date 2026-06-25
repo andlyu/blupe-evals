@@ -37,6 +37,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from blupe_evals.station import CameraConfig, HttpPolicyClient, default_camera_configs, parse_camera_config_specs
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
 
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 SEMANTIC_CAMERA_NAMES = ("front", "side", "wrist")
@@ -644,7 +645,9 @@ class SO101Controller:
         self.success_enabled = success_enabled
         self.success_fps = success_fps
         self.robot: SO101Follower | None = None
+        self.leader: SO101Leader | None = None
         self.robot_lock = threading.RLock()
+        self.leader_lock = threading.RLock()
         self.stop_event = threading.Event()
         self.policy_thread: threading.Thread | None = None
         self.success_stop_event = threading.Event()
@@ -660,6 +663,7 @@ class SO101Controller:
         self.stage = "idle"
         self.last_error = ""
         self.last_state: list[float] | None = None
+        self.last_leader_state: list[float] | None = None
         self.last_query_s: float | None = None
         self.started_at: float | None = None
         self.steps = 0
@@ -1050,6 +1054,16 @@ class SO101Controller:
                 self.log(f"connected {self.port} id={self.robot_id}")
             return self.robot
 
+    def ensure_leader(self) -> SO101Leader:
+        with self.leader_lock:
+            if self.leader is None:
+                cfg = SO101LeaderConfig(port=self.leader_port, id=self.leader_id)
+                leader = SO101Leader(cfg)
+                leader.connect()
+                self.leader = leader
+                self.log(f"connected leader {self.leader_port} id={self.leader_id}")
+            return self.leader
+
     def disconnect(self) -> None:
         if self._eval_running():
             self.stop_eval()
@@ -1063,6 +1077,11 @@ class SO101Controller:
                 self.robot.disconnect()
                 self.robot = None
                 self.log("disconnected")
+        with self.leader_lock:
+            if self.leader is not None:
+                self.leader.disconnect()
+                self.leader = None
+                self.log("leader disconnected")
 
     def shutdown(self) -> None:
         self.stop_success_tracking(join=True)
@@ -1087,6 +1106,32 @@ class SO101Controller:
                 time.sleep(0.05)
         assert last is not None
         raise last
+
+    def read_leader_state(self, retries: int = 4) -> np.ndarray:
+        last: BaseException | None = None
+        for _ in range(retries):
+            try:
+                leader = self.ensure_leader()
+                with self.leader_lock:
+                    action = leader.get_action()
+                state = np.array([action[f"{joint}.pos"] for joint in JOINTS], dtype=np.float32)
+                with self.status_lock:
+                    self.last_leader_state = [float(x) for x in state]
+                return state
+            except BaseException as exc:
+                last = exc
+                time.sleep(0.05)
+        assert last is not None
+        raise last
+
+    def read_station_joints(self) -> dict[str, Any]:
+        follower = self.read_state()
+        leader = self.read_leader_state()
+        return {
+            "joints": JOINTS,
+            "follower": [float(x) for x in follower],
+            "leader": [float(x) for x in leader],
+        }
 
     def send_state(self, target: np.ndarray, retries: int = 4) -> None:
         action = {f"{joint}.pos": float(v) for joint, v in zip(JOINTS, target)}
@@ -1138,8 +1183,8 @@ class SO101Controller:
                         "type": "so101_leader",
                         "id": self.leader_id,
                         "port": self.leader_port,
-                        "connected": None,
-                        "state": None,
+                        "connected": self.leader is not None,
+                        "state": self.last_leader_state,
                         "joints": JOINTS,
                     },
                 ],
@@ -1160,7 +1205,7 @@ class SO101Controller:
                             "type": "so101_leader",
                             "id": self.leader_id,
                             "port": self.leader_port,
-                            "connected": None,
+                            "connected": self.leader is not None,
                         },
                         "cameras": [cam.name for cam in self.camera_configs],
                     }
@@ -4804,8 +4849,8 @@ def make_handler(controller: SO101Controller):
                     home = controller.save_current_as_home()
                     _json_response(self, 200, {"ok": True, "home": home})
                 elif parsed.path == "/api/connect":
-                    state = controller.read_state()
-                    _json_response(self, 200, {"ok": True, "state": [float(x) for x in state]})
+                    joints = controller.read_station_joints()
+                    _json_response(self, 200, {"ok": True, **joints})
                 elif parsed.path == "/api/disconnect":
                     controller.disconnect()
                     _json_response(self, 200, {"ok": True})

@@ -60,6 +60,9 @@ button:disabled { opacity:.5; cursor:not-allowed; }
 .stat { background:#0f1215; border:1px solid #30363d; border-radius:5px; padding:8px; min-height:36px; }
 .stat span { display:block; color:#9aa4af; font-size:11px; margin-bottom:3px; }
 .stat b { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:13px; }
+table { width:100%; border-collapse:collapse; font-size:12px; }
+th, td { border-bottom:1px solid #30363d; padding:5px 6px; text-align:left; }
+th { color:#9aa4af; font-weight:600; }
 .cams { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:8px; }
 .cam { display:grid; gap:5px; }
 .cam img { width:100%; aspect-ratio:4 / 3; object-fit:contain; background:#050607; border:1px solid #30363d; border-radius:5px; }
@@ -130,6 +133,28 @@ function evalText(id) {
   if (e.running) return `${e.state || 'running'} attempt ${e.attempt || 0}`;
   return e.state || '-';
 }
+function jointRows(id) {
+  const status = state.status[id] || {};
+  const robots = Array.isArray(status.robots) ? status.robots : [];
+  const joints = status.joints || ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
+  const byRole = Object.fromEntries(robots.map(robot => [robot.role, robot]));
+  return joints.map((joint, idx) => {
+    const follower = byRole.follower?.state?.[idx];
+    const leader = byRole.leader?.state?.[idx];
+    return `<tr>
+      <td>${escapeHtml(joint)}</td>
+      <td class="mono">${Number.isFinite(Number(follower)) ? Number(follower).toFixed(2) : '-'}</td>
+      <td class="mono">${Number.isFinite(Number(leader)) ? Number(leader).toFixed(2) : '-'}</td>
+    </tr>`;
+  }).join('');
+}
+function robotSummary(id) {
+  const robots = (state.status[id] || {}).robots || [];
+  return robots.map(robot => {
+    const connected = robot.connected === true ? 'ok' : robot.connected === false ? 'bad' : 'warn';
+    return `<span class="pill mono ${connected}"><span class="dot"></span>${escapeHtml(robot.role)} ${escapeHtml(robot.port || '-')}</span>`;
+  }).join('');
+}
 function render() {
   document.getElementById('hubState').className = `pill mono ${state.stations.length ? 'ok' : 'warn'}`;
   document.getElementById('stations').innerHTML = state.stations.map(station => {
@@ -157,14 +182,28 @@ function render() {
             <div class="stat"><span>eval</span><b>${escapeHtml(evalText(station.id))}</b></div>
             <div class="stat"><span>base</span><b title="${escapeHtml(station.base_url)}">${escapeHtml(station.base_url || '-')}</b></div>
           </div>
+          <div class="row">${robotSummary(station.id)}</div>
+          <table>
+            <thead><tr><th>joint</th><th>follower</th><th>leader</th></tr></thead>
+            <tbody>${jointRows(station.id)}</tbody>
+          </table>
           <div class="cams">${cameras}</div>
           <div class="row">
+            <button onclick="connectStation(${stationArg})">Connect + Read Joints</button>
             <button class="primary" onclick="location.href='/record?station=${encodeURIComponent(station.id)}'">Record Dataset</button>
             <button onclick="recordStart(${stationArg})">Quick Record</button>
             <button onclick="recordStop(${stationArg})">Stop Record</button>
             <button onclick="teleopClaim(${stationArg})">Claim Teleop</button>
             <button onclick="teleopRelease(${stationArg})">Release</button>
             <button onclick="location.href='/dataset?station=${encodeURIComponent(station.id)}'">Edit Dataset</button>
+          </div>
+          <div class="row">
+            <button onclick="nudge(${stationArg}, 'shoulder_pan', -2)">Pan -</button>
+            <button onclick="nudge(${stationArg}, 'shoulder_pan', 2)">Pan +</button>
+            <button onclick="nudge(${stationArg}, 'wrist_flex', -2)">Wrist -</button>
+            <button onclick="nudge(${stationArg}, 'wrist_flex', 2)">Wrist +</button>
+            <button onclick="gripper(${stationArg}, 0)">Open</button>
+            <button onclick="gripper(${stationArg}, 50)">Close</button>
           </div>
           ${err}
         </div>
@@ -200,6 +239,10 @@ async function recordStart(id) {
   await postJson(`/api/stations/${encodeURIComponent(id)}/record/start`, {capture_mode:'continuous', cameras:[]});
   await refreshAll();
 }
+async function connectStation(id) {
+  await postJson(`/api/stations/${encodeURIComponent(id)}/connect`, {});
+  await refreshAll();
+}
 async function recordStop(id) {
   await postJson(`/api/stations/${encodeURIComponent(id)}/record/stop`, {});
   await refreshAll();
@@ -210,9 +253,20 @@ async function teleopClaim(id) {
   await refreshAll();
 }
 async function teleopRelease(id) {
-  const lease_id = state.leases[id] || (state.status[id]?.teleop || {}).lease_id || '';
+  const lease_id = leaseFor(id);
   await postJson(`/api/stations/${encodeURIComponent(id)}/teleop/release`, {lease_id, outcome:'complete'});
   state.leases[id] = '';
+  await refreshAll();
+}
+function leaseFor(id) {
+  return state.leases[id] || (state.status[id]?.teleop || {}).lease?.lease_id || '';
+}
+async function nudge(id, joint, delta) {
+  await postJson(`/api/stations/${encodeURIComponent(id)}/nudge`, {joint, delta, lease_id:leaseFor(id)});
+  await refreshAll();
+}
+async function gripper(id, value) {
+  await postJson(`/api/stations/${encodeURIComponent(id)}/gripper`, {value, lease_id:leaseFor(id)});
   await refreshAll();
 }
 refreshAll();
@@ -255,6 +309,12 @@ th, td { border-bottom:1px solid #30363d; padding:6px; text-align:left; vertical
 th { color:#9aa4af; font-weight:600; }
 td input, td select, td textarea { width:100%; box-sizing:border-box; }
 td textarea { min-height:38px; }
+tr.selected { background:#13233a; outline:1px solid #2f81f7; }
+tr.active:not(.selected) { background:#1d2630; }
+.segment-meta { color:#9aa4af; font-size:12px; margin-top:4px; }
+.status.ok { color:#9ee493; }
+.status.warn { color:#ffd166; }
+.status.error { color:#ffb4b4; }
 .compact { width:74px; }
 .status { color:#9aa4af; min-height:20px; }
 .error { color:#ffb4b4; }
@@ -318,6 +378,8 @@ let recording = null;
 let frameIdx = 0;
 let playTimer = null;
 let segments = [];
+let selectedSegmentIdx = -1;
+let dirty = false;
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
@@ -348,6 +410,22 @@ function timestampFor(idx) {
   const fps = Math.max(1, Number(recording?.meta?.fps || 30));
   return idx / fps;
 }
+function currentTimeS() { return Number(timestampFor(frameIdx).toFixed(3)); }
+function segmentLabel(idx) { return idx >= 0 ? `segment ${idx + 1}` : 'no segment selected'; }
+function durationLabel(seg) {
+  if (!seg) return '-';
+  const duration = Number(seg.end_s || 0) - Number(seg.start_s || 0);
+  return `${Math.max(0, duration).toFixed(3)}s`;
+}
+function activeSegmentIndex() {
+  const t = currentTimeS();
+  return segments.findIndex(seg => Number(seg.start_s) <= t && t <= Number(seg.end_s));
+}
+function setStatus(message, cls = '') {
+  const el = document.getElementById('manifestStatus');
+  el.className = `status mono ${cls}`;
+  el.textContent = message;
+}
 function frameFor(camera, idx) {
   const frames = recording?.frames?.[camera] || [];
   if (!frames.length) return null;
@@ -377,6 +455,8 @@ async function loadRecording(name) {
   recording = await getJson(`/api/stations/${encodeURIComponent(station)}/recording?name=${encodeURIComponent(name)}`);
   frameIdx = 0;
   segments = (recording.manifest?.segments || []).map(seg => ({...seg}));
+  selectedSegmentIdx = segments.length ? 0 : -1;
+  dirty = false;
   const maxIdx = Math.max(0, Number(recording.length || 0) - 1);
   document.getElementById('frameSlider').max = maxIdx;
   document.getElementById('frameNumber').max = maxIdx;
@@ -419,76 +499,134 @@ function renderFrame(idx) {
     `<div>action ${escapeHtml(Array.isArray(sample.action) ? sample.action.map(v => Number(v).toFixed(2)).join(', ') : '-')}</div>`,
   ].join('');
   renderStats();
+  renderSegments();
 }
 function renderStats() {
   const meta = recording?.meta || {};
   const counts = recording?.counts || {};
   const cameraCounts = cameraList().map(cam => `${cam.name}:${counts[cam.name] || 0}`).join(' ');
+  const activeIdx = activeSegmentIndex();
+  const selected = segments[selectedSegmentIdx] || null;
   document.getElementById('stats').innerHTML = [
     `<div class="stat"><span>task</span><b title="${escapeHtml(meta.task || '')}">${escapeHtml(meta.task || '-')}</b></div>`,
     `<div class="stat"><span>kind</span><b>${escapeHtml(recording?.kind || '-')}</b></div>`,
     `<div class="stat"><span>samples</span><b>${counts.samples || 0}</b></div>`,
     `<div class="stat"><span>cameras</span><b title="${escapeHtml(cameraCounts)}">${escapeHtml(cameraCounts || '-')}</b></div>`,
     `<div class="stat"><span>fps</span><b>${Number(meta.fps || 0).toFixed(1)}</b></div>`,
+    `<div class="stat"><span>time</span><b>${currentTimeS().toFixed(3)}s</b></div>`,
+    `<div class="stat"><span>selected</span><b>${escapeHtml(selected ? `${segmentLabel(selectedSegmentIdx)} ${Number(selected.start_s || 0).toFixed(3)}-${Number(selected.end_s || 0).toFixed(3)} (${durationLabel(selected)})` : '-')}</b></div>`,
+    `<div class="stat"><span>active</span><b>${activeIdx >= 0 ? escapeHtml(segmentLabel(activeIdx)) : '-'}</b></div>`,
+    `<div class="stat"><span>manifest</span><b>${dirty ? 'unsaved changes' : `${segments.length} segment(s)`}</b></div>`,
   ].join('');
 }
 function renderSegments() {
+  const activeIdx = activeSegmentIndex();
   document.getElementById('segmentsBody').innerHTML = segments.map((seg, idx) => `
-    <tr>
-      <td><input class="compact" type="number" step="0.001" value="${Number(seg.start_s || 0)}" onchange="updateSegment(${idx}, 'start_s', this.value)"></td>
-      <td><input class="compact" type="number" step="0.001" value="${Number(seg.end_s || 0)}" onchange="updateSegment(${idx}, 'end_s', this.value)"></td>
-      <td><input value="${escapeHtml(seg.task || '')}" onchange="updateSegment(${idx}, 'task', this.value)"></td>
-      <td><select onchange="updateSegment(${idx}, 'outcome', this.value)">
+    <tr class="${idx === selectedSegmentIdx ? 'selected' : ''} ${idx === activeIdx ? 'active' : ''}" onclick="selectSegment(${idx})">
+      <td><input class="compact" type="number" step="0.001" value="${Number(seg.start_s || 0)}" oninput="updateSegment(${idx}, 'start_s', this.value)"></td>
+      <td><input class="compact" type="number" step="0.001" value="${Number(seg.end_s || 0)}" oninput="updateSegment(${idx}, 'end_s', this.value)"></td>
+      <td><input value="${escapeHtml(seg.task || '')}" oninput="updateSegment(${idx}, 'task', this.value)"></td>
+      <td><select oninput="updateSegment(${idx}, 'outcome', this.value)">
         <option value="success" ${seg.outcome === 'success' ? 'selected' : ''}>success</option>
         <option value="failure" ${seg.outcome === 'failure' ? 'selected' : ''}>failure</option>
       </select></td>
-      <td><select onchange="updateSegment(${idx}, 'type', this.value)">
+      <td><select oninput="updateSegment(${idx}, 'type', this.value)">
         <option value="teleop" ${seg.type !== 'intervention' ? 'selected' : ''}>teleop</option>
         <option value="intervention" ${seg.type === 'intervention' ? 'selected' : ''}>intervention</option>
       </select></td>
-      <td><textarea onchange="updateSegment(${idx}, 'notes', this.value)">${escapeHtml(seg.notes || '')}</textarea></td>
-      <td><button onclick="removeSegment(${idx})">Remove</button></td>
+      <td><textarea oninput="updateSegment(${idx}, 'notes', this.value)">${escapeHtml(seg.notes || '')}</textarea><div class="segment-meta mono">${durationLabel(seg)} ${idx === activeIdx ? 'active at current frame' : ''}</div></td>
+      <td><button onclick="event.stopPropagation(); removeSegment(${idx})">Remove</button></td>
     </tr>
   `).join('');
 }
+function selectSegment(idx) {
+  selectedSegmentIdx = idx;
+  setStatus(`selected ${segmentLabel(idx)}`, dirty ? 'warn' : '');
+  renderStats();
+  renderSegments();
+}
 function updateSegment(idx, key, value) {
   if (!segments[idx]) return;
+  selectedSegmentIdx = idx;
   segments[idx][key] = ['start_s', 'end_s'].includes(key) ? Number(value) : value;
+  dirty = true;
+  setStatus(`${segmentLabel(idx)} edited; save manifest when ready`, 'warn');
+  renderStats();
 }
 function addSegment() {
   const t = timestampFor(frameIdx);
   segments.push({start_s:Number(t.toFixed(3)), end_s:Number((t + 5).toFixed(3)), task:recording?.meta?.task || '', outcome:'success', type:'teleop', notes:''});
+  selectedSegmentIdx = segments.length - 1;
+  dirty = true;
+  setStatus(`added ${segmentLabel(selectedSegmentIdx)} at ${Number(t).toFixed(3)}s`, 'warn');
   renderSegments();
+  renderStats();
 }
-function removeSegment(idx) { segments.splice(idx, 1); renderSegments(); }
-function markStart() {
-  if (!segments.length) addSegment();
-  segments[segments.length - 1].start_s = Number(timestampFor(frameIdx).toFixed(3));
-  if (segments[segments.length - 1].end_s <= segments[segments.length - 1].start_s) {
-    segments[segments.length - 1].end_s = Number((segments[segments.length - 1].start_s + 1).toFixed(3));
-  }
+function removeSegment(idx) {
+  segments.splice(idx, 1);
+  selectedSegmentIdx = Math.min(selectedSegmentIdx, segments.length - 1);
+  if (!segments.length) selectedSegmentIdx = -1;
+  dirty = true;
+  setStatus(`removed segment ${idx + 1}; save manifest when ready`, 'warn');
   renderSegments();
+  renderStats();
+}
+function editableSegmentIndex() {
+  if (selectedSegmentIdx >= 0 && segments[selectedSegmentIdx]) return selectedSegmentIdx;
+  if (segments.length) {
+    selectedSegmentIdx = segments.length - 1;
+    return selectedSegmentIdx;
+  }
+  addSegment();
+  return selectedSegmentIdx;
+}
+function markStart() {
+  const idx = editableSegmentIndex();
+  const t = currentTimeS();
+  segments[idx].start_s = t;
+  if (Number(segments[idx].end_s) <= t) {
+    segments[idx].end_s = Number((t + 1).toFixed(3));
+  }
+  dirty = true;
+  setStatus(`${segmentLabel(idx)} start marked at ${t.toFixed(3)}s`, 'warn');
+  renderSegments();
+  renderStats();
 }
 function markEnd() {
-  if (!segments.length) addSegment();
-  segments[segments.length - 1].end_s = Number(timestampFor(frameIdx).toFixed(3));
+  const idx = editableSegmentIndex();
+  const t = currentTimeS();
+  segments[idx].end_s = t;
+  if (Number(segments[idx].end_s) <= Number(segments[idx].start_s)) {
+    segments[idx].start_s = Number(Math.max(0, t - 1).toFixed(3));
+  }
+  dirty = true;
+  setStatus(`${segmentLabel(idx)} end marked at ${t.toFixed(3)}s`, 'warn');
   renderSegments();
+  renderStats();
 }
 async function loadManifest() {
   const data = await getJson(`/api/stations/${encodeURIComponent(selectedStation())}/segments?source=${encodeURIComponent(selectedRecording())}`);
   segments = (data.segments || []).map(seg => ({...seg}));
-  document.getElementById('manifestStatus').textContent = `loaded ${segments.length} segment(s)`;
+  selectedSegmentIdx = segments.length ? 0 : -1;
+  dirty = false;
+  setStatus(`loaded ${segments.length} segment(s)`, 'ok');
   renderSegments();
+  renderStats();
 }
 async function saveManifest() {
   const data = await postJson(`/api/stations/${encodeURIComponent(selectedStation())}/segments/save`, {source:selectedRecording(), segments});
   segments = (data.segments || []).map(seg => ({...seg}));
-  document.getElementById('manifestStatus').textContent = `saved ${segments.length} segment(s)`;
+  selectedSegmentIdx = Math.min(selectedSegmentIdx, segments.length - 1);
+  if (!segments.length) selectedSegmentIdx = -1;
+  dirty = false;
+  setStatus(`saved ${segments.length} segment(s)`, 'ok');
   renderSegments();
+  renderStats();
 }
 async function exportSegments() {
   const data = await postJson(`/api/stations/${encodeURIComponent(selectedStation())}/segments/export`, {source:selectedRecording(), segments});
-  document.getElementById('manifestStatus').textContent = `created ${data.episode_count || 0} episode(s), ${data.total_frames || 0} frames`;
+  dirty = false;
+  setStatus(`created ${data.episode_count || 0} episode(s), ${data.total_frames || 0} frames`, 'ok');
   await loadRecordings();
 }
 function stepFrame(delta) { renderFrame(frameIdx + delta); }
@@ -1086,8 +1224,12 @@ def make_handler(stations_list: list[StationConfig]):
                     station = _station_by_id(stations, parts[2])
                     command = "/".join(parts[3:])
                     allowed = {
+                        "connect": "/api/connect",
+                        "disconnect": "/api/disconnect",
                         "record/start": "/api/record/start",
                         "record/stop": "/api/record/stop",
+                        "nudge": "/api/nudge",
+                        "gripper": "/api/gripper",
                         "segments/save": "/api/segments/save",
                         "segments/export": "/api/busyboard/extract",
                         "teleop/claim": "/api/teleop/claim",
