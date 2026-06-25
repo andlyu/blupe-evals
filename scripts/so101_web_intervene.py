@@ -697,6 +697,9 @@ class SO101Controller:
         self.teleop_lease: dict[str, Any] | None = None
         self.dataset_thread: threading.Thread | None = None
         self.dataset_status: dict[str, Any] = self._new_dataset_status()
+        self.hf_teleop_process: subprocess.Popen[str] | None = None
+        self.hf_teleop_thread: threading.Thread | None = None
+        self.hf_teleop_status: dict[str, Any] = self._new_hf_teleop_status()
 
     def log(self, msg: str) -> None:
         line = f"{time.strftime('%H:%M:%S')} {msg}"
@@ -762,6 +765,21 @@ class SO101Controller:
             "uploaded": False,
             "private": False,
             "returncode": None,
+            "output_tail": [],
+            "error": "",
+        }
+
+    def _new_hf_teleop_status(self) -> dict[str, Any]:
+        return {
+            "running": False,
+            "state": "idle",
+            "started_at": None,
+            "completed_at": None,
+            "duration_s": None,
+            "fps": None,
+            "pid": None,
+            "returncode": None,
+            "command": [],
             "output_tail": [],
             "error": "",
         }
@@ -1088,7 +1106,162 @@ class SO101Controller:
         self.stop_recording()
         if self.record_thread is not None:
             self.record_thread.join(timeout=3.0)
+        self.stop_hf_teleop()
         self.disconnect()
+
+    def _hf_teleop_running(self) -> bool:
+        proc = self.hf_teleop_process
+        return proc is not None and proc.poll() is None
+
+    def _lerobot_teleoperate_command(self, duration_s: float, fps: int) -> list[str]:
+        teleop_bin = Path(sys.executable).with_name("lerobot-teleoperate")
+        executable = str(teleop_bin if teleop_bin.exists() else "lerobot-teleoperate")
+        return [
+            executable,
+            "--robot.type",
+            "so101_follower",
+            "--robot.port",
+            self.port,
+            "--robot.id",
+            self.robot_id,
+            "--teleop.type",
+            "so101_leader",
+            "--teleop.port",
+            self.leader_port,
+            "--teleop.id",
+            self.leader_id,
+            "--fps",
+            str(int(fps)),
+            "--teleop_time_s",
+            str(float(duration_s)),
+            "--display_data",
+            "false",
+        ]
+
+    def start_hf_teleop(self, duration_s: float = 10.0, fps: int = 30) -> dict[str, Any]:
+        if duration_s <= 0:
+            raise ValueError("teleop duration must be positive")
+        if fps <= 0:
+            raise ValueError("teleop fps must be positive")
+        if self._hf_teleop_running():
+            raise RuntimeError("HF teleop is already running")
+        if self._recording_running():
+            raise RuntimeError("stop station recording before starting HF teleop")
+        if self._eval_running():
+            raise RuntimeError("stop eval before starting HF teleop")
+        if self._motion_running():
+            self.stop_policy()
+            if self.policy_thread is not None:
+                self.policy_thread.join(timeout=3.0)
+
+        self.disconnect()
+        command = self._lerobot_teleoperate_command(duration_s=duration_s, fps=fps)
+        started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        output: deque[str] = deque(maxlen=80)
+        try:
+            proc = subprocess.Popen(
+                command,
+                cwd=str(REPO_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except BaseException as exc:
+            with self.status_lock:
+                self.hf_teleop_status = self._new_hf_teleop_status()
+                self.hf_teleop_status.update({"state": "failed", "error": str(exc), "command": command})
+            raise
+
+        with self.status_lock:
+            self.hf_teleop_process = proc
+            self.hf_teleop_status = self._new_hf_teleop_status()
+            self.hf_teleop_status.update(
+                {
+                    "running": True,
+                    "state": "running",
+                    "started_at": started_at,
+                    "duration_s": float(duration_s),
+                    "fps": int(fps),
+                    "pid": proc.pid,
+                    "command": command,
+                }
+            )
+
+        def runner() -> None:
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    output.append(line)
+                    with self.status_lock:
+                        self.hf_teleop_status["output_tail"] = list(output)
+                returncode = proc.wait()
+                state = "completed" if returncode == 0 else "failed"
+                with self.status_lock:
+                    self.hf_teleop_status.update(
+                        {
+                            "running": False,
+                            "state": state,
+                            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                            "returncode": returncode,
+                            "output_tail": list(output),
+                            "error": "" if returncode == 0 else f"lerobot-teleoperate exited {returncode}",
+                        }
+                    )
+                self.log(f"HF teleop {state} returncode={returncode}")
+            except BaseException as exc:
+                with self.status_lock:
+                    self.hf_teleop_status.update(
+                        {
+                            "running": False,
+                            "state": "failed",
+                            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                            "error": str(exc),
+                            "output_tail": list(output),
+                        }
+                    )
+                self.log(f"HF teleop error: {exc}")
+
+        self.hf_teleop_thread = threading.Thread(target=runner, daemon=True)
+        self.hf_teleop_thread.start()
+        self.log(f"HF teleop start duration={duration_s}s fps={fps} pid={proc.pid}")
+        return self.hf_teleop_snapshot()
+
+    def stop_hf_teleop(self) -> dict[str, Any]:
+        proc = self.hf_teleop_process
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
+        if self.hf_teleop_thread is not None:
+            self.hf_teleop_thread.join(timeout=1.0)
+        with self.status_lock:
+            if self.hf_teleop_status.get("running"):
+                self.hf_teleop_status.update(
+                    {
+                        "running": False,
+                        "state": "stopped",
+                        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "returncode": None if proc is None else proc.poll(),
+                    }
+                )
+        return self.hf_teleop_snapshot()
+
+    def hf_teleop_snapshot(self) -> dict[str, Any]:
+        with self.status_lock:
+            data = dict(self.hf_teleop_status)
+        proc = self.hf_teleop_process
+        data["running"] = bool(proc is not None and proc.poll() is None)
+        if not data["running"] and data.get("state") == "running":
+            data["state"] = "completed" if proc is not None and proc.poll() == 0 else "failed"
+            data["returncode"] = None if proc is None else proc.poll()
+        return data
 
     def read_state(self, retries: int = 4) -> np.ndarray:
         last: BaseException | None = None
@@ -1248,6 +1421,10 @@ class SO101Controller:
                 },
                 "eval": self._eval_snapshot_locked(),
                 "dataset": self._dataset_snapshot_locked(),
+                "hf_teleop": {
+                    **dict(self.hf_teleop_status),
+                    "running": self._hf_teleop_running(),
+                },
                 "teleop": self._teleop_snapshot_locked(),
                 "logs": logs,
             }
@@ -4824,6 +5001,15 @@ def make_handler(controller: SO101Controller):
                         outcome=str(data.get("outcome", "complete")),
                     )
                     _json_response(self, 200, {"ok": True, "teleop": status})
+                elif parsed.path == "/api/hf_teleop/start":
+                    status = controller.start_hf_teleop(
+                        duration_s=float(data.get("duration_s", 10.0)),
+                        fps=int(data.get("fps", 30)),
+                    )
+                    _json_response(self, 200, {"ok": True, "hf_teleop": status})
+                elif parsed.path == "/api/hf_teleop/stop":
+                    status = controller.stop_hf_teleop()
+                    _json_response(self, 200, {"ok": True, "hf_teleop": status})
                 elif parsed.path == "/api/start":
                     controller.start_policy(
                         instruction=str(data.get("instruction", DEFAULT_INSTRUCTION)),

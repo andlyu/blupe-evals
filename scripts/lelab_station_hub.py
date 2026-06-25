@@ -133,6 +133,11 @@ function evalText(id) {
   if (e.running) return `${e.state || 'running'} attempt ${e.attempt || 0}`;
   return e.state || '-';
 }
+function hfTeleopText(id) {
+  const t = (state.status[id] || {}).hf_teleop || {};
+  if (t.running) return `${t.state || 'running'} ${t.pid || ''}`;
+  return t.state || '-';
+}
 function jointRows(id) {
   const status = state.status[id] || {};
   const robots = Array.isArray(status.robots) ? status.robots : [];
@@ -180,6 +185,7 @@ function render() {
             <div class="stat"><span>recording</span><b>${escapeHtml(recordingText(station.id))}</b></div>
             <div class="stat"><span>teleop</span><b>${escapeHtml(teleopText(station.id))}</b></div>
             <div class="stat"><span>eval</span><b>${escapeHtml(evalText(station.id))}</b></div>
+            <div class="stat"><span>HF teleop</span><b>${escapeHtml(hfTeleopText(station.id))}</b></div>
             <div class="stat"><span>base</span><b title="${escapeHtml(station.base_url)}">${escapeHtml(station.base_url || '-')}</b></div>
           </div>
           <div class="row">${robotSummary(station.id)}</div>
@@ -195,6 +201,8 @@ function render() {
             <button onclick="recordStop(${stationArg})">Stop Record</button>
             <button onclick="teleopClaim(${stationArg})">Claim Teleop</button>
             <button onclick="teleopRelease(${stationArg})">Release</button>
+            <button onclick="hfTeleopStart(${stationArg})">HF Teleop 10s</button>
+            <button onclick="hfTeleopStop(${stationArg})">Stop HF Teleop</button>
             <button onclick="location.href='/dataset?station=${encodeURIComponent(station.id)}'">Edit Dataset</button>
           </div>
           <div class="row">
@@ -258,6 +266,14 @@ async function teleopRelease(id) {
   state.leases[id] = '';
   await refreshAll();
 }
+async function hfTeleopStart(id) {
+  await postJson(`/api/stations/${encodeURIComponent(id)}/hf_teleop/start`, {duration_s:10, fps:30});
+  await refreshAll();
+}
+async function hfTeleopStop(id) {
+  await postJson(`/api/stations/${encodeURIComponent(id)}/hf_teleop/stop`, {});
+  await refreshAll();
+}
 function leaseFor(id) {
   return state.leases[id] || (state.status[id]?.teleop || {}).lease?.lease_id || '';
 }
@@ -312,6 +328,13 @@ td textarea { min-height:38px; }
 tr.selected { background:#13233a; outline:1px solid #2f81f7; }
 tr.active:not(.selected) { background:#1d2630; }
 .segment-meta { color:#9aa4af; font-size:12px; margin-top:4px; }
+.timeline { position:relative; flex:1 1 360px; min-width:180px; height:18px; border:1px solid #30363d; border-radius:5px; background:#0f1215; overflow:hidden; }
+.timeline-empty { color:#9aa4af; font-size:12px; line-height:18px; padding-left:7px; }
+.timeline-segment { position:absolute; top:3px; height:10px; min-width:3px; border-radius:3px; background:#2f81f7; opacity:.72; cursor:pointer; }
+.timeline-segment.selected { background:#9ee493; opacity:1; }
+.timeline-segment.active { outline:1px solid #ffd166; }
+.timeline-cursor { position:absolute; top:0; bottom:0; width:2px; background:#ffdf7e; pointer-events:none; }
+.recording-nav { min-width:34px; }
 .status.ok { color:#9ee493; }
 .status.warn { color:#ffd166; }
 .status.error { color:#ffb4b4; }
@@ -336,6 +359,8 @@ tr.active:not(.selected) { background:#1d2630; }
     <div class="row">
       <label>Station <select id="stationSelect"></select></label>
       <label>Recording <select id="recordingSelect"></select></label>
+      <button class="recording-nav" title="Previous recording" onclick="stepRecording(-1)">Prev Episode</button>
+      <button class="recording-nav" title="Next recording" onclick="stepRecording(1)">Next Episode</button>
       <button onclick="loadRecordings()">Refresh</button>
       <button onclick="stepFrame(-1)">Prev</button>
       <button id="playButton" class="primary" onclick="togglePlay()">Play</button>
@@ -344,6 +369,7 @@ tr.active:not(.selected) { background:#1d2630; }
       <button onclick="markEnd()">Mark End</button>
       <label>Frame <input id="frameNumber" type="number" min="0" value="0" style="width:84px"></label>
       <input id="frameSlider" type="range" min="0" max="0" value="0">
+      <div class="timeline" id="segmentTimeline"></div>
     </div>
   </section>
   <section class="stats mono" id="stats"></section>
@@ -431,6 +457,20 @@ function frameFor(camera, idx) {
   if (!frames.length) return null;
   return frames[Math.max(0, Math.min(idx, frames.length - 1))];
 }
+function frameIndexForTime(t) {
+  const samples = recording?.samples || [];
+  if (!samples.length) return 0;
+  let best = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < samples.length; i++) {
+    const dist = Math.abs(Number(samples[i].timestamp_s ?? 0) - t);
+    if (dist < bestDist) {
+      best = i;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
 async function loadStations() {
   const data = await getJson('/api/stations');
   stations = data.stations || [];
@@ -450,6 +490,14 @@ async function loadRecordings() {
   if (selected && recordings.some(ep => ep.name === selected)) select.value = selected;
   if (select.value) await loadRecording(select.value);
 }
+async function stepRecording(delta) {
+  const select = document.getElementById('recordingSelect');
+  if (!select.options.length) return;
+  const next = Math.max(0, Math.min(select.selectedIndex + delta, select.options.length - 1));
+  if (next === select.selectedIndex) return;
+  select.selectedIndex = next;
+  await loadRecording(select.value);
+}
 async function loadRecording(name) {
   const station = selectedStation();
   recording = await getJson(`/api/stations/${encodeURIComponent(station)}/recording?name=${encodeURIComponent(name)}`);
@@ -463,6 +511,7 @@ async function loadRecording(name) {
   renderCameras();
   renderSegments();
   renderFrame(0);
+  setStatus(`loaded ${recording.name}`, segments.length ? '' : 'warn');
 }
 function renderCameras() {
   document.getElementById('cams').innerHTML = cameraList().map(cam => `
@@ -500,6 +549,7 @@ function renderFrame(idx) {
   ].join('');
   renderStats();
   renderSegments();
+  renderTimeline();
 }
 function renderStats() {
   const meta = recording?.meta || {};
@@ -538,12 +588,41 @@ function renderSegments() {
       <td><button onclick="event.stopPropagation(); removeSegment(${idx})">Remove</button></td>
     </tr>
   `).join('');
+  renderTimeline();
 }
 function selectSegment(idx) {
   selectedSegmentIdx = idx;
   setStatus(`selected ${segmentLabel(idx)}`, dirty ? 'warn' : '');
   renderStats();
   renderSegments();
+}
+function jumpToSegment(idx, edge = 'start') {
+  if (!segments[idx]) return;
+  selectedSegmentIdx = idx;
+  const t = Number(edge === 'end' ? segments[idx].end_s : segments[idx].start_s);
+  renderFrame(frameIndexForTime(t));
+  setStatus(`jumped to ${segmentLabel(idx)} ${edge}`, dirty ? 'warn' : '');
+}
+function renderTimeline() {
+  const el = document.getElementById('segmentTimeline');
+  if (!el || !recording) return;
+  const total = Math.max(0.001, Number(recording?.meta?.duration_s || 0) || timestampFor(Math.max(0, Number(recording.length || 1) - 1)) || 1);
+  const activeIdx = activeSegmentIndex();
+  const spans = segments.map((seg, idx) => {
+    const start = Math.max(0, Math.min(100, Number(seg.start_s || 0) / total * 100));
+    const end = Math.max(start, Math.min(100, Number(seg.end_s || 0) / total * 100));
+    const width = Math.max(0.5, end - start);
+    const cls = [
+      'timeline-segment',
+      idx === selectedSegmentIdx ? 'selected' : '',
+      idx === activeIdx ? 'active' : '',
+    ].filter(Boolean).join(' ');
+    const title = `${segmentLabel(idx)} ${Number(seg.start_s || 0).toFixed(3)}-${Number(seg.end_s || 0).toFixed(3)}s`;
+    return `<div class="${cls}" title="${escapeHtml(title)}" style="left:${start}%;width:${width}%" onclick="jumpToSegment(${idx}, 'start')"></div>`;
+  }).join('');
+  const cursor = Math.max(0, Math.min(100, currentTimeS() / total * 100));
+  el.innerHTML = spans || '<div class="timeline-empty">no segments marked</div>';
+  el.innerHTML += `<div class="timeline-cursor" style="left:${cursor}%"></div>`;
 }
 function updateSegment(idx, key, value) {
   if (!segments[idx]) return;
@@ -552,6 +631,7 @@ function updateSegment(idx, key, value) {
   dirty = true;
   setStatus(`${segmentLabel(idx)} edited; save manifest when ready`, 'warn');
   renderStats();
+  renderTimeline();
 }
 function addSegment() {
   const t = timestampFor(frameIdx);
@@ -561,6 +641,7 @@ function addSegment() {
   setStatus(`added ${segmentLabel(selectedSegmentIdx)} at ${Number(t).toFixed(3)}s`, 'warn');
   renderSegments();
   renderStats();
+  renderTimeline();
 }
 function removeSegment(idx) {
   segments.splice(idx, 1);
@@ -570,6 +651,7 @@ function removeSegment(idx) {
   setStatus(`removed segment ${idx + 1}; save manifest when ready`, 'warn');
   renderSegments();
   renderStats();
+  renderTimeline();
 }
 function editableSegmentIndex() {
   if (selectedSegmentIdx >= 0 && segments[selectedSegmentIdx]) return selectedSegmentIdx;
@@ -591,6 +673,7 @@ function markStart() {
   setStatus(`${segmentLabel(idx)} start marked at ${t.toFixed(3)}s`, 'warn');
   renderSegments();
   renderStats();
+  renderTimeline();
 }
 function markEnd() {
   const idx = editableSegmentIndex();
@@ -603,6 +686,7 @@ function markEnd() {
   setStatus(`${segmentLabel(idx)} end marked at ${t.toFixed(3)}s`, 'warn');
   renderSegments();
   renderStats();
+  renderTimeline();
 }
 async function loadManifest() {
   const data = await getJson(`/api/stations/${encodeURIComponent(selectedStation())}/segments?source=${encodeURIComponent(selectedRecording())}`);
@@ -612,6 +696,7 @@ async function loadManifest() {
   setStatus(`loaded ${segments.length} segment(s)`, 'ok');
   renderSegments();
   renderStats();
+  renderTimeline();
 }
 async function saveManifest() {
   const data = await postJson(`/api/stations/${encodeURIComponent(selectedStation())}/segments/save`, {source:selectedRecording(), segments});
@@ -759,8 +844,8 @@ td input { width:100%; box-sizing:border-box; }
       <label><input id="privateDataset" type="checkbox"> private</label>
     </div>
     <div class="row">
-      <button class="primary" onclick="startRecording()">Start Recording</button>
-      <button class="danger" onclick="stopRecording()">Stop</button>
+      <button id="startRecordingButton" class="primary" onclick="startRecording()">Start Recording</button>
+      <button id="stopRecordingButton" class="danger" onclick="stopRecording()">Stop</button>
       <button onclick="loadPreset()">Refresh Station</button>
     </div>
     <div id="formStatus" class="status mono"></div>
@@ -796,6 +881,8 @@ td input { width:100%; box-sizing:border-box; }
 let stations = [];
 let preset = null;
 let cameras = [];
+let recordingBusy = false;
+let recordingRunning = false;
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
@@ -821,6 +908,31 @@ function setStatus(text, cls = '') {
   const el = document.getElementById('formStatus');
   el.className = `status mono ${cls}`;
   el.textContent = text;
+}
+function setRecordingControls() {
+  document.getElementById('startRecordingButton').disabled = recordingBusy || recordingRunning;
+  document.getElementById('stopRecordingButton').disabled = recordingBusy && !recordingRunning;
+}
+function recordingSummary(recording) {
+  if (!recording) return 'recording status unavailable';
+  const counts = recording.counts || {};
+  const countText = Object.entries(counts).map(([key, value]) => `${key}:${value}`).join(' ');
+  const elapsed = recording.elapsed == null ? '-' : `${Number(recording.elapsed).toFixed(1)}s`;
+  const state = recording.running ? 'recording' : 'stopped';
+  return `${state} elapsed=${elapsed} ${countText}`.trim();
+}
+async function refreshRecordingStatus() {
+  const station = selectedStation();
+  if (!station) return;
+  try {
+    const status = await getJson(`/api/stations/${encodeURIComponent(station)}/status`);
+    const recording = status.recording || {};
+    recordingRunning = !!recording.running;
+    if (recordingRunning) setStatus(recordingSummary(recording), 'ok');
+    setRecordingControls();
+  } catch (err) {
+    setStatus(err.message, 'error');
+  }
 }
 async function loadStations() {
   const data = await getJson('/api/stations');
@@ -941,24 +1053,48 @@ function renderPayload() {
   document.getElementById('payloadPreview').textContent = JSON.stringify(payload(), null, 2);
 }
 async function startRecording() {
+  if (recordingBusy || recordingRunning) return;
   const body = payload();
   const station = selectedStation();
+  recordingBusy = true;
+  setRecordingControls();
   setStatus('starting recording...');
-  const result = await postJson(`/api/stations/${encodeURIComponent(station)}/record/start`, {
-    duration_s: body.duration_s,
-    fps: body.fps,
-    cameras: body.cameras,
-    task: body.single_task,
-    name_prefix: body.name_prefix,
-    capture_mode: body.capture_mode,
-    extra_meta: body,
-  });
-  setStatus(`recording started on station: ${result.dir || ''}`, 'ok');
+  try {
+    const result = await postJson(`/api/stations/${encodeURIComponent(station)}/record/start`, {
+      duration_s: body.duration_s,
+      fps: body.fps,
+      cameras: body.cameras,
+      task: body.single_task,
+      name_prefix: body.name_prefix,
+      capture_mode: body.capture_mode,
+      extra_meta: body,
+    });
+    recordingRunning = true;
+    setStatus(`recording started on station: ${result.dir || ''}`, 'ok');
+    await refreshRecordingStatus();
+  } catch (err) {
+    setStatus(err.message, 'error');
+  } finally {
+    recordingBusy = false;
+    setRecordingControls();
+  }
 }
 async function stopRecording() {
+  if (recordingBusy) return;
   const station = selectedStation();
-  await postJson(`/api/stations/${encodeURIComponent(station)}/record/stop`, {});
-  setStatus('recording stop requested', 'ok');
+  recordingBusy = true;
+  setRecordingControls();
+  try {
+    await postJson(`/api/stations/${encodeURIComponent(station)}/record/stop`, {});
+    recordingRunning = false;
+    setStatus('recording stop requested', 'ok');
+    await refreshRecordingStatus();
+  } catch (err) {
+    setStatus(err.message, 'error');
+  } finally {
+    recordingBusy = false;
+    setRecordingControls();
+  }
 }
 async function copyPayload() {
   await navigator.clipboard.writeText(JSON.stringify(payload(), null, 2));
@@ -975,6 +1111,7 @@ for (const id of ['datasetRepoId', 'task', 'numEpisodes', 'episodeTimeS', 'reset
 document.getElementById('stationSelect').addEventListener('change', loadPreset);
 document.getElementById('robotProfileSelect').addEventListener('change', () => { renderRobots(); renderPayload(); });
 loadStations().catch(err => setStatus(err.message, 'error'));
+setInterval(refreshRecordingStatus, 1000);
 </script>
 </body>
 </html>
@@ -1235,6 +1372,8 @@ def make_handler(stations_list: list[StationConfig]):
                         "teleop/claim": "/api/teleop/claim",
                         "teleop/heartbeat": "/api/teleop/heartbeat",
                         "teleop/release": "/api/teleop/release",
+                        "hf_teleop/start": "/api/hf_teleop/start",
+                        "hf_teleop/stop": "/api/hf_teleop/stop",
                         "eval/start": "/api/eval/start",
                         "eval/stop": "/api/eval/stop",
                         "eval/resume": "/api/eval/resume",
