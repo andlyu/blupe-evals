@@ -31,13 +31,16 @@ import requests
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
+from blupe_evals.station import CameraConfig, HttpPolicyClient, default_camera_configs, parse_camera_config_specs
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
-from molmoact2 import adapter
-from molmoact2.client import MolmoActClient, Observation
 
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
-CAM_URLS = ["http://127.0.0.1:8080/cam0.mjpg", "http://127.0.0.1:8080/cam1.mjpg"]
+SEMANTIC_CAMERA_NAMES = ("front", "side", "wrist")
+POLICY_CAMERA_NAMES = ("front", "side")
 DEFAULT_INSTRUCTION = "Move to blue ball, grab it, and place it in the cardboard cylinder"
 DEFAULT_DURATION_S = 300.0
 DEFAULT_EXEC_STEPS = 30
@@ -45,6 +48,7 @@ DEFAULT_MAX_STEP_DEG = 90.0
 DEFAULT_HZ = 30.0
 MOLMO_TIMEOUT_S = 75.0
 RECORD_ROOT = REPO_ROOT / "episodes"
+RAW_RECORD_ROOT = REPO_ROOT / "recordings"
 DEFAULT_RECORD_DURATION_S = 120.0
 DEFAULT_RECORD_FPS = 30.0
 DEFAULT_EVAL_RUN_DURATION_S = 3600.0
@@ -94,6 +98,9 @@ DEFAULT_CUP_POLYGON = np.array(
     ],
     dtype=np.int32,
 )
+
+
+DEFAULT_CAMERA_CONFIGS = default_camera_configs(SEMANTIC_CAMERA_NAMES)
 
 
 def _fmt(values: np.ndarray) -> str:
@@ -620,12 +627,16 @@ class SO101Controller:
         port: str,
         robot_id: str,
         molmo_url: str,
+        camera_configs: list[CameraConfig] | None = None,
         success_enabled: bool = True,
         success_fps: float = DEFAULT_SUCCESS_FPS,
     ):
         self.port = port
         self.robot_id = robot_id
         self.molmo_url = molmo_url
+        self.camera_configs = list(camera_configs or DEFAULT_CAMERA_CONFIGS)
+        self.cameras_by_name = {cam.name: cam for cam in self.camera_configs}
+        self.cameras_by_id = {cam.id: cam for cam in self.camera_configs}
         self.success_enabled = success_enabled
         self.success_fps = success_fps
         self.robot: SO101Follower | None = None
@@ -651,14 +662,14 @@ class SO101Controller:
         self.chunks = 0
         self.logs: deque[str] = deque(maxlen=200)
         self.home_pose = load_home_pose()
-        self.client = MolmoActClient(molmo_url, conv=adapter.LEROBOT_V21_COMPAT_DEG, timeout_s=MOLMO_TIMEOUT_S)
+        self.policy_client = HttpPolicyClient(molmo_url, timeout_s=MOLMO_TIMEOUT_S)
         self.record_stop_event = threading.Event()
         self.record_thread: threading.Thread | None = None
         self.record_started_at: float | None = None
         self.record_duration_s: float | None = None
         self.record_fps: float | None = None
         self.record_dir: Path | None = None
-        self.record_cameras: list[int] = []
+        self.record_cameras: list[str] = []
         self.record_counts: dict[str, int] = {}
         self.record_error = ""
         self.record_capture_mode = "policy_execute"
@@ -1092,7 +1103,7 @@ class SO101Controller:
         raise last
 
     def health(self) -> dict[str, Any]:
-        return self.client.health()
+        return self.policy_client.health()
 
     def status(self, log_limit: int = DEFAULT_STATUS_LOG_LIMIT) -> dict[str, Any]:
         log_limit = max(0, min(MAX_STATUS_LOG_LIMIT, int(log_limit)))
@@ -1120,10 +1131,16 @@ class SO101Controller:
                 "log_path": "/tmp/so101_web_intervene.log",
                 "running": self.policy_thread is not None and self.policy_thread.is_alive(),
                 "elapsed": None if self.started_at is None else round(time.monotonic() - self.started_at, 1),
+                "cameras": [self._camera_metadata(cam) for cam in self.camera_configs],
                 "recording": {
                     "running": record_running,
                     "dir": None if self.record_dir is None else str(self.record_dir),
                     "cameras": list(self.record_cameras),
+                    "camera_configs": [
+                        self._camera_metadata(self.cameras_by_name[name])
+                        for name in self.record_cameras
+                        if name in self.cameras_by_name
+                    ],
                     "counts": dict(self.record_counts),
                     "fps": self.record_fps,
                     "duration_s": self.record_duration_s,
@@ -1191,16 +1208,15 @@ class SO101Controller:
         )
         return dict(status)
 
-    def preview_success_sam3(self, prompt: str, min_score: float, camera: int = 0) -> dict[str, Any]:
+    def preview_success_sam3(self, prompt: str, min_score: float, camera: Any = "front") -> dict[str, Any]:
         prompt = prompt.strip()
         if not prompt:
             raise ValueError("SAM3 prompt cannot be empty")
         if min_score < 0.0 or min_score > 1.0:
             raise ValueError("SAM3 confidence must be between 0 and 1")
-        if camera < 0 or camera >= len(CAM_URLS):
-            raise ValueError(f"camera must be 0..{len(CAM_URLS) - 1}")
+        cam = self._camera_from_spec(camera)
 
-        rgb = read_mjpeg_frame(CAM_URLS[camera], timeout_s=5.0)
+        rgb = read_mjpeg_frame(cam.url, timeout_s=5.0)
         ok, encoded = cv2.imencode(
             ".jpg",
             cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
@@ -1234,7 +1250,7 @@ class SO101Controller:
             "status": status,
             "prompt": prompt,
             "min_score": float(min_score),
-            "camera": camera,
+            "camera": cam.name,
             "elapsed_s": round(time.monotonic() - start, 3),
             "overlay": data.get("overlay"),
             "top_mask": top_public,
@@ -1290,8 +1306,9 @@ class SO101Controller:
         period = 1.0 / self.success_fps if self.success_fps > 0 else 0.0
         next_process_t = 0.0
         buf = bytearray()
+        success_cam = self.camera_configs[0]
         try:
-            with urllib.request.urlopen(CAM_URLS[0], timeout=5) as resp:
+            with urllib.request.urlopen(success_cam.url, timeout=5) as resp:
                 while not self.success_stop_event.is_set():
                     chunk = resp.read(65536)
                     if not chunk:
@@ -1343,6 +1360,56 @@ class SO101Controller:
                 return True
             return self.mode == "policy" and self.stage == "execute"
 
+    def _camera_metadata(self, cam: CameraConfig) -> dict[str, Any]:
+        return {
+            "id": int(cam.id),
+            "name": cam.name,
+            "url": cam.url,
+            "frames_dir": cam.name,
+            "frames_file": f"{cam.name}/frames.jsonl",
+            "lerobot_key": cam.lerobot_key,
+        }
+
+    def _camera_from_spec(self, spec: Any) -> CameraConfig:
+        if isinstance(spec, str):
+            value = spec.strip()
+            if value in self.cameras_by_name:
+                return self.cameras_by_name[value]
+            if value.startswith("cam") and value[3:].isdigit():
+                cam_id = int(value[3:])
+                if cam_id in self.cameras_by_id:
+                    return self.cameras_by_id[cam_id]
+            if value.isdigit():
+                cam_id = int(value)
+                if cam_id in self.cameras_by_id:
+                    return self.cameras_by_id[cam_id]
+        else:
+            try:
+                cam_id = int(spec)
+            except (TypeError, ValueError):
+                cam_id = -1
+            if cam_id in self.cameras_by_id:
+                return self.cameras_by_id[cam_id]
+        valid = [cam.name for cam in self.camera_configs]
+        raise ValueError(f"invalid camera {spec!r}; valid cameras: {valid}")
+
+    def _normalize_cameras(self, cameras: list[Any] | None, *, default_all: bool = True) -> list[CameraConfig]:
+        raw = list(cameras or [])
+        selected = self.camera_configs if default_all and not raw else [self._camera_from_spec(item) for item in raw]
+        deduped: list[CameraConfig] = []
+        seen: set[str] = set()
+        for cam in selected:
+            if cam.name not in seen:
+                deduped.append(cam)
+                seen.add(cam.name)
+        if not deduped:
+            raise ValueError("at least one camera is required")
+        return deduped
+
+    def _policy_cameras(self) -> list[CameraConfig]:
+        selected = [self.cameras_by_name[name] for name in POLICY_CAMERA_NAMES if name in self.cameras_by_name]
+        return selected or self.camera_configs[:2]
+
     def _wait_motion_done(self, timeout_s: float) -> bool:
         deadline = time.monotonic() + max(0.0, timeout_s)
         while self._motion_running() and time.monotonic() < deadline:
@@ -1355,7 +1422,7 @@ class SO101Controller:
         self,
         duration_s: float,
         fps: float,
-        cameras: list[int],
+        cameras: list[Any],
         task: str = DEFAULT_INSTRUCTION,
         name_prefix: str = "so101_recording",
         extra_meta: dict[str, Any] | None = None,
@@ -1367,36 +1434,40 @@ class SO101Controller:
             raise ValueError("recording duration must be positive")
         if fps <= 0:
             raise ValueError("recording fps must be positive")
-        cameras = sorted({int(cam) for cam in cameras})
-        if not cameras:
-            cameras = [0, 1]
-        invalid = [cam for cam in cameras if cam < 0 or cam >= len(CAM_URLS)]
-        if invalid:
-            raise ValueError(f"invalid camera ids: {invalid}")
         capture_mode = capture_mode.strip().lower()
         if capture_mode in {"policy_execute_stage_only", "policy"}:
             capture_mode = "policy_execute"
         if capture_mode not in {"policy_execute", "continuous"}:
             raise ValueError("recording capture_mode must be policy_execute or continuous")
+        camera_configs = self._normalize_cameras(cameras, default_all=True)
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         safe_prefix = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name_prefix).strip("_")
         if not safe_prefix:
             safe_prefix = "so101_recording"
-        out_dir = RECORD_ROOT / f"{safe_prefix}_{timestamp}"
+        out_root = RAW_RECORD_ROOT if capture_mode == "continuous" else RECORD_ROOT
+        if capture_mode == "continuous" and not safe_prefix.startswith("session"):
+            safe_prefix = "session"
+        out_dir = out_root / f"{safe_prefix}_{timestamp}"
         if out_dir.exists():
-            out_dir = RECORD_ROOT / f"{safe_prefix}_{timestamp}_{uuid.uuid4().hex[:8]}"
+            out_dir = out_root / f"{safe_prefix}_{timestamp}_{uuid.uuid4().hex[:8]}"
         out_dir.mkdir(parents=True, exist_ok=True)
         record_start_mono = time.monotonic()
         task = task.strip() or DEFAULT_INSTRUCTION
         if capture_mode == "continuous":
             trajectory_time_source = "continuous_recording"
             notes = "Frames and samples are written continuously for manual/teleop demonstrations."
+            sample_file = "samples.jsonl"
+            meta_file = "session_meta.json"
+            format_name = "blupe_so101_recording_session"
         else:
             trajectory_time_source = "policy_execute_stage_only"
             notes = "Frames and samples are only written while policy stage is execute; inference/capture waits are excluded."
-        episode_meta = {
-            "format": "blupe_so101_episode",
+            sample_file = "lerobot_samples.jsonl"
+            meta_file = "episode_meta.json"
+            format_name = "blupe_so101_episode"
+        recording_meta = {
+            "format": format_name,
             "format_version": 1,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "task": task,
@@ -1409,46 +1480,38 @@ class SO101Controller:
             "capture_mode": capture_mode,
             "trajectory_time_source": trajectory_time_source,
             "notes": notes,
-            "sample_file": "lerobot_samples.jsonl",
-            "cameras": [
-                {
-                    "id": int(cam),
-                    "name": f"cam{cam}",
-                    "url": CAM_URLS[cam],
-                    "frames_dir": f"cam{cam}",
-                    "frames_file": f"cam{cam}/frames.jsonl",
-                    "lerobot_key": f"observation.images.cam{cam}",
-                }
-                for cam in cameras
-            ],
+            "sample_file": sample_file,
+            "samples_file": sample_file,
+            "cameras": [self._camera_metadata(cam) for cam in camera_configs],
         }
         if extra_meta:
-            episode_meta.update(dict(extra_meta))
-        (out_dir / "episode_meta.json").write_text(json.dumps(episode_meta, indent=2) + "\n")
+            recording_meta.update(dict(extra_meta))
+        (out_dir / meta_file).write_text(json.dumps(recording_meta, indent=2) + "\n")
 
         self.record_stop_event.clear()
+        camera_names = [cam.name for cam in camera_configs]
         with self.status_lock:
             self.record_started_at = record_start_mono
             self.record_duration_s = float(duration_s)
             self.record_fps = float(fps)
             self.record_dir = out_dir
-            self.record_cameras = cameras
-            self.record_counts = {f"cam{cam}": 0 for cam in cameras}
+            self.record_cameras = camera_names
+            self.record_counts = {name: 0 for name in camera_names}
             self.record_counts["samples"] = 0
             self.record_error = ""
             self.record_capture_mode = capture_mode
 
         self.record_thread = threading.Thread(
             target=self._record_loop,
-            args=(out_dir, duration_s, fps, cameras, record_start_mono),
+            args=(out_dir, duration_s, fps, camera_configs, record_start_mono, sample_file),
             daemon=True,
         )
         self.record_thread.start()
         self.log(
-            f"recording start duration={duration_s}s fps={fps} cameras={cameras} "
+            f"recording start duration={duration_s}s fps={fps} cameras={camera_names} "
             f"capture_mode={capture_mode} task={task!r} out={out_dir}"
         )
-        return {"dir": str(out_dir), "cameras": cameras, "capture_mode": capture_mode}
+        return {"dir": str(out_dir), "cameras": camera_names, "capture_mode": capture_mode, "meta_file": meta_file}
 
     def stop_recording(self) -> None:
         if self._recording_running():
@@ -1538,13 +1601,14 @@ class SO101Controller:
         out_dir: Path,
         duration_s: float,
         fps: float,
-        cameras: list[int],
+        cameras: list[CameraConfig],
         record_start_mono: float,
+        sample_file: str,
     ) -> None:
         threads = [
             threading.Thread(
                 target=self._record_camera_loop,
-                args=(cam, CAM_URLS[cam], out_dir / f"cam{cam}", duration_s, fps, record_start_mono),
+                args=(cam, out_dir / cam.name, duration_s, fps, record_start_mono),
                 daemon=True,
             )
             for cam in cameras
@@ -1552,7 +1616,7 @@ class SO101Controller:
         threads.append(
             threading.Thread(
                 target=self._record_robot_sample_loop,
-                args=(out_dir, duration_s, fps, record_start_mono),
+                args=(out_dir, duration_s, fps, record_start_mono, sample_file),
                 daemon=True,
             )
         )
@@ -1570,8 +1634,7 @@ class SO101Controller:
 
     def _record_camera_loop(
         self,
-        cam: int,
-        url: str,
+        cam: CameraConfig,
         out_dir: Path,
         duration_s: float,
         fps: float,
@@ -1585,7 +1648,7 @@ class SO101Controller:
         buf = bytearray()
         frames_log = out_dir / "frames.jsonl"
         try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
+            with urllib.request.urlopen(cam.url, timeout=5) as resp:
                 while not self.record_stop_event.is_set() and time.monotonic() < end_t:
                     chunk = resp.read(65536)
                     if not chunk:
@@ -1614,7 +1677,7 @@ class SO101Controller:
                             append_jsonl(
                                 frames_log,
                                 {
-                                    "camera": f"cam{cam}",
+                                    "camera": cam.name,
                                     "frame_idx": saved,
                                     "frame": frame_name,
                                     "timestamp_s": round(saved * period, 6),
@@ -1625,16 +1688,16 @@ class SO101Controller:
                             saved += 1
                             next_save_t = now + period
                             with self.status_lock:
-                                self.record_counts[f"cam{cam}"] = saved
+                                self.record_counts[cam.name] = saved
                         if time.monotonic() >= end_t:
                             break
         except BaseException as exc:
             with self.status_lock:
-                self.record_error = f"cam{cam}: {exc}"
-            self.log(f"recording cam{cam} error: {exc}")
+                self.record_error = f"{cam.name}: {exc}"
+            self.log(f"recording {cam.name} error: {exc}")
         finally:
             with self.status_lock:
-                self.record_counts[f"cam{cam}"] = saved
+                self.record_counts[cam.name] = saved
 
     def _record_robot_sample_loop(
         self,
@@ -1642,8 +1705,9 @@ class SO101Controller:
         duration_s: float,
         fps: float,
         record_start_mono: float,
+        sample_file: str,
     ) -> None:
-        samples_path = out_dir / "lerobot_samples.jsonl"
+        samples_path = out_dir / sample_file
         period = 1.0 / fps
         end_t = record_start_mono + duration_s
         next_sample_t = record_start_mono
@@ -2186,7 +2250,7 @@ class SO101Controller:
                     recording = self.start_recording(
                         record_duration_s,
                         record_fps,
-                        [0, 1],
+                        [cam.name for cam in self.camera_configs],
                         task=instruction,
                         name_prefix=f"so101_episode_run{run_num:04d}",
                         extra_meta={
@@ -2656,17 +2720,22 @@ class SO101Controller:
                 measured = self.read_state()
                 self.log(f"chunk {next_chunk} capture start measured {_fmt(measured)}")
                 self.set_stage("capture")
-                images = []
+                images: dict[str, np.ndarray] = {}
                 capture_times = []
-                for idx, url in enumerate(CAM_URLS):
+                for cam in self._policy_cameras():
                     t_cam = time.monotonic()
-                    images.append(read_mjpeg_frame(url))
+                    images[cam.name] = read_mjpeg_frame(cam.url)
                     capture_times.append(time.monotonic() - t_cam)
-                    self.log(f"chunk {next_chunk} cam{idx} frame={capture_times[-1]:.2f}s")
+                    self.log(f"chunk {next_chunk} {cam.name} frame={capture_times[-1]:.2f}s")
                 t0 = time.monotonic()
                 self.set_stage("query")
                 self.log(f"chunk {next_chunk} query start timeout={MOLMO_TIMEOUT_S:.0f}s")
-                chunk = self.client.act(Observation(images=images, state_rad=measured, instruction=instruction))
+                chunk = self.policy_client.act(
+                    images=images,
+                    state=measured,
+                    instruction=instruction,
+                    joints=JOINTS,
+                )
                 query_s = time.monotonic() - t0
                 with self.status_lock:
                     self.last_query_s = round(query_s, 3)
@@ -2955,6 +3024,7 @@ body.page-monitor #liveToggle { display:none; }
 	    <div class="cams">
 	      <img id="cam0" alt="camera 0">
       <img id="cam1" alt="camera 1">
+      <img id="cam2" alt="camera 2">
       <img id="successOverlay" alt="success tracking overlay">
     </div>
     <div class="live-summary monitor-only">
@@ -3029,7 +3099,7 @@ body.page-monitor #liveToggle { display:none; }
       </div>
       <div class="row">
         <label>Confidence <input id="sam3MinScore" type="number" value="0.15" min="0" max="1" step="0.01" style="width:72px"></label>
-        <label>Camera <select id="sam3Camera"><option value="0">Cam 0</option><option value="1">Cam 1</option></select></label>
+        <label>Camera <select id="sam3Camera"><option value="front">Front</option><option value="side">Side</option><option value="wrist">Wrist</option></select></label>
         <button id="sam3PreviewButton" onclick="previewSam3()">Preview SAM3</button>
         <button class="good" onclick="applySam3Prompt()">Use For Success</button>
       </div>
@@ -3069,8 +3139,9 @@ body.page-monitor #liveToggle { display:none; }
     <div class="row hidden" aria-hidden="true">
       <label>Record duration <input id="recordDuration" type="number" value="120" min="1" max="900" style="width:72px"></label>
       <label>Record FPS <input id="recordFps" type="number" value="30" min="0.5" max="30" step="0.5" style="width:64px"></label>
-      <label><input id="recordCam0" type="checkbox" checked> Cam 0</label>
-      <label><input id="recordCam1" type="checkbox" checked> Cam 1</label>
+      <label><input id="recordFront" type="checkbox" checked> Front</label>
+      <label><input id="recordSide" type="checkbox" checked> Side</label>
+      <label><input id="recordWrist" type="checkbox" checked> Wrist</label>
     </div>
     <div class="row hidden" aria-hidden="true">
       <button class="primary" onclick="startRecording()">Start Recording</button>
@@ -3134,6 +3205,7 @@ function startLowLatencyImage(id, path, intervalMs) {
 
 startLowLatencyImage('cam0', '/cam0.jpg', 125);
 startLowLatencyImage('cam1', '/cam1.jpg', 125);
+startLowLatencyImage('cam2', '/cam2.jpg', 125);
 
 async function api(path, body) {
   const opts = body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)};
@@ -3197,7 +3269,7 @@ function sam3EditorConfig() {
   return {
     prompt: val('sam3Prompt'),
     min_score: Number(val('sam3MinScore')),
-    camera: Number(val('sam3Camera')),
+    camera: val('sam3Camera'),
   };
 }
 function setSam3PreviewStatus(text) {
@@ -3324,8 +3396,9 @@ async function gripper(value) {
 }
 function selectedCameras() {
   const cams = [];
-  if (document.getElementById('recordCam0').checked) cams.push(0);
-  if (document.getElementById('recordCam1').checked) cams.push(1);
+  if (document.getElementById('recordFront').checked) cams.push('front');
+  if (document.getElementById('recordSide').checked) cams.push('side');
+  if (document.getElementById('recordWrist').checked) cams.push('wrist');
   return cams;
 }
 async function startRecording() {
@@ -3351,7 +3424,7 @@ async function startBusyboardRecording() {
   const data = await api('/api/record/start', {
     duration_s: Number(val('busyboardDuration')),
     fps: Number(val('busyboardFps')),
-    cameras: [0, 1],
+    cameras: ['front', 'side', 'wrist'],
     task: 'busyboard long recording',
     name_prefix: 'so101_busyboard_long',
     capture_mode: 'continuous',
@@ -3867,7 +3940,7 @@ EPISODE_VIEWER_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SO101 Episode Viewer</title>
+<title>SO101 Dataset Editor</title>
 <style>
 :root { color-scheme: dark; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
 body { margin:0; background:#111; color:#eee; }
@@ -3883,7 +3956,7 @@ button { background:#333; color:#fff; border-color:#555; cursor:pointer; padding
 button.primary { background:#1f6feb; border-color:#2f81f7; }
 button:disabled { opacity:.45; cursor:not-allowed; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.cams { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:12px; }
+.cams { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:12px; }
 .cam { display:grid; gap:6px; min-width:0; }
 .cam img { width:100%; aspect-ratio:4 / 3; object-fit:contain; background:#000; border:1px solid #333; border-radius:6px; }
 .cam span { color:#aaa; font-size:12px; }
@@ -3894,6 +3967,13 @@ button:disabled { opacity:.45; cursor:not-allowed; }
 .sample { display:grid; grid-template-columns: 120px 1fr; gap:6px 10px; font-size:13px; overflow:auto; }
 .sample div:nth-child(odd) { color:#aaa; }
 #frameSlider { flex:1 1 360px; min-width:180px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th, td { border-bottom:1px solid #303030; padding:6px; text-align:left; vertical-align:top; }
+th { color:#aaa; font-weight:600; }
+td input, td select { width:100%; box-sizing:border-box; }
+td textarea { width:100%; min-height:38px; box-sizing:border-box; font:inherit; background:#111; color:#eee; border:1px solid #444; border-radius:5px; padding:7px; }
+.compact { width:72px; }
+.status { color:#aaa; min-height:20px; }
 @media (max-width: 900px) {
   .cams { grid-template-columns:1fr; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -3903,7 +3983,7 @@ button:disabled { opacity:.45; cursor:not-allowed; }
 </head>
 <body>
 <header>
-  <h1>SO101 Episode Viewer</h1>
+  <h1>SO101 Dataset Editor</h1>
   <a href="/">Back to control UI</a>
 </header>
 <main>
@@ -3914,19 +3994,31 @@ button:disabled { opacity:.45; cursor:not-allowed; }
       <button id="prevButton" onclick="stepFrame(-1)">Prev</button>
       <button id="playButton" class="primary" onclick="togglePlay()">Play</button>
       <button id="nextButton" onclick="stepFrame(1)">Next</button>
+      <button onclick="markStart()">Mark Start</button>
+      <button onclick="markEnd()">Mark End</button>
       <label>Frame <input id="frameNumber" type="number" min="0" value="0" style="width:84px"></label>
       <input id="frameSlider" type="range" min="0" max="0" value="0">
     </div>
   </section>
   <section class="stats mono" id="stats"></section>
-  <section class="cams">
-    <div class="cam">
-      <img id="cam0" alt="cam0 frame">
-      <span class="mono" id="cam0Info"></span>
+  <section class="cams" id="cams"></section>
+  <section class="panel">
+    <div class="row" style="justify-content:space-between">
+      <div class="row">
+        <button onclick="addSegment()">Add Segment</button>
+        <button onclick="loadManifest()">Load Manifest</button>
+        <button onclick="saveManifest()">Save Manifest</button>
+        <button class="primary" onclick="exportSegments()">Export Episodes</button>
+      </div>
+      <div class="status mono" id="manifestStatus"></div>
     </div>
-    <div class="cam">
-      <img id="cam1" alt="cam1 frame">
-      <span class="mono" id="cam1Info"></span>
+    <div style="overflow:auto; margin-top:10px">
+      <table>
+        <thead>
+          <tr><th>Start</th><th>End</th><th>Task</th><th>Outcome</th><th>Type</th><th>Notes</th><th></th></tr>
+        </thead>
+        <tbody id="segmentsBody"></tbody>
+      </table>
     </div>
   </section>
   <section class="panel">
@@ -3938,6 +4030,7 @@ let episodes = [];
 let episode = null;
 let frameIdx = 0;
 let playTimer = null;
+let segments = [];
 
 async function api(path) {
   const res = await fetch(path);
@@ -3951,6 +4044,12 @@ function escapeHtml(value) {
 function fmtVec(values) {
   if (!Array.isArray(values)) return '-';
   return values.map(v => Number(v).toFixed(2)).join(', ');
+}
+function timestampFor(idx) {
+  const sample = (episode?.samples || [])[idx] || {};
+  if (sample.timestamp_s !== undefined) return Number(sample.timestamp_s);
+  const fps = Math.max(1, Number(episode?.meta?.fps || 30));
+  return idx / fps;
 }
 function queryEpisodeName() {
   return new URLSearchParams(location.search).get('episode') || '';
@@ -3968,12 +4067,29 @@ async function loadEpisode(name) {
   episode = await api(`/api/episode?name=${encodeURIComponent(name)}`);
   history.replaceState(null, '', `/episodes?episode=${encodeURIComponent(name)}`);
   frameIdx = 0;
+  segments = (episode.manifest?.segments || []).map(seg => ({...seg}));
   const maxIdx = Math.max(0, Number(episode.length || 0) - 1);
   const slider = document.getElementById('frameSlider');
   const num = document.getElementById('frameNumber');
   slider.max = maxIdx;
   num.max = maxIdx;
+  renderCameras();
+  renderSegments();
   renderFrame(0);
+}
+function cameraList() {
+  const fromMeta = Array.isArray(episode?.cameras) ? episode.cameras : [];
+  if (fromMeta.length) return fromMeta.map(cam => ({name: cam.name, frames_dir: cam.frames_dir || cam.name}));
+  return Object.keys(episode?.frames || {}).map(name => ({name, frames_dir: name}));
+}
+function renderCameras() {
+  const cams = document.getElementById('cams');
+  cams.innerHTML = cameraList().map(cam => `
+    <div class="cam">
+      <img id="camera-${escapeHtml(cam.name)}" alt="${escapeHtml(cam.name)} frame">
+      <span class="mono" id="camera-${escapeHtml(cam.name)}-info"></span>
+    </div>
+  `).join('');
 }
 function frameFor(camera, idx) {
   const frames = episode?.frames?.[camera] || [];
@@ -3985,10 +4101,12 @@ function renderFrame(idx) {
   frameIdx = Math.max(0, Math.min(idx, Math.max(0, Number(episode.length || 0) - 1)));
   document.getElementById('frameSlider').value = frameIdx;
   document.getElementById('frameNumber').value = frameIdx;
-  for (const camera of ['cam0', 'cam1']) {
+  for (const cam of cameraList()) {
+    const camera = cam.name;
     const frame = frameFor(camera, frameIdx);
-    const img = document.getElementById(camera);
-    const info = document.getElementById(`${camera}Info`);
+    const img = document.getElementById(`camera-${camera}`);
+    const info = document.getElementById(`camera-${camera}-info`);
+    if (!img || !info) continue;
     if (frame) {
       img.src = `/episode_frame?name=${encodeURIComponent(episode.name)}&camera=${encodeURIComponent(camera)}&frame=${encodeURIComponent(frame.frame)}`;
       info.textContent = `${camera} ${frame.frame} t=${frame.timestamp_s ?? '-'}s`;
@@ -4013,13 +4131,84 @@ function renderStats() {
   const counts = episode?.counts || {};
   const summary = episode?.eval_summary || {};
   const result = episode?.result || {};
+  const cameraCounts = cameraList().map(cam => `${cam.name}:${counts[cam.name] || 0}`).join(' ');
   document.getElementById('stats').innerHTML = [
     `<div class="stat"><span>task</span><b title="${escapeHtml(meta.task || '')}">${escapeHtml(meta.task || '-')}</b></div>`,
+    `<div class="stat"><span>kind</span><b>${escapeHtml(episode?.kind || '-')}</b></div>`,
     `<div class="stat"><span>result</span><b>${escapeHtml(result.outcome || summary.state || '-')}</b></div>`,
     `<div class="stat"><span>samples</span><b>${counts.samples || 0}</b></div>`,
-    `<div class="stat"><span>cam0 / cam1</span><b>${counts.cam0 || 0} / ${counts.cam1 || 0}</b></div>`,
+    `<div class="stat"><span>cameras</span><b title="${escapeHtml(cameraCounts)}">${escapeHtml(cameraCounts || '-')}</b></div>`,
     `<div class="stat"><span>fps</span><b>${Number(meta.fps || 0).toFixed(1)}</b></div>`,
   ].join('');
+}
+function renderSegments() {
+  const body = document.getElementById('segmentsBody');
+  body.innerHTML = segments.map((seg, idx) => `
+    <tr>
+      <td><input class="compact" type="number" step="0.001" value="${Number(seg.start_s || 0)}" onchange="updateSegment(${idx}, 'start_s', this.value)"></td>
+      <td><input class="compact" type="number" step="0.001" value="${Number(seg.end_s || 0)}" onchange="updateSegment(${idx}, 'end_s', this.value)"></td>
+      <td><input value="${escapeHtml(seg.task || '')}" onchange="updateSegment(${idx}, 'task', this.value)"></td>
+      <td><select onchange="updateSegment(${idx}, 'outcome', this.value)">
+        <option value="success" ${seg.outcome === 'success' ? 'selected' : ''}>success</option>
+        <option value="failure" ${seg.outcome === 'failure' ? 'selected' : ''}>failure</option>
+      </select></td>
+      <td><select onchange="updateSegment(${idx}, 'type', this.value)">
+        <option value="teleop" ${seg.type !== 'intervention' ? 'selected' : ''}>teleop</option>
+        <option value="intervention" ${seg.type === 'intervention' ? 'selected' : ''}>intervention</option>
+      </select></td>
+      <td><textarea onchange="updateSegment(${idx}, 'notes', this.value)">${escapeHtml(seg.notes || '')}</textarea></td>
+      <td><button onclick="removeSegment(${idx})">Remove</button></td>
+    </tr>
+  `).join('');
+}
+function updateSegment(idx, key, value) {
+  if (!segments[idx]) return;
+  segments[idx][key] = ['start_s', 'end_s'].includes(key) ? Number(value) : value;
+}
+function addSegment() {
+  const t = timestampFor(frameIdx);
+  segments.push({start_s: Number(t.toFixed(3)), end_s: Number((t + 5).toFixed(3)), task: episode?.meta?.task || '', outcome: 'success', type: 'teleop', notes: ''});
+  renderSegments();
+}
+function removeSegment(idx) {
+  segments.splice(idx, 1);
+  renderSegments();
+}
+function markStart() {
+  if (!segments.length) addSegment();
+  segments[segments.length - 1].start_s = Number(timestampFor(frameIdx).toFixed(3));
+  if (segments[segments.length - 1].end_s <= segments[segments.length - 1].start_s) {
+    segments[segments.length - 1].end_s = Number((segments[segments.length - 1].start_s + 1).toFixed(3));
+  }
+  renderSegments();
+}
+function markEnd() {
+  if (!segments.length) addSegment();
+  segments[segments.length - 1].end_s = Number(timestampFor(frameIdx).toFixed(3));
+  renderSegments();
+}
+async function postJson(path, payload) {
+  const res = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || res.statusText);
+  return json;
+}
+async function loadManifest() {
+  const data = await api(`/api/segments?source=${encodeURIComponent(episode?.name || 'latest')}`);
+  segments = (data.segments || []).map(seg => ({...seg}));
+  document.getElementById('manifestStatus').textContent = `loaded ${segments.length} segment(s)`;
+  renderSegments();
+}
+async function saveManifest() {
+  const data = await postJson('/api/segments/save', {source: episode?.name || 'latest', segments});
+  segments = (data.segments || []).map(seg => ({...seg}));
+  document.getElementById('manifestStatus').textContent = `saved ${segments.length} segment(s)`;
+  renderSegments();
+}
+async function exportSegments() {
+  const data = await postJson('/api/busyboard/extract', {source: episode?.name || 'latest', segments});
+  document.getElementById('manifestStatus').textContent = `created ${data.episode_count || 0} episode(s), ${data.total_frames || 0} frames`;
+  await loadEpisodes();
 }
 function stepFrame(delta) {
   renderFrame(frameIdx + delta);
@@ -4087,47 +4276,160 @@ def _read_jsonl_file(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _recording_meta_path(path: Path) -> Path | None:
+    if (path / "session_meta.json").exists():
+        return path / "session_meta.json"
+    if (path / "episode_meta.json").exists():
+        return path / "episode_meta.json"
+    return None
+
+
+def _recording_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    for root in (RAW_RECORD_ROOT, RECORD_ROOT):
+        if not root.exists():
+            continue
+        dirs.extend(path for path in root.iterdir() if path.is_dir() and _recording_meta_path(path) is not None)
+    return sorted(dirs, key=lambda path: path.stat().st_mtime, reverse=True)
+
+
 def _episode_dirs() -> list[Path]:
-    if not RECORD_ROOT.exists():
-        return []
-    return sorted(
-        [path for path in RECORD_ROOT.iterdir() if path.is_dir() and (path / "episode_meta.json").exists()],
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
+    return [path for path in _recording_dirs() if (path / "episode_meta.json").exists()]
 
 
 def _safe_episode_dir(name: str) -> Path:
-    dirs = _episode_dirs()
+    dirs = _recording_dirs()
     if name == "latest":
         if not dirs:
-            raise FileNotFoundError("no recorded episodes")
+            raise FileNotFoundError("no recordings")
         return dirs[0]
     if not name or "/" in name or "\\" in name or name.startswith("."):
         raise ValueError("invalid episode name")
-    root = RECORD_ROOT.resolve()
-    path = (RECORD_ROOT / name).resolve()
-    if path != root and root not in path.parents:
-        raise ValueError("invalid episode path")
-    if not path.is_dir() or not (path / "episode_meta.json").exists():
-        raise FileNotFoundError(f"episode not found: {name}")
-    return path
+    for root in (RAW_RECORD_ROOT, RECORD_ROOT):
+        root_resolved = root.resolve()
+        path = (root / name).resolve()
+        if path != root_resolved and root_resolved not in path.parents:
+            continue
+        if path.is_dir() and _recording_meta_path(path) is not None:
+            return path
+    raise FileNotFoundError(f"recording not found: {name}")
+
+
+def _sample_file_for(path: Path, meta: dict[str, Any]) -> str:
+    if "sample_file" in meta:
+        return str(meta.get("sample_file") or "lerobot_samples.jsonl")
+    if (path / "samples.jsonl").exists():
+        return "samples.jsonl"
+    return "lerobot_samples.jsonl"
+
+
+def _camera_specs_for(path: Path, meta: dict[str, Any]) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    cameras = meta.get("cameras")
+    if isinstance(cameras, list):
+        for cam in cameras:
+            if not isinstance(cam, dict):
+                continue
+            name = str(cam.get("name") or f"cam{cam.get('id')}").strip()
+            if not name or name == "camNone":
+                continue
+            frames_dir = str(cam.get("frames_dir") or name)
+            frames_file = str(cam.get("frames_file") or f"{frames_dir}/frames.jsonl")
+            specs.append({**cam, "name": name, "frames_dir": frames_dir, "frames_file": frames_file})
+    if specs:
+        return specs
+    inferred = []
+    for child in sorted(path.iterdir()) if path.exists() else []:
+        if child.is_dir() and (child / "frames.jsonl").exists():
+            inferred.append(
+                {
+                    "name": child.name,
+                    "frames_dir": child.name,
+                    "frames_file": f"{child.name}/frames.jsonl",
+                    "lerobot_key": f"observation.images.{child.name}",
+                }
+            )
+    return inferred or [
+        {"name": "cam0", "frames_dir": "cam0", "frames_file": "cam0/frames.jsonl"},
+        {"name": "cam1", "frames_dir": "cam1", "frames_file": "cam1/frames.jsonl"},
+    ]
+
+
+def _manifest_path(path: Path) -> Path:
+    return path / "segment_manifest.json"
+
+
+def _read_segment_manifest(path: Path) -> dict[str, Any]:
+    manifest = _read_json_file(_manifest_path(path))
+    if not manifest:
+        return {"recording_dir": str(path), "segments": []}
+    if "recording_dir" not in manifest:
+        manifest["recording_dir"] = str(path)
+    if not isinstance(manifest.get("segments"), list):
+        manifest["segments"] = []
+    return manifest
+
+
+def _write_segment_manifest(path: Path, segments: list[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(segments, list):
+        raise ValueError("segments must be a list")
+    cleaned: list[dict[str, Any]] = []
+    for idx, raw in enumerate(segments, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"segment {idx} must be an object")
+        start_s = float(raw.get("start_s"))
+        end_s = float(raw.get("end_s"))
+        if end_s <= start_s:
+            raise ValueError(f"segment {idx} end_s must be greater than start_s")
+        task = str(raw.get("task") or "").strip()
+        if not task:
+            raise ValueError(f"segment {idx} task is required")
+        outcome = str(raw.get("outcome") or "success").strip().lower()
+        if outcome not in {"success", "failure"}:
+            raise ValueError(f"segment {idx} outcome must be success or failure")
+        segment_type = str(raw.get("type") or "teleop").strip().lower()
+        if segment_type not in {"teleop", "intervention"}:
+            raise ValueError(f"segment {idx} type must be teleop or intervention")
+        cleaned.append(
+            {
+                "start_s": start_s,
+                "end_s": end_s,
+                "task": task,
+                "outcome": outcome,
+                "type": segment_type,
+                "notes": str(raw.get("notes") or "").strip(),
+            }
+        )
+    manifest = {
+        "recording_dir": str(path),
+        "segments": cleaned,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    _manifest_path(path).write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
 
 
 def _episode_summary(path: Path) -> dict[str, Any]:
-    meta = _read_json_file(path / "episode_meta.json")
+    meta_path = _recording_meta_path(path)
+    meta = _read_json_file(meta_path) if meta_path is not None else {}
     result = _read_json_file(path / "episode_result.json")
     eval_summary = _read_json_file(path / "eval_summary.json").get("eval", {})
-    samples = _read_jsonl_file(path / str(meta.get("sample_file") or "lerobot_samples.jsonl"))
-    cam0 = _read_jsonl_file(path / "cam0" / "frames.jsonl")
-    cam1 = _read_jsonl_file(path / "cam1" / "frames.jsonl")
+    samples = _read_jsonl_file(path / _sample_file_for(path, meta))
+    camera_counts = {}
+    cameras = _camera_specs_for(path, meta)
+    for cam in cameras:
+        camera_counts[str(cam["name"])] = len(_read_jsonl_file(path / str(cam["frames_file"])))
+    manifest = _read_segment_manifest(path)
     return {
         "name": path.name,
         "path": str(path),
+        "kind": "recording" if meta_path is not None and meta_path.name == "session_meta.json" else "episode",
         "created_at": meta.get("created_at"),
         "task": meta.get("task"),
         "result": result,
-        "counts": {"samples": len(samples), "cam0": len(cam0), "cam1": len(cam1)},
+        "counts": {"samples": len(samples), **camera_counts},
+        "cameras": cameras,
+        "segment_count": len(manifest.get("segments", [])),
         "eval": {
             "state": result.get("outcome") or eval_summary.get("state"),
             "successes": eval_summary.get("successes", 0),
@@ -4137,18 +4439,19 @@ def _episode_summary(path: Path) -> dict[str, Any]:
 
 
 def _episode_detail(path: Path) -> dict[str, Any]:
-    meta = _read_json_file(path / "episode_meta.json")
+    meta_path = _recording_meta_path(path)
+    meta = _read_json_file(meta_path) if meta_path is not None else {}
     result = _read_json_file(path / "episode_result.json")
     eval_summary = _read_json_file(path / "eval_summary.json").get("eval", {})
-    samples = _read_jsonl_file(path / str(meta.get("sample_file") or "lerobot_samples.jsonl"))
-    frames = {
-        "cam0": _read_jsonl_file(path / "cam0" / "frames.jsonl"),
-        "cam1": _read_jsonl_file(path / "cam1" / "frames.jsonl"),
-    }
+    samples = _read_jsonl_file(path / _sample_file_for(path, meta))
+    cameras = _camera_specs_for(path, meta)
+    frames = {str(cam["name"]): _read_jsonl_file(path / str(cam["frames_file"])) for cam in cameras}
     length = min([len(samples), *(len(v) for v in frames.values() if v)] or [0])
+    counts = {"samples": len(samples), **{camera: len(rows) for camera, rows in frames.items()}}
     return {
         "name": path.name,
         "path": str(path),
+        "kind": "recording" if meta_path is not None and meta_path.name == "session_meta.json" else "episode",
         "meta": meta,
         "result": result,
         "eval_summary": {
@@ -4157,7 +4460,9 @@ def _episode_detail(path: Path) -> dict[str, Any]:
             "failures": eval_summary.get("failures", 0),
             "stop_reason": eval_summary.get("stop_reason", ""),
         },
-        "counts": {"samples": len(samples), "cam0": len(frames["cam0"]), "cam1": len(frames["cam1"])},
+        "counts": counts,
+        "cameras": cameras,
+        "manifest": _read_segment_manifest(path),
         "length": length,
         "samples": samples[:length],
         "frames": {camera: rows[:length] for camera, rows in frames.items()},
@@ -4167,9 +4472,15 @@ def _episode_detail(path: Path) -> dict[str, Any]:
 def _episode_frame_response(handler: BaseHTTPRequestHandler, episode_name: str, camera: str, frame: str) -> None:
     try:
         episode_dir = _safe_episode_dir(episode_name)
-        if camera not in {"cam0", "cam1"} or "/" in frame or "\\" in frame or frame.startswith("."):
+        meta_path = _recording_meta_path(episode_dir)
+        meta = _read_json_file(meta_path) if meta_path is not None else {}
+        camera_dirs = {
+            str(cam["name"]): str(cam["frames_dir"])
+            for cam in _camera_specs_for(episode_dir, meta)
+        }
+        if camera not in camera_dirs or "/" in frame or "\\" in frame or frame.startswith("."):
             raise ValueError("invalid frame path")
-        frame_path = (episode_dir / camera / frame).resolve()
+        frame_path = (episode_dir / camera_dirs[camera] / frame).resolve()
         if episode_dir.resolve() not in frame_path.parents:
             raise ValueError("invalid frame path")
         if frame_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
@@ -4235,12 +4546,9 @@ def _success_mjpeg_stream(handler: BaseHTTPRequestHandler, controller: SO101Cont
         return
 
 
-def _camera_mjpeg_proxy(handler: BaseHTTPRequestHandler, camera_idx: int) -> None:
-    if camera_idx < 0 or camera_idx >= len(CAM_URLS):
-        _json_response(handler, 404, {"error": "camera not found"})
-        return
+def _camera_mjpeg_proxy(handler: BaseHTTPRequestHandler, cam: CameraConfig) -> None:
     try:
-        with requests.get(CAM_URLS[camera_idx], stream=True, timeout=(3.0, 30.0)) as resp:
+        with requests.get(cam.url, stream=True, timeout=(3.0, 30.0)) as resp:
             resp.raise_for_status()
             handler.send_response(200)
             handler.send_header(
@@ -4263,12 +4571,9 @@ def _camera_mjpeg_proxy(handler: BaseHTTPRequestHandler, camera_idx: int) -> Non
             return
 
 
-def _camera_jpeg_snapshot(handler: BaseHTTPRequestHandler, camera_idx: int) -> None:
-    if camera_idx < 0 or camera_idx >= len(CAM_URLS):
-        _json_response(handler, 404, {"error": "camera not found"})
-        return
+def _camera_jpeg_snapshot(handler: BaseHTTPRequestHandler, cam: CameraConfig) -> None:
     try:
-        jpeg = read_mjpeg_jpeg(CAM_URLS[camera_idx], timeout_s=2.0)
+        jpeg = read_mjpeg_jpeg(cam.url, timeout_s=2.0)
         handler.send_response(200)
         handler.send_header("Content-Type", "image/jpeg")
         handler.send_header("Cache-Control", "no-store, max-age=0")
@@ -4313,21 +4618,23 @@ def make_handler(controller: SO101Controller):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-            elif parsed.path == "/cam0.mjpg":
-                _camera_mjpeg_proxy(self, 0)
-            elif parsed.path == "/cam1.mjpg":
-                _camera_mjpeg_proxy(self, 1)
-            elif parsed.path == "/cam0.jpg":
-                _camera_jpeg_snapshot(self, 0)
-            elif parsed.path == "/cam1.jpg":
-                _camera_jpeg_snapshot(self, 1)
             elif parsed.path == "/api/episodes":
-                _json_response(self, 200, {"episodes": [_episode_summary(path) for path in _episode_dirs()]})
+                _json_response(self, 200, {"episodes": [_episode_summary(path) for path in _recording_dirs()]})
             elif parsed.path == "/api/episode":
                 q = parse_qs(parsed.query)
                 name = q.get("name", ["latest"])[0]
                 try:
                     _json_response(self, 200, _episode_detail(_safe_episode_dir(name)))
+                except FileNotFoundError as exc:
+                    _json_response(self, 404, {"error": str(exc)})
+                except BaseException as exc:
+                    _json_response(self, 400, {"error": str(exc)})
+            elif parsed.path == "/api/segments":
+                q = parse_qs(parsed.query)
+                name = q.get("source", ["latest"])[0]
+                try:
+                    manifest = _read_segment_manifest(_safe_episode_dir(name))
+                    _json_response(self, 200, manifest)
                 except FileNotFoundError as exc:
                     _json_response(self, 404, {"error": str(exc)})
                 except BaseException as exc:
@@ -4346,13 +4653,37 @@ def make_handler(controller: SO101Controller):
                 _json_response(self, 200, controller.status(log_limit=log_limit))
             elif parsed.path == "/api/health":
                 try:
-                    _json_response(self, 200, {"molmo": controller.health()})
+                    _json_response(self, 200, {"policy": controller.health()})
                 except BaseException as exc:
                     _json_response(self, 500, {"error": str(exc)})
             elif parsed.path == "/api/success.jpg":
                 _jpeg_response(self, controller.success_overlay_jpeg)
             elif parsed.path == "/api/success.mjpg":
                 _success_mjpeg_stream(self, controller)
+            elif parsed.path.startswith("/camera/") and parsed.path.endswith(".mjpg"):
+                name = parsed.path.removeprefix("/camera/").removesuffix(".mjpg")
+                try:
+                    _camera_mjpeg_proxy(self, controller._camera_from_spec(name))
+                except ValueError as exc:
+                    _json_response(self, 404, {"error": str(exc)})
+            elif parsed.path.startswith("/camera/") and parsed.path.endswith(".jpg"):
+                name = parsed.path.removeprefix("/camera/").removesuffix(".jpg")
+                try:
+                    _camera_jpeg_snapshot(self, controller._camera_from_spec(name))
+                except ValueError as exc:
+                    _json_response(self, 404, {"error": str(exc)})
+            elif parsed.path.startswith("/cam") and parsed.path.endswith(".mjpg"):
+                name = parsed.path.strip("/").removesuffix(".mjpg")
+                try:
+                    _camera_mjpeg_proxy(self, controller._camera_from_spec(name))
+                except ValueError as exc:
+                    _json_response(self, 404, {"error": str(exc)})
+            elif parsed.path.startswith("/cam") and parsed.path.endswith(".jpg"):
+                name = parsed.path.strip("/").removesuffix(".jpg")
+                try:
+                    _camera_jpeg_snapshot(self, controller._camera_from_spec(name))
+                except ValueError as exc:
+                    _json_response(self, 404, {"error": str(exc)})
             else:
                 _json_response(self, 404, {"error": "not found"})
 
@@ -4450,7 +4781,7 @@ def make_handler(controller: SO101Controller):
                     result = controller.start_recording(
                         duration_s=float(data.get("duration_s", DEFAULT_RECORD_DURATION_S)),
                         fps=float(data.get("fps", DEFAULT_RECORD_FPS)),
-                        cameras=list(data.get("cameras", [0, 1])),
+                        cameras=list(data.get("cameras", [])),
                         task=str(data.get("task", DEFAULT_INSTRUCTION)),
                         name_prefix=str(data.get("name_prefix", "so101_recording")),
                         extra_meta=data.get("extra_meta") if isinstance(data.get("extra_meta"), dict) else None,
@@ -4460,6 +4791,10 @@ def make_handler(controller: SO101Controller):
                 elif parsed.path == "/api/record/stop":
                     controller.stop_recording()
                     _json_response(self, 200, {"ok": True})
+                elif parsed.path == "/api/segments/save":
+                    source_dir = _safe_episode_dir(str(data.get("source", "latest")))
+                    manifest = _write_segment_manifest(source_dir, data.get("segments", []))
+                    _json_response(self, 200, {"ok": True, **manifest})
                 elif parsed.path == "/api/busyboard/extract":
                     summary = controller.extract_busyboard_segments(
                         source_name=str(data.get("source", "latest")),
@@ -4483,7 +4818,7 @@ def make_handler(controller: SO101Controller):
                     result = controller.preview_success_sam3(
                         prompt=str(data.get("prompt", SUCCESS_CONTAINER_SAM3_PROMPT)),
                         min_score=float(data.get("min_score", SUCCESS_CONTAINER_SAM3_MIN_SCORE)),
-                        camera=int(data.get("camera", 0)),
+                        camera=data.get("camera", "front"),
                     )
                     _json_response(self, 200, result)
                 elif parsed.path == "/api/success/sam3":
@@ -4510,15 +4845,27 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8091)
     parser.add_argument("--robot-port", default="/dev/ttyACM0")
     parser.add_argument("--robot-id", default="blupe_follower")
-    parser.add_argument("--molmo-url", default="http://127.0.0.1:8202")
+    parser.add_argument("--policy-url", default="http://127.0.0.1:8202", help="Local policy runner base URL.")
+    parser.add_argument("--molmo-url", default=None, help="Deprecated alias for --policy-url.")
+    parser.add_argument(
+        "--camera",
+        action="append",
+        default=[],
+        help="Semantic camera mapping NAME=URL. Repeat for front, side, wrist. Defaults to local cam0/cam1/cam2 MJPEG.",
+    )
     parser.add_argument("--success-fps", type=float, default=DEFAULT_SUCCESS_FPS)
     parser.add_argument("--no-success-tracking", action="store_true")
     args = parser.parse_args()
+    try:
+        camera_configs = parse_camera_config_specs(args.camera, SEMANTIC_CAMERA_NAMES)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     controller = SO101Controller(
         args.robot_port,
         args.robot_id,
-        args.molmo_url,
+        args.molmo_url or args.policy_url,
+        camera_configs=camera_configs,
         success_enabled=not args.no_success_tracking,
         success_fps=args.success_fps,
     )

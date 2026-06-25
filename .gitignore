@@ -20,6 +20,9 @@ env/
 # Data / logs (teleop episode logs, recordings)
 logs/
 data/
+recordings/
+episodes/
+datasets/
 *.log
 .gstack/
 

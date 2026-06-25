@@ -16,6 +16,8 @@ from typing import Any
 DEFAULT_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EPISODES_ROOT = DEFAULT_REPO_ROOT / "episodes"
+VALID_OUTCOMES = {"success", "failure"}
+VALID_TYPES = {"teleop", "intervention"}
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -79,20 +81,56 @@ def _select_time_range(rows: list[dict[str, Any]], start_s: float, end_s: float)
     return selected
 
 
-def _camera_names(meta: dict[str, Any], requested: list[str]) -> list[str]:
-    if requested:
-        return [name if name.startswith("cam") else f"cam{name}" for name in requested]
+def _metadata_path(source_dir: Path) -> Path:
+    if (source_dir / "session_meta.json").exists():
+        return source_dir / "session_meta.json"
+    return source_dir / "episode_meta.json"
+
+
+def _sample_file(meta: dict[str, Any], source_dir: Path) -> str:
+    if "sample_file" in meta:
+        return str(meta.get("sample_file") or "lerobot_samples.jsonl")
+    if (source_dir / "samples.jsonl").exists():
+        return "samples.jsonl"
+    return "lerobot_samples.jsonl"
+
+
+def _camera_specs(meta: dict[str, Any], requested: list[str]) -> list[dict[str, Any]]:
+    known: list[dict[str, Any]] = []
     cameras = meta.get("cameras")
-    if isinstance(cameras, list) and cameras:
-        out = []
+    if isinstance(cameras, list):
         for cam in cameras:
             if not isinstance(cam, dict):
                 continue
-            name = str(cam.get("name") or f"cam{cam.get('id')}")
-            if name and name != "camNone":
-                out.append(name)
-        if out:
-            return out
+            name = str(cam.get("name") or f"cam{cam.get('id')}").strip()
+            if not name or name == "camNone":
+                continue
+            frames_dir = str(cam.get("frames_dir") or name)
+            frames_file = str(cam.get("frames_file") or f"{frames_dir}/frames.jsonl")
+            known.append({**cam, "name": name, "frames_dir": frames_dir, "frames_file": frames_file})
+    if not known:
+        known = [
+            {
+                "id": idx,
+                "name": f"cam{idx}",
+                "frames_dir": f"cam{idx}",
+                "frames_file": f"cam{idx}/frames.jsonl",
+                "lerobot_key": f"observation.images.cam{idx}",
+            }
+            for idx in (0, 1)
+        ]
+    if not requested:
+        return known
+    requested_set = {str(name).strip() for name in requested if str(name).strip()}
+    return [cam for cam in known if str(cam["name"]) in requested_set or str(cam["frames_dir"]) in requested_set]
+
+
+def _camera_names(meta: dict[str, Any], requested: list[str]) -> list[str]:
+    specs = _camera_specs(meta, requested)
+    if specs:
+        return [str(cam["name"]) for cam in specs]
+    if requested:
+        return [str(name).strip() for name in requested if str(name).strip()]
     return ["cam0", "cam1"]
 
 
@@ -108,14 +146,18 @@ def _normalize_segment(raw: dict[str, Any], index: int) -> dict[str, Any]:
     if not task:
         raise SystemExit(f"segment {index} needs task/prompt text")
     outcome = str(raw.get("outcome") or "success").strip().lower()
-    if outcome not in {"success", "failure"}:
+    if outcome not in VALID_OUTCOMES:
         raise SystemExit(f"segment {index} outcome must be success or failure")
+    segment_type = str(raw.get("type") or "teleop").strip().lower()
+    if segment_type not in VALID_TYPES:
+        raise SystemExit(f"segment {index} type must be teleop or intervention")
     return {
         "index": index,
         "start_s": start_s,
         "end_s": end_s,
         "task": task,
         "outcome": outcome,
+        "type": segment_type,
         "notes": str(raw.get("notes") or "").strip(),
     }
 
@@ -167,6 +209,7 @@ def _copy_segment(
     source_meta: dict[str, Any],
     samples: list[dict[str, Any]],
     camera_rows: dict[str, list[dict[str, Any]]],
+    camera_specs: dict[str, dict[str, Any]],
     segment: dict[str, Any],
     fps: float,
     overwrite: bool,
@@ -212,20 +255,21 @@ def _copy_segment(
         if isinstance(cam, dict)
     }
     for camera in camera_rows:
-        source_cam = source_camera_meta.get(camera, {})
+        source_cam = camera_specs.get(camera) or source_camera_meta.get(camera, {})
         cam_id_raw = source_cam.get("id")
         try:
             cam_id = int(cam_id_raw)
         except (TypeError, ValueError):
             cam_id = int(camera.replace("cam", "")) if camera.replace("cam", "").isdigit() else 0
+        frames_dir = str(source_cam.get("frames_dir") or camera)
         cameras_meta.append(
             {
                 "id": cam_id,
                 "name": camera,
                 "url": source_cam.get("url", ""),
-                "frames_dir": camera,
-                "frames_file": f"{camera}/frames.jsonl",
-                "lerobot_key": f"observation.images.{camera}",
+                "frames_dir": frames_dir,
+                "frames_file": f"{frames_dir}/frames.jsonl",
+                "lerobot_key": source_cam.get("lerobot_key") or f"observation.images.{camera}",
             }
         )
 
@@ -235,7 +279,7 @@ def _copy_segment(
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "task": segment["task"],
         "outcome": segment["outcome"],
-        "reason": "busyboard_subepisode",
+        "reason": "manifest_segment",
         "robot_type": source_meta.get("robot_type", "so101_follower"),
         "joints": source_meta.get("joints", DEFAULT_JOINTS),
         "state_units": source_meta.get("state_units", "degrees"),
@@ -245,13 +289,15 @@ def _copy_segment(
         "trajectory_time_source": "extracted_from_source_timestamp_s",
         "sample_file": "lerobot_samples.jsonl",
         "cameras": cameras_meta,
-        "collection_type": "busyboard_subepisode",
+        "collection_type": segment["type"],
+        "source_recording": source_dir.name,
         "source_episode": source_dir.name,
         "source_path": str(source_dir),
         "source_task": source_meta.get("task", ""),
         "source_capture_mode": source_meta.get("capture_mode", ""),
         "source_time_range_s": [segment["start_s"], segment["end_s"]],
         "segment_index": segment["index"],
+        "segment_type": segment["type"],
         "notes": segment["notes"],
     }
     _write_json(out_dir / "episode_meta.json", meta)
@@ -266,20 +312,22 @@ def _copy_segment(
         new_sample["sample_idx"] = new_idx
         new_sample["timestamp_s"] = round(new_idx / fps, 6) if fps > 0 else round((source_ts or segment["start_s"]) - segment["start_s"], 6)
         new_sample["wall_elapsed_s"] = new_sample["timestamp_s"]
-        new_sample["collection_type"] = "busyboard_subepisode"
+        new_sample["collection_type"] = segment["type"]
         new_sample["task"] = segment["task"]
         _append_jsonl(out_dir / "lerobot_samples.jsonl", new_sample)
 
     for camera, rows in selected_camera_rows.items():
+        source_frames_dir = str((camera_specs.get(camera) or {}).get("frames_dir") or camera)
+        target_frames_dir = str((camera_specs.get(camera) or {}).get("frames_dir") or camera)
         for new_idx, frame_row in enumerate(rows[:common_len]):
             frame_name = str(frame_row.get("frame") or "")
             if not frame_name:
                 raise SystemExit(f"missing frame name for {camera} segment {segment['index']}")
-            source_frame = source_dir / camera / frame_name
+            source_frame = source_dir / source_frames_dir / frame_name
             if not source_frame.exists():
                 raise SystemExit(f"missing source frame: {source_frame}")
             target_name = f"frame_{new_idx:05d}{source_frame.suffix.lower() or '.jpg'}"
-            target_frame = out_dir / camera / target_name
+            target_frame = out_dir / target_frames_dir / target_name
             target_frame.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_frame, target_frame)
             source_ts = _timestamp(frame_row)
@@ -293,20 +341,22 @@ def _copy_segment(
             new_frame_row["frame"] = target_name
             new_frame_row["timestamp_s"] = round(new_idx / fps, 6) if fps > 0 else round((source_ts or segment["start_s"]) - segment["start_s"], 6)
             new_frame_row["wall_elapsed_s"] = new_frame_row["timestamp_s"]
-            _append_jsonl(out_dir / camera / "frames.jsonl", new_frame_row)
+            _append_jsonl(out_dir / target_frames_dir / "frames.jsonl", new_frame_row)
 
     result = {
         "format": "blupe_so101_episode_result",
         "format_version": 1,
         "outcome": segment["outcome"],
-        "reason": "busyboard_subepisode",
+        "reason": "manifest_segment",
         "started_at": meta["created_at"],
         "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "duration_s": round(duration_s, 6),
         "counts": {"samples": common_len, **{camera: common_len for camera in camera_rows}},
         "source_episode": source_dir.name,
+        "source_recording": source_dir.name,
         "source_time_range_s": [segment["start_s"], segment["end_s"]],
         "task": segment["task"],
+        "segment_type": segment["type"],
     }
     _write_json(out_dir / "episode_result.json", result)
     return summary
@@ -323,16 +373,24 @@ def extract_segments(
 ) -> dict[str, Any]:
     source_dir = source_dir.expanduser().resolve()
     output_root = output_root.expanduser().resolve()
-    source_meta = _read_json(source_dir / "episode_meta.json")
+    meta_path = _metadata_path(source_dir)
+    source_meta = _read_json(meta_path)
     if not source_meta:
-        raise SystemExit(f"source episode has no episode_meta.json: {source_dir}")
-    sample_file = str(source_meta.get("sample_file") or "lerobot_samples.jsonl")
+        raise SystemExit(f"source recording has no episode_meta.json or session_meta.json: {source_dir}")
+    sample_file = _sample_file(source_meta, source_dir)
     samples = _read_jsonl(source_dir / sample_file)
     if not samples:
         raise SystemExit(f"source episode has no samples: {source_dir / sample_file}")
 
-    camera_names = _camera_names(source_meta, cameras or [])
-    camera_rows = {camera: _read_jsonl(source_dir / camera / "frames.jsonl") for camera in camera_names}
+    camera_specs_list = _camera_specs(source_meta, cameras or [])
+    if not camera_specs_list:
+        raise SystemExit(f"source recording has no matching cameras for request: {cameras}")
+    camera_specs = {str(cam["name"]): cam for cam in camera_specs_list}
+    camera_names = [str(cam["name"]) for cam in camera_specs_list]
+    camera_rows = {
+        camera: _read_jsonl(source_dir / str(camera_specs[camera].get("frames_file") or f"{camera}/frames.jsonl"))
+        for camera in camera_names
+    }
     empty_cameras = [camera for camera, rows in camera_rows.items() if not rows]
     if empty_cameras:
         raise SystemExit(f"source episode missing camera frames: {empty_cameras}")
@@ -349,6 +407,7 @@ def extract_segments(
             source_meta=source_meta,
             samples=samples,
             camera_rows=camera_rows,
+            camera_specs=camera_specs,
             segment=segment,
             fps=fps,
             overwrite=overwrite,

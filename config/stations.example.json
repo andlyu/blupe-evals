@@ -1,0 +1,11 @@
+{
+  "stations": [
+    {
+      "id": "so101-1",
+      "name": "SO101 Station 1",
+      "base_url": "http://192.168.0.185:8091",
+      "robot_type": "so101_follower",
+      "cameras": ["front", "side", "wrist"]
+    }
+  ]
+}

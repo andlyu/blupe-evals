@@ -69,7 +69,7 @@ def _episode_dirs(args: argparse.Namespace) -> list[Path]:
 
 def _camera_names(meta: dict[str, Any], requested: list[str]) -> list[str]:
     if requested:
-        return [name if name.startswith("cam") else f"cam{name}" for name in requested]
+        return [str(name).strip() for name in requested if str(name).strip()]
     cameras = meta.get("cameras")
     if isinstance(cameras, list) and cameras:
         names = [str(cam.get("name") or f"cam{cam.get('id')}") for cam in cameras]
