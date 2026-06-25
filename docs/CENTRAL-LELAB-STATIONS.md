@@ -98,16 +98,48 @@ The dashboard talks only to the hub API. It lists configured stations, polls eac
 health/status through the hub, shows live hub-proxied `front`/`side`/`wrist` camera streams,
 and exposes record start/stop plus teleop claim/release controls.
 
+Open the LeLab-style station recording form at:
+
+```text
+http://localhost:8099/record
+```
+
+The recording form keeps LeLab's dataset parameters: dataset repo, task, episode count,
+episode duration, reset duration, FPS, video, Hub upload, and privacy. FPS defaults to
+30, matching LeLab and the station recording API. Selecting a station
+loads its recording preset from the hub and pre-fills the camera rows with station camera
+values such as `front`, `side`, and `wrist`. The operator can still add, disable, or edit
+camera rows before starting a recording. Start/stop recording is forwarded to the selected
+station; the Jetson owns the actual recording process.
+
+Open the dataset editor at:
+
+```text
+http://localhost:8099/dataset
+```
+
+The editor also talks only to the hub API. It loads recordings from a selected station,
+plays back semantic camera streams from saved frames, lets an operator mark segment
+start/end times, edit `task`, `outcome`, `type`, and `notes`, save the segment manifest,
+and export labeled segments into episode folders on the owning station.
+
 The hub exposes one local API for LeLab:
 
 - `GET /api/stations`
 - `GET /api/stations/{station_id}`
 - `GET /api/stations/{station_id}/status`
 - `GET /api/stations/{station_id}/health`
+- `GET /api/stations/{station_id}/recording-preset`
+- `GET /api/stations/{station_id}/recordings`
+- `GET /api/stations/{station_id}/recording?name=<recording>`
+- `GET /api/stations/{station_id}/segments?source=<recording>`
+- `GET /api/stations/{station_id}/frame?name=<recording>&camera=<camera>&frame=<frame>`
 - `GET /api/stations/{station_id}/camera/{camera}.jpg`
 - `GET /api/stations/{station_id}/camera/{camera}.mjpg`
 - `POST /api/stations/{station_id}/record/start`
 - `POST /api/stations/{station_id}/record/stop`
+- `POST /api/stations/{station_id}/segments/save`
+- `POST /api/stations/{station_id}/segments/export`
 - `POST /api/stations/{station_id}/teleop/claim`
 - `POST /api/stations/{station_id}/teleop/heartbeat`
 - `POST /api/stations/{station_id}/teleop/release`

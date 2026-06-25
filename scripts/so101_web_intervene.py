@@ -627,12 +627,16 @@ class SO101Controller:
         port: str,
         robot_id: str,
         molmo_url: str,
+        leader_port: str = "/dev/ttyACM1",
+        leader_id: str = "blupe_leader",
         camera_configs: list[CameraConfig] | None = None,
         success_enabled: bool = True,
         success_fps: float = DEFAULT_SUCCESS_FPS,
     ):
         self.port = port
         self.robot_id = robot_id
+        self.leader_port = leader_port
+        self.leader_id = leader_id
         self.molmo_url = molmo_url
         self.camera_configs = list(camera_configs or DEFAULT_CAMERA_CONFIGS)
         self.cameras_by_name = {cam.name: cam for cam in self.camera_configs}
@@ -1119,6 +1123,48 @@ class SO101Controller:
                 "mode": self.mode,
                 "stage": self.stage,
                 "connected": self.robot is not None,
+                "robots": [
+                    {
+                        "role": "follower",
+                        "type": "so101_follower",
+                        "id": self.robot_id,
+                        "port": self.port,
+                        "connected": self.robot is not None,
+                        "state": self.last_state,
+                        "joints": JOINTS,
+                    },
+                    {
+                        "role": "leader",
+                        "type": "so101_leader",
+                        "id": self.leader_id,
+                        "port": self.leader_port,
+                        "connected": None,
+                        "state": None,
+                        "joints": JOINTS,
+                    },
+                ],
+                "robot_profiles": [
+                    {
+                        "id": "blupe_so101",
+                        "name": "BluPe SO101",
+                        "robot_type": "so101",
+                        "follower": {
+                            "role": "follower",
+                            "type": "so101_follower",
+                            "id": self.robot_id,
+                            "port": self.port,
+                            "connected": self.robot is not None,
+                        },
+                        "leader": {
+                            "role": "leader",
+                            "type": "so101_leader",
+                            "id": self.leader_id,
+                            "port": self.leader_port,
+                            "connected": None,
+                        },
+                        "cameras": [cam.name for cam in self.camera_configs],
+                    }
+                ],
                 "state": self.last_state,
                 "last_action": self.last_action,
                 "joints": JOINTS,
@@ -2894,7 +2940,6 @@ class SO101Controller:
         after = self.read_state()
         self.log(f"gripper {value:.2f}: {_fmt(after)}")
         return [float(x) for x in after]
-
 
 HTML = r"""<!doctype html>
 <html>
@@ -4845,6 +4890,8 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8091)
     parser.add_argument("--robot-port", default="/dev/ttyACM0")
     parser.add_argument("--robot-id", default="blupe_follower")
+    parser.add_argument("--leader-port", default="/dev/ttyACM1")
+    parser.add_argument("--leader-id", default="blupe_leader")
     parser.add_argument("--policy-url", default="http://127.0.0.1:8202", help="Local policy runner base URL.")
     parser.add_argument("--molmo-url", default=None, help="Deprecated alias for --policy-url.")
     parser.add_argument(
@@ -4865,6 +4912,8 @@ def main() -> int:
         args.robot_port,
         args.robot_id,
         args.molmo_url or args.policy_url,
+        leader_port=args.leader_port,
+        leader_id=args.leader_id,
         camera_configs=camera_configs,
         success_enabled=not args.no_success_tracking,
         success_fps=args.success_fps,
