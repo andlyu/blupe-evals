@@ -36,6 +36,14 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from blupe_evals.station import CameraConfig, HttpPolicyClient, default_camera_configs, parse_camera_config_specs
+from blupe_evals.station.joint_conventions import (
+    DEFAULT_SO101_POLICY_TO_ROBOT_JOINT_OFFSETS_DEG,
+    DEFAULT_SO101_POLICY_TO_ROBOT_JOINT_SIGNS,
+    load_joint_array_env,
+    policy_action_to_robot_target as convert_policy_action_to_robot_target,
+    robot_state_to_policy_state as convert_robot_state_to_policy_state,
+    validate_policy_to_robot_signs,
+)
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
 
@@ -110,15 +118,20 @@ DEFAULT_CUP_POLYGON = np.array(
 DEFAULT_CAMERA_CONFIGS = default_camera_configs(SEMANTIC_CAMERA_NAMES)
 
 
-def _load_policy_joint_offsets() -> np.ndarray:
-    raw = os.environ.get("SO101_POLICY_JOINT_OFFSETS_DEG", "[0,0,0,0,0,0]")
-    offsets = np.asarray(json.loads(raw), dtype=np.float32).reshape(-1)
-    if offsets.shape != (len(JOINTS),):
-        raise ValueError(f"SO101_POLICY_JOINT_OFFSETS_DEG must have {len(JOINTS)} values")
-    return offsets
-
-
-POLICY_JOINT_OFFSETS_DEG = _load_policy_joint_offsets()
+POLICY_TO_ROBOT_JOINT_SIGNS = load_joint_array_env(
+    "SO101_POLICY_TO_ROBOT_JOINT_SIGNS",
+    DEFAULT_SO101_POLICY_TO_ROBOT_JOINT_SIGNS,
+    joint_count=len(JOINTS),
+)
+POLICY_TO_ROBOT_JOINT_OFFSETS_DEG = load_joint_array_env(
+    "SO101_POLICY_TO_ROBOT_JOINT_OFFSETS_DEG",
+    DEFAULT_SO101_POLICY_TO_ROBOT_JOINT_OFFSETS_DEG,
+    joint_count=len(JOINTS),
+)
+validate_policy_to_robot_signs(
+    POLICY_TO_ROBOT_JOINT_SIGNS,
+    env_name="SO101_POLICY_TO_ROBOT_JOINT_SIGNS",
+)
 
 
 def policy_step_limit(requested_max_step_deg: float) -> tuple[float, bool]:
@@ -132,11 +145,19 @@ def policy_step_limit(requested_max_step_deg: float) -> tuple[float, bool]:
 
 
 def robot_state_to_policy_state(state: np.ndarray) -> np.ndarray:
-    return np.asarray(state, dtype=np.float32) + POLICY_JOINT_OFFSETS_DEG
+    return convert_robot_state_to_policy_state(
+        state,
+        policy_to_robot_signs=POLICY_TO_ROBOT_JOINT_SIGNS,
+        policy_to_robot_offsets_deg=POLICY_TO_ROBOT_JOINT_OFFSETS_DEG,
+    )
 
 
 def policy_action_to_robot_target(action: np.ndarray) -> np.ndarray:
-    return np.asarray(action, dtype=np.float32) - POLICY_JOINT_OFFSETS_DEG
+    return convert_policy_action_to_robot_target(
+        action,
+        policy_to_robot_signs=POLICY_TO_ROBOT_JOINT_SIGNS,
+        policy_to_robot_offsets_deg=POLICY_TO_ROBOT_JOINT_OFFSETS_DEG,
+    )
 
 
 def _fmt(values: np.ndarray) -> str:
@@ -3042,7 +3063,9 @@ class SO101Controller:
         self.log(
             f"policy start duration={duration_s}s exec_steps={exec_steps} "
             f"max_step={max_step_deg}{clamp_note} hz={hz} "
-            f"policy_offsets={_fmt(POLICY_JOINT_OFFSETS_DEG)} instruction={instruction!r}"
+            f"policy_to_robot_signs={_fmt(POLICY_TO_ROBOT_JOINT_SIGNS)} "
+            f"policy_to_robot_offsets={_fmt(POLICY_TO_ROBOT_JOINT_OFFSETS_DEG)} "
+            f"instruction={instruction!r}"
         )
         start = time.monotonic()
         period = 1.0 / hz if hz > 0 else 0.0
