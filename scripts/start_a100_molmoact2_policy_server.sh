@@ -13,8 +13,9 @@ STATE_KEY="${MOLMOACT2_STATE_KEY:-observation.state}"
 DEVICE="${MOLMOACT2_DEVICE:-cuda}"
 NUM_ACTIONS="${MOLMOACT2_NUM_ACTIONS:-30}"
 ACTION_DIM="${MOLMOACT2_ACTION_DIM:-6}"
-MODEL_DTYPE="${MOLMOACT2_MODEL_DTYPE:-bfloat16}"
-FLOW_STEPS="${MOLMOACT2_NUM_FLOW_TIMESTEPS:-8}"
+MODEL_DTYPE="${MOLMOACT2_MODEL_DTYPE:-float32}"
+FLOW_STEPS="${MOLMOACT2_NUM_FLOW_TIMESTEPS:-10}"
+ENABLE_CUDA_GRAPH="${MOLMOACT2_ENABLE_CUDA_GRAPH:-1}"
 NORM_TAG="${MOLMOACT2_NORM_TAG:-}"
 
 if [ -n "${MOLMOACT2_EXPERIMENTS_DIR:-}" ]; then
@@ -33,6 +34,12 @@ cmd=(
   --model-dtype "$MODEL_DTYPE"
   --num-flow-timesteps "$FLOW_STEPS"
 )
+
+if [ "$ENABLE_CUDA_GRAPH" = "0" ]; then
+  cmd+=(--no-enable-cuda-graph)
+else
+  cmd+=(--enable-cuda-graph)
+fi
 
 if [ -n "${MOLMOACT2_POLICY_PATH:-}" ]; then
   cmd+=(--policy-path "$MOLMOACT2_POLICY_PATH")

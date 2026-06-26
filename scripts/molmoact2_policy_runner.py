@@ -12,6 +12,7 @@ import argparse
 import base64
 import inspect
 import json
+import contextlib
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -130,8 +131,11 @@ class LeRobotMolmoAct2Runner:
         self.action_dim = int(action_dim)
         self.preprocessor = None
         self.postprocessor = None
+        self.processor = None
+        self.action_tokenizer = None
         self.policy = None
         self.policy_type = "molmoact2"
+        self.runner_api = "lerobot_policy"
         self.loaded_from = self.policy_path or self.checkpoint_path or ""
 
         self._load_policy()
@@ -196,32 +200,38 @@ class LeRobotMolmoAct2Runner:
 
     def _load_original_hf_checkpoint(self, checkpoint_path: str) -> None:
         try:
-            from lerobot.policies.molmoact2.configuration_molmoact2 import MolmoAct2Config
-            from lerobot.policies.molmoact2.modeling_molmoact2 import MolmoAct2Policy
+            from transformers import AutoModelForImageTextToText, AutoProcessor
         except Exception as exc:
             raise SystemExit(
-                "This LeRobot environment does not include MolmoAct2. Install LeRobot from source with "
-                "the molmoact2 extra before starting this runner."
+                "Transformers with MolmoAct2 trust_remote_code support is required for base HF checkpoints."
             ) from exc
 
-        cfg_kwargs: dict[str, Any] = {
-            "checkpoint_path": checkpoint_path,
-            "device": self.device,
-            "model_dtype": self.model_dtype,
-            "inference_action_mode": self.inference_action_mode,
-            "use_amp": self.use_amp,
-            "enable_inference_cuda_graph": self.enable_cuda_graph,
-            "num_flow_timesteps": self.num_flow_timesteps,
-            "num_steps": self.num_flow_timesteps,
-            "image_keys": self.image_keys,
-            "chunk_size": self.num_actions,
-            "n_action_steps": self.num_actions,
+        dtype_by_name = {
+            "float32": self.torch.float32,
+            "bfloat16": self.torch.bfloat16,
+            "float16": self.torch.float16,
         }
-        if self.norm_tag:
-            cfg_kwargs["norm_tag"] = self.norm_tag
-        cfg = MolmoAct2Config(**_filter_kwargs_for_callable(MolmoAct2Config, cfg_kwargs))
-        self.policy = MolmoAct2Policy(cfg)
+        dtype = dtype_by_name[self.model_dtype]
+        self.processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
+        try:
+            self.policy = AutoModelForImageTextToText.from_pretrained(
+                checkpoint_path,
+                trust_remote_code=True,
+                dtype=dtype,
+            )
+        except TypeError:
+            self.policy = AutoModelForImageTextToText.from_pretrained(
+                checkpoint_path,
+                trust_remote_code=True,
+                torch_dtype=dtype,
+            )
+        if self.inference_action_mode == "discrete":
+            self.action_tokenizer = AutoProcessor.from_pretrained(
+                "allenai/MolmoAct2-FAST-Tokenizer",
+                trust_remote_code=True,
+            )
         self.policy_type = "molmoact2"
+        self.runner_api = "hf_predict_action"
 
     def health(self) -> dict[str, Any]:
         cuda_available = None
@@ -236,13 +246,74 @@ class LeRobotMolmoAct2Runner:
             "cuda_available": cuda_available,
             "model_dtype": self.model_dtype,
             "inference_action_mode": self.inference_action_mode,
+            "runner_api": self.runner_api,
             "image_keys": self.image_keys,
             "state_key": self.state_key,
             "num_actions": self.num_actions,
             "action_dim": self.action_dim,
+            "num_steps": self.num_flow_timesteps,
+            "enable_cuda_graph": self.enable_cuda_graph,
+            "normalize_language": True,
+            "enable_depth_reasoning": False,
+            "has_processor": self.processor is not None,
             "has_preprocessor": self.preprocessor is not None,
             "has_postprocessor": self.postprocessor is not None,
         }
+
+    def _ordered_hf_inputs(self, payload: dict[str, Any]) -> tuple[list[np.ndarray], np.ndarray, str]:
+        images_payload = payload.get("images")
+        if not isinstance(images_payload, dict) or not images_payload:
+            raise ValueError("payload.images must be a non-empty object")
+
+        camera_order = payload.get("camera_order")
+        if not isinstance(camera_order, list) or not camera_order:
+            camera_order = list(images_payload.keys())
+        camera_order = [str(name) for name in camera_order]
+
+        images: list[np.ndarray] = []
+        for idx, image_key in enumerate(self.image_keys):
+            camera_name = _camera_name_from_image_key(image_key)
+            if camera_name not in images_payload and idx < len(camera_order):
+                camera_name = camera_order[idx]
+            item = images_payload.get(camera_name)
+            if not isinstance(item, dict):
+                available = sorted(str(name) for name in images_payload)
+                raise ValueError(f"missing image for {image_key!r}; expected camera {camera_name!r}, got {available}")
+            images.append(_decode_image(item))
+
+        state = np.asarray(payload.get("state"), dtype=np.float32).reshape(-1)
+        if state.shape != (self.action_dim,):
+            raise ValueError(f"payload.state must have shape ({self.action_dim},), got {state.shape}")
+        task = str(payload.get("instruction") or "")
+        return images, state, task
+
+    def _hf_autocast(self):
+        if self.model_dtype == "float32" or not str(self.device).startswith("cuda"):
+            return contextlib.nullcontext()
+        dtype = self.torch.bfloat16 if self.model_dtype == "bfloat16" else self.torch.float16
+        return self.torch.autocast("cuda", dtype=dtype)
+
+    def _predict_hf_actions(self, payload: dict[str, Any]) -> Any:
+        if self.processor is None:
+            raise RuntimeError("HF processor is not loaded")
+        images, state, task = self._ordered_hf_inputs(payload)
+        predict_kwargs: dict[str, Any] = {
+            "processor": self.processor,
+            "images": images,
+            "task": task,
+            "state": state,
+            "norm_tag": self.norm_tag,
+            "inference_action_mode": self.inference_action_mode,
+            "enable_depth_reasoning": False,
+            "num_steps": self.num_flow_timesteps,
+            "normalize_language": True,
+            "enable_cuda_graph": self.enable_cuda_graph,
+        }
+        if self.action_tokenizer is not None:
+            predict_kwargs["action_tokenizer"] = self.action_tokenizer
+        with self.torch.inference_mode(), self._hf_autocast():
+            out = self.policy.predict_action(**predict_kwargs)
+        return out.actions
 
     def _target_image_shape(self, image_key: str) -> tuple[int, int, int] | None:
         config = getattr(self.policy, "config", None)
@@ -329,8 +400,12 @@ class LeRobotMolmoAct2Runner:
 
     def act(self, payload: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
-        batch = self._prepare_batch(payload)
-        actions = _as_numpy_actions(self._predict_action_chunk(batch))
+        if self.runner_api == "hf_predict_action":
+            actions = _as_numpy_actions(self._predict_hf_actions(payload))
+        else:
+            batch = self._prepare_batch(payload)
+            actions = _as_numpy_actions(self._predict_action_chunk(batch))
+        actions = actions[: self.num_actions]
         if actions.shape[1] != self.action_dim:
             raise RuntimeError(f"policy returned action dim {actions.shape[1]}, expected {self.action_dim}")
         elapsed_s = time.monotonic() - start
@@ -386,11 +461,11 @@ def main() -> int:
     parser.add_argument("--image-keys", default=json.dumps(list(DEFAULT_IMAGE_KEYS)))
     parser.add_argument("--state-key", default=DEFAULT_STATE_KEY)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--model-dtype", default="bfloat16", choices=("float32", "bfloat16", "float16"))
+    parser.add_argument("--model-dtype", default="float32", choices=("float32", "bfloat16", "float16"))
     parser.add_argument("--inference-action-mode", default="continuous", choices=("continuous", "discrete"))
     parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--enable-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--num-flow-timesteps", type=int, default=8)
+    parser.add_argument("--enable-cuda-graph", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--num-flow-timesteps", type=int, default=10)
     parser.add_argument("--num-actions", type=int, default=30)
     parser.add_argument("--action-dim", type=int, default=DEFAULT_ACTION_DIM)
     args = parser.parse_args()

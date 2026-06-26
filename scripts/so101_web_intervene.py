@@ -111,7 +111,7 @@ DEFAULT_CAMERA_CONFIGS = default_camera_configs(SEMANTIC_CAMERA_NAMES)
 
 
 def _load_policy_joint_offsets() -> np.ndarray:
-    raw = os.environ.get("SO101_POLICY_JOINT_OFFSETS_DEG", "[0,180,0,0,0,0]")
+    raw = os.environ.get("SO101_POLICY_JOINT_OFFSETS_DEG", "[0,0,0,0,0,0]")
     offsets = np.asarray(json.loads(raw), dtype=np.float32).reshape(-1)
     if offsets.shape != (len(JOINTS),):
         raise ValueError(f"SO101_POLICY_JOINT_OFFSETS_DEG must have {len(JOINTS)} values")
