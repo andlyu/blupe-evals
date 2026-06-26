@@ -65,7 +65,7 @@ def _safe_slug(value: str, fallback: str = "segment") -> str:
 
 def _timestamp(row: dict[str, Any]) -> float | None:
     try:
-        return float(row.get("timestamp_s"))
+        return float(row.get("timestamp_s", row.get("timestamp")))
     except (TypeError, ValueError):
         return None
 
@@ -305,7 +305,7 @@ def _copy_segment(
     for new_idx, sample in enumerate(selected_samples[:common_len]):
         source_ts = _timestamp(sample)
         new_sample = dict(sample)
-        new_sample["source_sample_idx"] = sample.get("sample_idx")
+        new_sample["source_sample_idx"] = sample.get("sample_idx", sample.get("index"))
         new_sample["source_timestamp_s"] = source_ts
         new_sample["source_wall_elapsed_s"] = sample.get("wall_elapsed_s")
         new_sample["source_monotonic_s"] = sample.get("monotonic_s")
@@ -320,10 +320,15 @@ def _copy_segment(
         source_frames_dir = str((camera_specs.get(camera) or {}).get("frames_dir") or camera)
         target_frames_dir = str((camera_specs.get(camera) or {}).get("frames_dir") or camera)
         for new_idx, frame_row in enumerate(rows[:common_len]):
-            frame_name = str(frame_row.get("frame") or "")
+            frame_name = str(frame_row.get("frame") or frame_row.get("path") or "")
             if not frame_name:
                 raise SystemExit(f"missing frame name for {camera} segment {segment['index']}")
-            source_frame = source_dir / source_frames_dir / frame_name
+            frame_path = Path(frame_name)
+            source_frame = (
+                source_dir / frame_path
+                if frame_path.parts and frame_path.parts[0] == source_frames_dir
+                else source_dir / source_frames_dir / frame_path.name
+            )
             if not source_frame.exists():
                 raise SystemExit(f"missing source frame: {source_frame}")
             target_name = f"frame_{new_idx:05d}{source_frame.suffix.lower() or '.jpg'}"
@@ -332,7 +337,7 @@ def _copy_segment(
             shutil.copy2(source_frame, target_frame)
             source_ts = _timestamp(frame_row)
             new_frame_row = dict(frame_row)
-            new_frame_row["source_frame_idx"] = frame_row.get("frame_idx")
+            new_frame_row["source_frame_idx"] = frame_row.get("frame_idx", frame_row.get("index"))
             new_frame_row["source_frame"] = frame_name
             new_frame_row["source_timestamp_s"] = source_ts
             new_frame_row["source_wall_elapsed_s"] = frame_row.get("wall_elapsed_s")

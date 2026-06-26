@@ -20,6 +20,19 @@ def test_dashboard_targets_station_hub_api_only():
 
 def test_dataset_editor_targets_station_hub_dataset_api_only():
     assert "LeLab Dataset Editor" in DATASET_EDITOR_HTML
+    assert 'id="sourceDatasetSelect"' in DATASET_EDITOR_HTML
+    assert 'id="datasetSelect"' in DATASET_EDITOR_HTML
+    assert 'id="defaultPrompt"' in DATASET_EDITOR_HTML
+    assert "async function loadDatasets()" in DATASET_EDITOR_HTML
+    assert "episode-mini-timeline" in DATASET_EDITOR_HTML
+    assert "function miniTimeline(ds)" in DATASET_EDITOR_HTML
+    assert "source_repo_id" in DATASET_EDITOR_HTML
+    assert "selectedSourceDataset()" in DATASET_EDITOR_HTML
+    assert "episode-panel" in DATASET_EDITOR_HTML
+    assert 'id="stats"' not in DATASET_EDITOR_HTML
+    assert DATASET_EDITOR_HTML.index("Add Output Episode") < DATASET_EDITOR_HTML.index('class="cams"')
+    assert DATASET_EDITOR_HTML.index("<th>Prompt</th>") > DATASET_EDITOR_HTML.index('class="cams"')
+    assert 'placeholder="Prompt for this output episode" onclick="event.stopPropagation()"' in DATASET_EDITOR_HTML
     assert "/api/stations/${encodeURIComponent(station)}/recordings" in DATASET_EDITOR_HTML
     assert "/api/stations/${encodeURIComponent(station)}/recording?name=" in DATASET_EDITOR_HTML
     assert "/api/stations/${encodeURIComponent(selectedStation())}/segments/save" in DATASET_EDITOR_HTML

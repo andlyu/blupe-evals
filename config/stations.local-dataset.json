@@ -1,0 +1,11 @@
+{
+  "stations": [
+    {
+      "id": "local-latest",
+      "name": "andlyu/so101-ball-cup-success",
+      "base_url": "http://127.0.0.1:8092",
+      "robot_type": "cached_lerobot_dataset",
+      "cameras": ["front", "side"]
+    }
+  ]
+}

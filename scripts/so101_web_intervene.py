@@ -50,6 +50,7 @@ DEFAULT_HZ = 30.0
 MOLMO_TIMEOUT_S = 75.0
 RECORD_ROOT = REPO_ROOT / "episodes"
 RAW_RECORD_ROOT = REPO_ROOT / "recordings"
+DEFAULT_LEROBOT_DATASET_ROOT = Path.home() / ".cache" / "huggingface" / "lerobot"
 DEFAULT_RECORD_DURATION_S = 120.0
 DEFAULT_RECORD_FPS = 30.0
 DEFAULT_EVAL_RUN_DURATION_S = 3600.0
@@ -761,6 +762,7 @@ class SO101Controller:
             "uncompressed_success_count": 0,
             "dataset_root": "",
             "repo_id": "",
+            "episodes_root": "",
             "upload": False,
             "uploaded": False,
             "private": False,
@@ -797,16 +799,17 @@ class SO101Controller:
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
 
-    def _dataset_episode_counts(self) -> dict[str, int]:
+    def _dataset_episode_counts(self, root: Path | None = None) -> dict[str, int]:
         counts = {
             "episode_count": 0,
             "success_count": 0,
             "failure_count": 0,
             "uncompressed_success_count": 0,
         }
-        if not RECORD_ROOT.exists():
+        root = root or RECORD_ROOT
+        if not root.exists():
             return counts
-        for path in RECORD_ROOT.iterdir():
+        for path in root.iterdir():
             if not path.is_dir() or not (path / "episode_meta.json").exists():
                 continue
             result = self._episode_json(path / "episode_result.json")
@@ -825,7 +828,9 @@ class SO101Controller:
 
     def _dataset_snapshot_locked(self) -> dict[str, Any]:
         data = dict(self.dataset_status)
-        data.update(self._dataset_episode_counts())
+        episodes_root = data.get("episodes_root")
+        root = Path(episodes_root) if episodes_root else RECORD_ROOT
+        data.update(self._dataset_episode_counts(root))
         data["running"] = self._dataset_running()
         return data
 
@@ -2218,7 +2223,13 @@ class SO101Controller:
         self.log("eval cleared")
         return self.status().get("eval", {})
 
-    def extract_busyboard_segments(self, source_name: str, segments: Any) -> dict[str, Any]:
+    def extract_busyboard_segments(
+        self,
+        source_name: str,
+        segments: Any,
+        cameras: list[str] | None = None,
+        output_dataset_name: str = "",
+    ) -> dict[str, Any]:
         if self._recording_running():
             raise RuntimeError("stop recording before extracting busyboard subepisodes")
         if self._eval_running() or self._motion_running():
@@ -2227,6 +2238,7 @@ class SO101Controller:
             raise ValueError("segments must be a non-empty list")
 
         source_dir = _safe_episode_dir((source_name or "latest").strip() or "latest")
+        output_root = RECORD_ROOT / _safe_dataset_name(output_dataset_name, fallback="edited-dataset")
         tmp_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile("w", suffix=".json", prefix="busyboard_segments_", delete=False) as f:
@@ -2238,10 +2250,14 @@ class SO101Controller:
                 "--source-dir",
                 str(source_dir),
                 "--output-root",
-                str(RECORD_ROOT),
+                str(output_root),
                 "--segments-json",
                 str(tmp_path),
             ]
+            for camera in cameras or []:
+                camera = str(camera).strip()
+                if camera:
+                    cmd.extend(["--camera", camera])
             proc = subprocess.run(
                 cmd,
                 cwd=str(REPO_ROOT),
@@ -2271,27 +2287,30 @@ class SO101Controller:
         repo_id: str = "",
         dataset_name: str = "",
         root: str = "",
+        episodes_root_name: str = "",
         upload: bool = False,
         private: bool = False,
         include_failures: bool = False,
+        overwrite: bool = False,
     ) -> dict[str, Any]:
         if self._dataset_running():
             raise RuntimeError("dataset compression is already running")
         if self._eval_running() or self._motion_running() or self._recording_running():
             raise RuntimeError("stop eval/recording before compressing episodes")
 
-        counts = self._dataset_episode_counts()
-        if counts["uncompressed_success_count"] < 1 and not include_failures:
-            raise RuntimeError("no uncompressed successful episodes to compress")
-
         repo_id = repo_id.strip()
         dataset_name = dataset_name.strip()
         root = root.strip()
+        episodes_root = RECORD_ROOT / _safe_dataset_name(episodes_root_name) if episodes_root_name.strip() else RECORD_ROOT
+        counts = self._dataset_episode_counts(episodes_root)
+        if counts["uncompressed_success_count"] < 1 and not include_failures:
+            raise RuntimeError("no uncompressed successful episodes to compress")
+
         cmd = [
             sys.executable,
             str(REPO_ROOT / "scripts" / "compress_so101_episodes.py"),
             "--episodes-root",
-            str(RECORD_ROOT),
+            str(episodes_root),
         ]
         if repo_id:
             cmd.extend(["--repo-id", repo_id])
@@ -2305,6 +2324,8 @@ class SO101Controller:
             cmd.append("--private")
         if include_failures:
             cmd.append("--include-failures")
+        if overwrite:
+            cmd.append("--overwrite")
 
         with self.status_lock:
             self.dataset_status = self._new_dataset_status()
@@ -2315,8 +2336,10 @@ class SO101Controller:
                     "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     "repo_id": repo_id,
                     "dataset_root": root,
+                    "episodes_root": str(episodes_root),
                     "upload": bool(upload),
                     "private": bool(private),
+                    "overwrite": bool(overwrite),
                     **counts,
                 }
             )
@@ -2361,8 +2384,9 @@ class SO101Controller:
                 error = f"compression command failed exit={returncode}"
         except BaseException as exc:
             error = str(exc)
-        counts = self._dataset_episode_counts()
         with self.status_lock:
+            episodes_root = self.dataset_status.get("episodes_root")
+            counts = self._dataset_episode_counts(Path(episodes_root) if episodes_root else RECORD_ROOT)
             self.dataset_status.update(
                 {
                     "running": False,
@@ -4210,41 +4234,71 @@ EPISODE_VIEWER_HTML = r"""<!doctype html>
 <title>SO101 Dataset Editor</title>
 <style>
 :root { color-scheme: dark; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
-body { margin:0; background:#111; color:#eee; }
-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; border-bottom:1px solid #333; }
+body { margin:0; background:#101214; color:#f1f3f4; }
+header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; border-bottom:1px solid #2d3338; background:#15181b; }
 h1 { margin:0; font-size:18px; }
 a { color:#9ecbff; }
-main { padding:14px; display:grid; gap:12px; }
-.panel { border:1px solid #333; border-radius:6px; background:#1b1b1b; padding:12px; }
+main { padding:14px; display:grid; gap:12px; grid-template-columns:minmax(0, 1fr) 260px; align-items:start; }
+.editor-main { display:grid; gap:12px; min-width:0; }
+.episode-panel { position:sticky; top:12px; max-height:calc(100vh - 88px); overflow:auto; }
+.panel { border:1px solid #30363d; border-radius:6px; background:#171b1f; padding:12px; }
 .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 label { color:#bbb; font-size:13px; }
-select, input, button { font:inherit; background:#111; color:#eee; border:1px solid #444; border-radius:5px; padding:7px; }
+select, input, button, textarea { font:inherit; background:#1b2025; color:#f1f3f4; border:1px solid #3a424a; border-radius:5px; padding:7px 9px; }
 button { background:#333; color:#fff; border-color:#555; cursor:pointer; padding:8px 10px; }
 button.primary { background:#1f6feb; border-color:#2f81f7; }
 button:disabled { opacity:.45; cursor:not-allowed; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.cams { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap:12px; }
-.cam { display:grid; gap:6px; min-width:0; }
-.cam img { width:100%; aspect-ratio:4 / 3; object-fit:contain; background:#000; border:1px solid #333; border-radius:6px; }
-.cam span { color:#aaa; font-size:12px; }
-.stats { display:grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap:8px; }
-.stat { background:#0b0b0b; border:1px solid #333; border-radius:5px; padding:8px; min-height:34px; }
-.stat span { display:block; color:#aaa; font-size:11px; margin-bottom:3px; }
-.stat b { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.sample { display:grid; grid-template-columns: 120px 1fr; gap:6px 10px; font-size:13px; overflow:auto; }
-.sample div:nth-child(odd) { color:#aaa; }
+.cams { display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:8px; }
+.cam { display:grid; gap:5px; min-width:0; }
+.cam img { width:100%; max-height:210px; aspect-ratio:4 / 3; object-fit:contain; background:#050607; border:1px solid #30363d; border-radius:5px; }
+.cam span { display:none; }
 #frameSlider { flex:1 1 360px; min-width:180px; }
 table { width:100%; border-collapse:collapse; font-size:13px; }
 th, td { border-bottom:1px solid #303030; padding:6px; text-align:left; vertical-align:top; }
 th { color:#aaa; font-weight:600; }
 td input, td select { width:100%; box-sizing:border-box; }
-td textarea { width:100%; min-height:38px; box-sizing:border-box; font:inherit; background:#111; color:#eee; border:1px solid #444; border-radius:5px; padding:7px; }
+td textarea { width:100%; min-height:38px; box-sizing:border-box; }
+tr.selected { background:#13233a; outline:1px solid #2f81f7; }
+tr.active:not(.selected) { background:#1d2630; }
+tr.other-source { background:#13171b; }
+tr.other-source td { color:#c5ced8; }
 .compact { width:72px; }
 .status { color:#aaa; min-height:20px; }
+.status.ok { color:#9ee493; }
+.status.warn { color:#ffd166; }
+.status.error { color:#ffb4b4; }
+.progress-shell { width:min(520px, 100%); height:12px; border:1px solid #30363d; border-radius:5px; background:#0f1215; overflow:hidden; }
+.progress-fill { height:100%; width:0%; background:#2f81f7; transition:width .2s ease; }
+.progress-fill.ok { background:#2ea043; }
+.progress-fill.error { background:#da3633; }
+.segment-meta { color:#9aa4af; font-size:12px; margin-top:4px; }
+.draft-grid { display:grid; grid-template-columns:minmax(150px, 1.2fr) 92px 92px minmax(180px, 2fr) 110px 120px minmax(140px, 1.5fr) minmax(160px, 1.4fr) auto auto; gap:8px; align-items:end; }
+.draft-grid label { display:grid; gap:4px; }
+.draft-grid input, .draft-grid select { width:100%; box-sizing:border-box; }
+.draft-source { color:#f1f3f4; border:1px solid #30363d; border-radius:5px; padding:8px 9px; min-height:20px; background:#0f1215; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.timeline { position:relative; flex:1 1 360px; min-width:180px; height:18px; border:1px solid #30363d; border-radius:5px; background:#0f1215; overflow:hidden; }
+.timeline-empty { color:#9aa4af; font-size:12px; line-height:18px; padding-left:7px; }
+.timeline-segment { position:absolute; top:3px; height:10px; min-width:3px; border-radius:3px; background:#2ea043; opacity:.82; cursor:pointer; }
+.timeline-segment.selected { background:#9ee493; opacity:1; }
+.timeline-segment.active { outline:1px solid #ffd166; }
+.timeline-pending { position:absolute; top:3px; height:10px; min-width:3px; border-radius:3px; background:#ffd166; opacity:.9; }
+.timeline-cursor { position:absolute; top:0; bottom:0; width:2px; background:#ffdf7e; pointer-events:none; }
+.camera-picker { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.camera-picker label { background:#0f1215; border:1px solid #30363d; border-radius:5px; padding:5px 7px; }
+.episode-list { display:grid; grid-template-columns:1fr; gap:8px; }
+.episode-button { text-align:left; min-height:52px; }
+.episode-button.active { border-color:#9ee493; background:#17351f; }
+.episode-button span { display:block; color:#9aa4af; font-size:11px; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.episode-mini-timeline { position:relative; height:8px; margin-top:8px; border-radius:3px; background:#0f1215; overflow:hidden; border:1px solid #30363d; }
+.episode-mini-segment { position:absolute; top:0; bottom:0; min-width:3px; background:#2ea043; }
+.episode-output-list { display:grid; gap:3px; margin-top:7px; color:#d7e1ea; font-size:11px; }
+.episode-output-item { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 @media (max-width: 900px) {
+  main { grid-template-columns:1fr; }
+  .episode-panel { position:static; max-height:none; }
+  .draft-grid { grid-template-columns:1fr 1fr; }
   .cams { grid-template-columns:1fr; }
-  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .sample { grid-template-columns:1fr; }
 }
 </style>
 </head>
@@ -4254,43 +4308,74 @@ td textarea { width:100%; min-height:38px; box-sizing:border-box; font:inherit; 
   <a href="/">Back to control UI</a>
 </header>
 <main>
+  <div class="editor-main">
   <section class="panel">
     <div class="row">
-      <label>Episode <select id="episodeSelect"></select></label>
+      <label>Dataset repo <input id="datasetRepoInput" type="text" placeholder="andlyu/move_blue_ball_20260625_012617" style="min-width:310px"></label>
+      <button onclick="loadDatasetRepo()">Load Dataset</button>
+      <button class="primary" onclick="downloadDatasetForEditing()">Download for Editing</button>
+      <label>Local Dataset <select id="sourceDatasetSelect"></select></label>
+      <label style="display:none">Episode <select id="episodeSelect"></select></label>
       <button onclick="loadEpisodes()">Refresh</button>
-      <button id="prevButton" onclick="stepFrame(-1)">Prev</button>
       <button id="playButton" class="primary" onclick="togglePlay()">Play</button>
-      <button id="nextButton" onclick="stepFrame(1)">Next</button>
       <button onclick="markStart()">Mark Start</button>
       <button onclick="markEnd()">Mark End</button>
       <label>Frame <input id="frameNumber" type="number" min="0" value="0" style="width:84px"></label>
       <input id="frameSlider" type="range" min="0" max="0" value="0">
+      <div class="timeline" id="segmentTimeline"></div>
+      <div class="status mono" id="datasetStatus"></div>
     </div>
   </section>
-  <section class="stats mono" id="stats"></section>
+  <section class="panel">
+    <div class="draft-grid">
+      <label>Draft source <div class="draft-source mono" id="draftSource">-</div></label>
+      <label>Start <input id="draftStart" type="number" step="0.001" oninput="updatePendingStart(this.value)"></label>
+      <label>End <input id="draftEnd" type="number" step="0.001" oninput="updatePendingEnd(this.value)"></label>
+      <label>Prompt <input id="draftPrompt" type="text" placeholder="Prompt for this output episode"></label>
+      <label>Outcome <select id="draftOutcome"><option value="success">success</option><option value="failure">failure</option></select></label>
+      <label>Type <select id="draftType"><option value="teleop">teleop</option><option value="intervention">intervention</option></select></label>
+      <label>Notes <input id="draftNotes" type="text" placeholder="Optional"></label>
+      <label>Camera Views <div class="camera-picker mono" id="draftCameraPicker"></div></label>
+      <button class="primary" onclick="addSegment(event)">Add Output Episode</button>
+      <button onclick="clearDraft()">Clear</button>
+    </div>
+    <div class="status mono" id="manifestStatus" style="margin-top:8px"></div>
+  </section>
   <section class="cams" id="cams"></section>
   <section class="panel">
-    <div class="row" style="justify-content:space-between">
-      <div class="row">
-        <button onclick="addSegment()">Add Segment</button>
-        <button onclick="loadManifest()">Load Manifest</button>
-        <button onclick="saveManifest()">Save Manifest</button>
-        <button class="primary" onclick="exportSegments()">Export Episodes</button>
-      </div>
-      <div class="status mono" id="manifestStatus"></div>
-    </div>
     <div style="overflow:auto; margin-top:10px">
       <table>
         <thead>
-          <tr><th>Start</th><th>End</th><th>Task</th><th>Outcome</th><th>Type</th><th>Notes</th><th></th></tr>
+          <tr><th>Dataset / Episode</th><th>Start</th><th>End</th><th>Prompt</th><th>Outcome</th><th>Type</th><th>Notes</th><th>Camera_Views</th><th></th></tr>
         </thead>
         <tbody id="segmentsBody"></tbody>
       </table>
     </div>
   </section>
   <section class="panel">
-    <div class="sample mono" id="sample"></div>
+    <div class="row" style="justify-content:space-between">
+      <div class="row">
+        <label>New Dataset Name <input id="outputDatasetName" type="text" placeholder="move-blue-ball-edited" style="min-width:220px"></label>
+        <label>HF Repo <input id="outputRepoId" type="text" placeholder="andlyu/move-blue-ball-edited" style="min-width:240px"></label>
+        <label><input id="encodeAfterExport" type="checkbox"> Encode + upload</label>
+        <button onclick="loadManifest()">Load Manifest</button>
+        <button onclick="saveManifest()">Save Manifest</button>
+        <button class="primary" onclick="exportSegments()">Export Episodes</button>
+      </div>
+      <div class="row">
+        <div class="progress-shell"><div class="progress-fill" id="exportProgressFill"></div></div>
+        <div class="status mono" id="exportStatus"></div>
+      </div>
+    </div>
   </section>
+  <section class="panel" style="display:none">
+    <div class="mono" id="sample"></div>
+    <div class="mono" id="stats"></div>
+  </section>
+  </div>
+  <aside class="panel episode-panel">
+    <div class="episode-list" id="episodeList"></div>
+  </aside>
 </main>
 <script>
 let episodes = [];
@@ -4298,6 +4383,13 @@ let episode = null;
 let frameIdx = 0;
 let playTimer = null;
 let segments = [];
+let selectedSegmentIdx = -1;
+let dirty = false;
+let segmentDrafts = {};
+let lastAddSegmentAtMs = 0;
+let pendingStartS = null;
+let pendingEndS = null;
+let outputRepoUserEdited = false;
 
 async function api(path) {
   const res = await fetch(path);
@@ -4321,33 +4413,350 @@ function timestampFor(idx) {
 function queryEpisodeName() {
   return new URLSearchParams(location.search).get('episode') || '';
 }
+function sourceKey(ep) {
+  return ep?.source_repo_id || ep?.dataset_repo_id || (ep?.name || '').replace(/_ep\d+$/, '') || 'local recordings';
+}
+function defaultPrompt() {
+  return document.getElementById('defaultPrompt')?.value.trim() || '';
+}
+function currentTimeS() {
+  return Number(timestampFor(frameIdx).toFixed(3));
+}
+function segmentLabel(idx) {
+  return idx >= 0 ? `episode ${idx + 1}` : 'no output episode selected';
+}
+function durationLabel(seg) {
+  if (!seg) return '-';
+  return `${Math.max(0, Number(seg.end_s || 0) - Number(seg.start_s || 0)).toFixed(3)}s`;
+}
+function activeSegmentIndex() {
+  const t = currentTimeS();
+  return segments.findIndex(seg => Number(seg.start_s) <= t && t <= Number(seg.end_s));
+}
+function setStatus(message, cls = '') {
+  const el = document.getElementById('manifestStatus');
+  if (!el) return;
+  el.className = `status mono ${cls}`;
+  el.textContent = message;
+}
+function cloneSegments(value) {
+  return (Array.isArray(value) ? value : []).map(seg => ({...seg, cameras: Array.isArray(seg.cameras) ? [...seg.cameras] : seg.cameras}));
+}
+function currentEpisodeName() {
+  return episode?.name || document.getElementById('episodeSelect')?.value || '';
+}
+function persistDraftFor(name, nextSegments = segments, nextDirty = dirty) {
+  if (!name) return;
+  segmentDrafts[name] = {segments: cloneSegments(nextSegments), dirty: Boolean(nextDirty)};
+  const ep = episodes.find(item => item.name === name);
+  if (ep) ep.segments = cloneSegments(nextSegments);
+}
+function persistCurrentDraft() {
+  persistDraftFor(currentEpisodeName());
+}
+function datasetRepoInput() {
+  return document.getElementById('datasetRepoInput')?.value.trim() || '';
+}
+function setDatasetStatus(message, cls = '') {
+  const el = document.getElementById('datasetStatus');
+  if (!el) return;
+  el.className = `status mono ${cls}`;
+  el.textContent = message;
+}
 async function loadEpisodes() {
   const data = await api('/api/episodes');
   episodes = data.episodes || [];
+  await renderSourcePicker();
+}
+async function renderSourcePicker() {
+  const sources = [...new Map(episodes.map(ep => [sourceKey(ep), sourceKey(ep)])).values()];
+  const sourceSelect = document.getElementById('sourceDatasetSelect');
+  const requestedRepo = datasetRepoInput();
+  const previous = sourceSelect.value || new URLSearchParams(location.search).get('source') || requestedRepo || sources[0] || '';
+  sourceSelect.innerHTML = sources.map(source => `<option value="${escapeHtml(source)}">${escapeHtml(source)}</option>`).join('');
+  if (previous && sources.includes(previous)) sourceSelect.value = previous;
+  await renderEpisodePicker();
+}
+async function loadDatasetRepo() {
+  const repo = datasetRepoInput();
+  if (!repo) {
+    setDatasetStatus('enter a dataset repo id', 'warn');
+    return;
+  }
+  await loadEpisodes();
+  const sourceSelect = document.getElementById('sourceDatasetSelect');
+  const sources = [...sourceSelect.options].map(option => option.value);
+  if (!sources.includes(repo)) {
+    setDatasetStatus(`${repo} is not downloaded for editing yet`, 'warn');
+    return;
+  }
+  sourceSelect.value = repo;
+  await renderEpisodePicker();
+  setDatasetStatus(`loaded local dataset ${repo}`, 'ok');
+}
+async function downloadDatasetForEditing() {
+  const repo = datasetRepoInput();
+  if (!repo) {
+    setDatasetStatus('enter a dataset repo id', 'warn');
+    return;
+  }
+  setDatasetStatus(`downloading ${repo} for editing...`, 'warn');
+  try {
+    const data = await postJson('/api/datasets/download', {repo_id: repo});
+    setDatasetStatus(`${data.status || 'ready'}: ${repo}`, 'ok');
+    await loadEpisodes();
+    const sourceSelect = document.getElementById('sourceDatasetSelect');
+    if ([...sourceSelect.options].some(option => option.value === repo)) {
+      sourceSelect.value = repo;
+      await renderEpisodePicker();
+    }
+  } catch (err) {
+    setDatasetStatus(err.message, 'error');
+  }
+}
+async function renderEpisodePicker() {
+  const activeSource = document.getElementById('sourceDatasetSelect')?.value || '';
+  const visible = visibleEpisodes();
+  visible.forEach((ep, idx) => ep.label = `Episode ${idx + 1}`);
+  ensureOutputDatasetName();
   const select = document.getElementById('episodeSelect');
-  const selected = select.value || queryEpisodeName() || episodes[0]?.name || '';
-  select.innerHTML = episodes.map(ep => `<option value="${escapeHtml(ep.name)}">${escapeHtml(ep.name)}</option>`).join('');
-  if (selected && episodes.some(ep => ep.name === selected)) select.value = selected;
+  const selected = select.value || queryEpisodeName() || visible[0]?.name || '';
+  select.innerHTML = visible.map(ep => `<option value="${escapeHtml(ep.name)}">${escapeHtml(ep.label)}</option>`).join('');
+  if (selected && visible.some(ep => ep.name === selected)) select.value = selected;
   if (select.value) await loadEpisode(select.value);
+  renderEpisodeList();
+}
+function episodeDuration(ep) {
+  return Number(ep?.duration_s || ep?.meta?.duration_s || ep?.result?.duration_s || 0);
+}
+function visibleEpisodes() {
+  const activeSource = document.getElementById('sourceDatasetSelect')?.value || '';
+  return episodes.filter(ep => sourceKey(ep) === activeSource);
+}
+function cameraNamesForEpisode(ep) {
+  const fromMeta = Array.isArray(ep?.cameras) ? ep.cameras : [];
+  if (fromMeta.length) return fromMeta.map(cam => cam.name).filter(Boolean);
+  if (ep?.frames && typeof ep.frames === 'object') return Object.keys(ep.frames);
+  return [];
+}
+function segmentCameraNames(seg, ep = episode) {
+  const available = cameraNamesForEpisode(ep);
+  const selected = Array.isArray(seg?.cameras) ? seg.cameras.filter(name => available.includes(name)) : [];
+  return selected.length ? selected : available;
+}
+function episodeSegments(ep) {
+  const draft = segmentDrafts[ep.name];
+  if (ep.name === episode?.name) return segments;
+  return draft?.segments || ep.manifest?.segments || ep.segments || [];
+}
+function outputRows() {
+  return visibleEpisodes().flatMap((ep, epIdx) => {
+    const ranges = episodeSegments(ep);
+    return ranges.map((seg, segmentIdx) => ({ep, epIdx, seg, segmentIdx}));
+  });
+}
+function shortDatasetLabel(ep) {
+  const source = sourceKey(ep);
+  return source.includes('/') ? source.split('/').pop() : source;
+}
+function slugify(value, fallback = '') {
+  const slug = String(value || '').trim().replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/-+/g, '-').replace(/^[-_.]+|[-_.]+$/g, '');
+  return slug || fallback;
+}
+function defaultOutputDatasetName() {
+  const activeSource = document.getElementById('sourceDatasetSelect')?.value || '';
+  return slugify(`${activeSource.split('/').pop() || 'dataset'}-edited`, 'edited-dataset');
+}
+function defaultOutputRepoId() {
+  const activeSource = document.getElementById('sourceDatasetSelect')?.value || '';
+  const namespace = activeSource.includes('/') ? activeSource.split('/')[0] : 'andlyu';
+  return `${namespace}/${slugify(document.getElementById('outputDatasetName')?.value || defaultOutputDatasetName(), 'edited-dataset')}`;
+}
+function ensureOutputDatasetName() {
+  const el = document.getElementById('outputDatasetName');
+  if (el && !el.value.trim()) el.value = defaultOutputDatasetName();
+  const repo = document.getElementById('outputRepoId');
+  if (repo && !repo.value.trim()) repo.value = defaultOutputRepoId();
+}
+function setExportProgress(percent, message, cls = '') {
+  const fill = document.getElementById('exportProgressFill');
+  if (fill) {
+    fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+    fill.className = `progress-fill ${cls}`;
+  }
+  const status = document.getElementById('exportStatus');
+  if (status) {
+    status.className = `status mono ${cls}`;
+    status.textContent = message;
+  }
+}
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+function setDraftValue(id, value) {
+  const el = document.getElementById(id);
+  if (!el || document.activeElement === el) return;
+  el.value = value;
+}
+function draftStartValue() {
+  if (pendingStartS !== null) return Number(pendingStartS);
+  return currentTimeS();
+}
+function draftEndValue() {
+  if (pendingEndS !== null) return Number(pendingEndS);
+  return Number((draftStartValue() + 5).toFixed(3));
+}
+function ensureDraftPrompt() {
+  const prompt = document.getElementById('draftPrompt');
+  if (prompt && !prompt.value.trim()) {
+    prompt.value = episode?.meta?.task || episode?.task || '';
+  }
+}
+function renderDraftExtraction() {
+  const source = document.getElementById('draftSource');
+  if (source) {
+    const epIdx = visibleEpisodes().findIndex(ep => ep.name === episode?.name);
+    const epLabel = epIdx >= 0 ? `Episode ${epIdx + 1}` : 'Episode -';
+    source.textContent = episode ? `DS: ${shortDatasetLabel(episode)} EP: ${epLabel}` : '-';
+    source.title = episode ? sourceKey(episode) : '';
+  }
+  ensureDraftPrompt();
+  renderDraftCameraPicker();
+  setDraftValue('draftStart', draftStartValue().toFixed(3));
+  setDraftValue('draftEnd', draftEndValue().toFixed(3));
+}
+function renderDraftCameraPicker() {
+  const el = document.getElementById('draftCameraPicker');
+  if (!el) return;
+  const previous = [...document.querySelectorAll('input[name="draftCamera"]:checked')].map(input => input.value);
+  const previousSet = new Set(previous);
+  el.innerHTML = cameraList().map(cam => `
+    <label title="Include ${escapeHtml(cam.name)} in this output episode">
+      <input type="checkbox" name="draftCamera" value="${escapeHtml(cam.name)}" ${!previous.length || previousSet.has(cam.name) ? 'checked' : ''}>
+      ${escapeHtml(cam.name)}
+    </label>
+  `).join('');
+}
+function selectedDraftCameraNames() {
+  const checked = [...document.querySelectorAll('input[name="draftCamera"]:checked')].map(input => input.value);
+  return checked.length ? checked : cameraList().map(cam => cam.name);
+}
+function updatePendingStart(value) {
+  const next = Number(value);
+  pendingStartS = Number.isFinite(next) ? next : null;
+  renderTimeline();
+}
+function updatePendingEnd(value) {
+  const next = Number(value);
+  pendingEndS = Number.isFinite(next) ? next : null;
+  renderTimeline();
+}
+function draftSegment() {
+  const start = draftStartValue();
+  const end = draftEndValue();
+  const prompt = document.getElementById('draftPrompt')?.value.trim() || episode?.meta?.task || episode?.task || '';
+  const outcome = document.getElementById('draftOutcome')?.value || 'success';
+  const type = document.getElementById('draftType')?.value || 'teleop';
+  const notes = document.getElementById('draftNotes')?.value || '';
+  return {
+    start_s: Number(Math.min(start, end).toFixed(3)),
+    end_s: Number(Math.max(start, end).toFixed(3)),
+    task: prompt,
+    outcome,
+    type,
+    notes,
+    cameras: selectedDraftCameraNames(),
+  };
+}
+function clearDraft() {
+  pendingStartS = null;
+  pendingEndS = null;
+  const notes = document.getElementById('draftNotes');
+  if (notes) notes.value = '';
+  renderDraftExtraction();
+  renderTimeline();
+  setStatus('cleared draft extraction', '');
+}
+function miniTimeline(ep) {
+  const ranges = episodeSegments(ep);
+  const maxEnd = Math.max(0, ...ranges.map(seg => Number(seg.end_s || 0)));
+  const total = Math.max(0.001, episodeDuration(ep) || maxEnd || 1);
+  const bars = ranges.map(seg => {
+    const start = Math.max(0, Math.min(100, Number(seg.start_s || 0) / total * 100));
+    const end = Math.max(start, Math.min(100, Number(seg.end_s || 0) / total * 100));
+    const width = Math.max(0.5, end - start);
+    const title = `${Number(seg.start_s || 0).toFixed(3)}-${Number(seg.end_s || 0).toFixed(3)}s`;
+    return `<div class="episode-mini-segment" title="${escapeHtml(title)}" style="left:${start}%;width:${width}%"></div>`;
+  }).join('');
+  return `<div class="episode-mini-timeline">${bars}</div>`;
+}
+function episodeOutputSummary(ep) {
+  const ranges = episodeSegments(ep);
+  if (!ranges.length) return '';
+  const items = ranges.slice(0, 3).map((seg, idx) => {
+    const label = `Output ${idx + 1}: ${Number(seg.start_s || 0).toFixed(3)}-${Number(seg.end_s || 0).toFixed(3)}s`;
+    const prompt = seg.task ? ` ${seg.task}` : '';
+    return `<div class="episode-output-item" title="${escapeHtml(label + prompt)}">${escapeHtml(label + prompt)}</div>`;
+  }).join('');
+  const more = ranges.length > 3 ? `<div class="episode-output-item">+${ranges.length - 3} more</div>` : '';
+  return `<div class="episode-output-list">${items}${more}</div>`;
+}
+function renderEpisodeList() {
+  const el = document.getElementById('episodeList');
+  if (!el) return;
+  const visible = visibleEpisodes();
+  const current = document.getElementById('episodeSelect')?.value || '';
+  el.innerHTML = visible.map((ep, idx) => {
+    const active = ep.name === current ? 'active' : '';
+    const label = ep.label || `Episode ${idx + 1}`;
+    return `<button class="episode-button ${active}" value="${escapeHtml(ep.name)}" title="${escapeHtml(ep.name)}" onclick="selectEpisode(this.value)">
+      ${escapeHtml(label)}
+      ${ep.task ? `<span>${escapeHtml(ep.task)}</span>` : ''}
+      ${miniTimeline(ep)}
+      ${episodeOutputSummary(ep)}
+    </button>`;
+  }).join('');
+}
+function selectEpisode(name) {
+  const previousName = episode?.name || '';
+  persistDraftFor(previousName);
+  document.getElementById('episodeSelect').value = name;
+  loadEpisode(name);
 }
 async function loadEpisode(name) {
+  const previousName = episode?.name || '';
+  if (previousName && previousName !== name) persistDraftFor(previousName);
   episode = await api(`/api/episode?name=${encodeURIComponent(name)}`);
   history.replaceState(null, '', `/episodes?episode=${encodeURIComponent(name)}`);
+  const select = document.getElementById('episodeSelect');
+  if (select && select.value !== name) select.value = name;
   frameIdx = 0;
-  segments = (episode.manifest?.segments || []).map(seg => ({...seg}));
+  pendingStartS = null;
+  pendingEndS = null;
+  selectedSegmentIdx = -1;
+  const draft = segmentDrafts[name];
+  segments = draft ? cloneSegments(draft.segments) : cloneSegments(episode.manifest?.segments);
+  dirty = Boolean(draft?.dirty);
   const maxIdx = Math.max(0, Number(episode.length || 0) - 1);
   const slider = document.getElementById('frameSlider');
   const num = document.getElementById('frameNumber');
   slider.max = maxIdx;
   num.max = maxIdx;
+  renderCameraPicker();
+  renderDraftExtraction();
   renderCameras();
   renderSegments();
   renderFrame(0);
+  renderEpisodeList();
+  setStatus(`loaded ${episode.name}`, segments.length ? '' : 'warn');
 }
 function cameraList() {
   const fromMeta = Array.isArray(episode?.cameras) ? episode.cameras : [];
   if (fromMeta.length) return fromMeta.map(cam => ({name: cam.name, frames_dir: cam.frames_dir || cam.name}));
   return Object.keys(episode?.frames || {}).map(name => ({name, frames_dir: name}));
+}
+function renderCameraPicker() {
+  renderDraftCameraPicker();
 }
 function renderCameras() {
   const cams = document.getElementById('cams');
@@ -4363,11 +4772,19 @@ function frameFor(camera, idx) {
   if (!frames.length) return null;
   return frames[Math.max(0, Math.min(idx, frames.length - 1))];
 }
+function frameRef(frame, fallbackIdx) {
+  if (!frame) return '';
+  if (frame.frame !== undefined && frame.frame !== null && String(frame.frame) !== '') return String(frame.frame);
+  if (frame.index !== undefined && frame.index !== null && String(frame.index) !== '') return String(frame.index);
+  if (frame.path) return String(fallbackIdx);
+  return String(fallbackIdx);
+}
 function renderFrame(idx) {
   if (!episode) return;
   frameIdx = Math.max(0, Math.min(idx, Math.max(0, Number(episode.length || 0) - 1)));
   document.getElementById('frameSlider').value = frameIdx;
   document.getElementById('frameNumber').value = frameIdx;
+  renderDraftExtraction();
   for (const cam of cameraList()) {
     const camera = cam.name;
     const frame = frameFor(camera, frameIdx);
@@ -4375,8 +4792,9 @@ function renderFrame(idx) {
     const info = document.getElementById(`camera-${camera}-info`);
     if (!img || !info) continue;
     if (frame) {
-      img.src = `/episode_frame?name=${encodeURIComponent(episode.name)}&camera=${encodeURIComponent(camera)}&frame=${encodeURIComponent(frame.frame)}`;
-      info.textContent = `${camera} ${frame.frame} t=${frame.timestamp_s ?? '-'}s`;
+      const ref = frameRef(frame, frameIdx);
+      img.src = `/episode_frame?name=${encodeURIComponent(episode.name)}&camera=${encodeURIComponent(camera)}&frame=${encodeURIComponent(ref)}`;
+      info.textContent = `${camera} ${ref} t=${frame.timestamp_s ?? frame.timestamp ?? '-'}s`;
     } else {
       img.removeAttribute('src');
       info.textContent = `${camera} no frame`;
@@ -4392,6 +4810,8 @@ function renderFrame(idx) {
     '<div>error</div>', `<div>${escapeHtml(sample.error || '-')}</div>`,
   ].join('');
   renderStats();
+  renderSegments();
+  renderTimeline();
 }
 function renderStats() {
   const meta = episode?.meta || {};
@@ -4410,49 +4830,196 @@ function renderStats() {
 }
 function renderSegments() {
   const body = document.getElementById('segmentsBody');
-  body.innerHTML = segments.map((seg, idx) => `
-    <tr>
-      <td><input class="compact" type="number" step="0.001" value="${Number(seg.start_s || 0)}" onchange="updateSegment(${idx}, 'start_s', this.value)"></td>
-      <td><input class="compact" type="number" step="0.001" value="${Number(seg.end_s || 0)}" onchange="updateSegment(${idx}, 'end_s', this.value)"></td>
-      <td><input value="${escapeHtml(seg.task || '')}" onchange="updateSegment(${idx}, 'task', this.value)"></td>
-      <td><select onchange="updateSegment(${idx}, 'outcome', this.value)">
+  const activeIdx = activeSegmentIndex();
+  const rows = outputRows();
+  body.innerHTML = rows.map(({ep, epIdx, seg, segmentIdx}) => {
+    const isCurrent = ep.name === episode?.name;
+    const isSelected = isCurrent && segmentIdx === selectedSegmentIdx;
+    const isActive = isCurrent && segmentIdx === activeIdx;
+    const sourceLabel = ep.label || `Episode ${epIdx + 1}`;
+    const rowClick = isCurrent ? `selectSegment(${segmentIdx})` : `selectOutputEpisode('${escapeJs(ep.name)}', ${segmentIdx})`;
+    const readOnly = isCurrent ? '' : 'disabled';
+    const sourceSummary = `DS: ${shortDatasetLabel(ep)} EP: ${sourceLabel}`;
+    return `
+    <tr class="${isSelected ? 'selected' : ''} ${isActive ? 'active' : ''} ${isCurrent ? '' : 'other-source'}" onclick="${rowClick}">
+      <td><button title="${escapeHtml(sourceKey(ep))}" onclick="event.stopPropagation(); selectOutputEpisode('${escapeJs(ep.name)}', ${segmentIdx})">${escapeHtml(sourceSummary)}</button></td>
+      <td><input class="compact" type="number" step="0.001" value="${Number(seg.start_s || 0)}" ${readOnly} onclick="event.stopPropagation()" oninput="updateSegment(${segmentIdx}, 'start_s', this.value)"></td>
+      <td><input class="compact" type="number" step="0.001" value="${Number(seg.end_s || 0)}" ${readOnly} onclick="event.stopPropagation()" oninput="updateSegment(${segmentIdx}, 'end_s', this.value)"></td>
+      <td><input value="${escapeHtml(seg.task || '')}" placeholder="Prompt for this output episode" ${readOnly} onclick="event.stopPropagation()" oninput="updateSegment(${segmentIdx}, 'task', this.value)"></td>
+      <td><select ${readOnly} onclick="event.stopPropagation()" oninput="updateSegment(${segmentIdx}, 'outcome', this.value)">
         <option value="success" ${seg.outcome === 'success' ? 'selected' : ''}>success</option>
         <option value="failure" ${seg.outcome === 'failure' ? 'selected' : ''}>failure</option>
       </select></td>
-      <td><select onchange="updateSegment(${idx}, 'type', this.value)">
+      <td><select ${readOnly} onclick="event.stopPropagation()" oninput="updateSegment(${segmentIdx}, 'type', this.value)">
         <option value="teleop" ${seg.type !== 'intervention' ? 'selected' : ''}>teleop</option>
         <option value="intervention" ${seg.type === 'intervention' ? 'selected' : ''}>intervention</option>
       </select></td>
-      <td><textarea onchange="updateSegment(${idx}, 'notes', this.value)">${escapeHtml(seg.notes || '')}</textarea></td>
-      <td><button onclick="removeSegment(${idx})">Remove</button></td>
+      <td><textarea ${readOnly} onclick="event.stopPropagation()" oninput="updateSegment(${segmentIdx}, 'notes', this.value)">${escapeHtml(seg.notes || '')}</textarea><div class="segment-meta mono">${durationLabel(seg)} ${isActive ? 'active at current frame' : ''}</div></td>
+      <td>${renderSegmentCameraControls(ep, segmentIdx, seg, isCurrent)}</td>
+      <td><button onclick="event.stopPropagation(); removeOutputEpisode('${escapeJs(ep.name)}', ${segmentIdx})">Remove</button></td>
     </tr>
-  `).join('');
+  `;
+  }).join('');
+  renderTimeline();
+  renderEpisodeList();
+}
+function renderSegmentCameraControls(ep, idx, seg, isCurrent) {
+  const selected = new Set(segmentCameraNames(seg, ep));
+  const disabled = isCurrent ? '' : 'disabled';
+  return `<div class="camera-picker mono">${cameraNamesForEpisode(ep).map(name => `
+    <label title="Include ${escapeHtml(name)} in this output episode">
+      <input type="checkbox" ${disabled} ${selected.has(name) ? 'checked' : ''} onclick="event.stopPropagation()" onchange="updateSegmentCamera(${idx}, '${escapeJs(name)}', this.checked)">
+      ${escapeHtml(name)}
+    </label>
+  `).join('')}</div>`;
+}
+function updateSegmentCamera(idx, camera, checked) {
+  if (!segments[idx]) return;
+  const available = cameraNamesForEpisode(episode);
+  const selected = new Set(segmentCameraNames(segments[idx], episode));
+  if (checked) selected.add(camera);
+  else selected.delete(camera);
+  const next = available.filter(name => selected.has(name));
+  segments[idx].cameras = next.length ? next : available;
+  dirty = true;
+  persistCurrentDraft();
+  renderEpisodeList();
+  setStatus(`${segmentLabel(idx)} camera views edited; save manifest when ready`, 'warn');
+}
+function escapeJs(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+async function selectOutputEpisode(name, idx) {
+  if (episode?.name !== name) {
+    await loadEpisode(name);
+  }
+  selectSegment(idx);
+}
+function selectSegment(idx) {
+  selectedSegmentIdx = idx;
+  const seg = segments[idx];
+  if (seg) renderFrame(frameIndexForTime(Number(seg.start_s || 0)));
+  renderSegments();
+  setStatus(`selected ${segmentLabel(idx)}`, dirty ? 'warn' : '');
+}
+function frameIndexForTime(t) {
+  const samples = episode?.samples || [];
+  if (!samples.length) return 0;
+  let best = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < samples.length; i++) {
+    const dist = Math.abs(Number(samples[i].timestamp_s ?? samples[i].timestamp ?? 0) - t);
+    if (dist < bestDist) {
+      best = i;
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+function renderTimeline() {
+  const el = document.getElementById('segmentTimeline');
+  if (!el) return;
+  const duration = Math.max(0.001, Number(episode?.meta?.duration_s || episode?.result?.duration_s || timestampFor(Math.max(0, Number(episode?.length || 1) - 1)) || 1));
+  const activeIdx = activeSegmentIndex();
+  const finalizedSpans = segments.map((seg, idx) => {
+    const start = Math.max(0, Math.min(100, Number(seg.start_s || 0) / duration * 100));
+    const end = Math.max(start, Math.min(100, Number(seg.end_s || 0) / duration * 100));
+    const width = Math.max(0.5, end - start);
+    const classes = ['timeline-segment', idx === selectedSegmentIdx ? 'selected' : '', idx === activeIdx ? 'active' : ''].filter(Boolean).join(' ');
+    const title = `kept in export: ${segmentLabel(idx)} ${Number(seg.start_s || 0).toFixed(3)}-${Number(seg.end_s || 0).toFixed(3)}s`;
+    return `<div class="${classes}" title="${escapeHtml(title)}" style="left:${start}%;width:${width}%" onclick="selectSegment(${idx})"></div>`;
+  }).join('');
+  let pendingSpan = '';
+  if (pendingStartS !== null || pendingEndS !== null) {
+    const draft = draftSegment();
+    const start = Math.max(0, Math.min(100, Number(draft.start_s || 0) / duration * 100));
+    const end = Math.max(start, Math.min(100, Number(draft.end_s || 0) / duration * 100));
+    const width = Math.max(0.5, end - start);
+    const title = `draft extraction: ${Number(draft.start_s || 0).toFixed(3)}-${Number(draft.end_s || 0).toFixed(3)}s`;
+    pendingSpan = `<div class="timeline-pending" title="${escapeHtml(title)}" style="left:${start}%;width:${width}%"></div>`;
+  }
+  const cursor = Math.max(0, Math.min(100, currentTimeS() / duration * 100));
+  el.innerHTML = (finalizedSpans || pendingSpan ? finalizedSpans + pendingSpan : '<div class="timeline-empty">no output episodes marked</div>') + `<div class="timeline-cursor" style="left:${cursor}%"></div>`;
 }
 function updateSegment(idx, key, value) {
   if (!segments[idx]) return;
   segments[idx][key] = ['start_s', 'end_s'].includes(key) ? Number(value) : value;
+  dirty = true;
+  persistCurrentDraft();
+  renderTimeline();
+  renderEpisodeList();
+  setStatus(`${segmentLabel(idx)} edited; save manifest when ready`, 'warn');
 }
-function addSegment() {
-  const t = timestampFor(frameIdx);
-  segments.push({start_s: Number(t.toFixed(3)), end_s: Number((t + 5).toFixed(3)), task: episode?.meta?.task || '', outcome: 'success', type: 'teleop', notes: ''});
+function addSegment(event = null) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+    const now = Date.now();
+    if (now - lastAddSegmentAtMs < 500) return selectedSegmentIdx;
+    lastAddSegmentAtMs = now;
+  }
+  const next = draftSegment();
+  segments.push(next);
+  selectedSegmentIdx = segments.length - 1;
+  pendingStartS = null;
+  pendingEndS = null;
+  const notes = document.getElementById('draftNotes');
+  if (notes) notes.value = '';
+  dirty = true;
+  persistCurrentDraft();
+  renderDraftExtraction();
   renderSegments();
+  setStatus(`added output ${segmentLabel(selectedSegmentIdx)}`, 'warn');
+  return selectedSegmentIdx;
 }
 function removeSegment(idx) {
   segments.splice(idx, 1);
+  selectedSegmentIdx = Math.min(selectedSegmentIdx, segments.length - 1);
+  if (!segments.length) selectedSegmentIdx = -1;
+  dirty = true;
+  persistCurrentDraft();
   renderSegments();
+  setStatus(`removed output episode ${idx + 1}; save manifest when ready`, 'warn');
+}
+function removeOutputEpisode(name, idx) {
+  if (episode?.name === name) {
+    removeSegment(idx);
+    return;
+  }
+  const ep = episodes.find(item => item.name === name);
+  if (!ep) return;
+  const next = cloneSegments(episodeSegments(ep));
+  next.splice(idx, 1);
+  persistDraftFor(name, next, true);
+  renderSegments();
+  setStatus(`removed output episode ${idx + 1}; save manifest when ready`, 'warn');
+}
+function editableSegmentIndex() {
+  return -1;
 }
 function markStart() {
-  if (!segments.length) addSegment();
-  segments[segments.length - 1].start_s = Number(timestampFor(frameIdx).toFixed(3));
-  if (segments[segments.length - 1].end_s <= segments[segments.length - 1].start_s) {
-    segments[segments.length - 1].end_s = Number((segments[segments.length - 1].start_s + 1).toFixed(3));
+  const t = currentTimeS();
+  pendingStartS = t;
+  if (pendingEndS !== null && pendingEndS <= t) {
+    pendingEndS = Number((t + 1).toFixed(3));
   }
+  selectedSegmentIdx = -1;
+  renderDraftExtraction();
+  renderTimeline();
   renderSegments();
+  setStatus(`draft start marked at ${t.toFixed(3)}s; press Add Output Episode to keep it`, 'warn');
 }
 function markEnd() {
-  if (!segments.length) addSegment();
-  segments[segments.length - 1].end_s = Number(timestampFor(frameIdx).toFixed(3));
+  const t = currentTimeS();
+  pendingEndS = t;
+  if (pendingStartS !== null && pendingEndS <= pendingStartS) {
+    pendingStartS = Number(Math.max(0, t - 1).toFixed(3));
+  }
+  selectedSegmentIdx = -1;
+  renderDraftExtraction();
+  renderTimeline();
   renderSegments();
+  setStatus(`draft end marked at ${t.toFixed(3)}s; press Add Output Episode to keep it`, 'warn');
 }
 async function postJson(path, payload) {
   const res = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
@@ -4462,19 +5029,114 @@ async function postJson(path, payload) {
 }
 async function loadManifest() {
   const data = await api(`/api/segments?source=${encodeURIComponent(episode?.name || 'latest')}`);
-  segments = (data.segments || []).map(seg => ({...seg}));
-  document.getElementById('manifestStatus').textContent = `loaded ${segments.length} segment(s)`;
+  segments = cloneSegments(data.segments);
+  selectedSegmentIdx = segments.length ? 0 : -1;
+  dirty = false;
+  persistCurrentDraft();
+  setStatus(`loaded ${segments.length} output episode(s)`, 'ok');
   renderSegments();
 }
 async function saveManifest() {
-  const data = await postJson('/api/segments/save', {source: episode?.name || 'latest', segments});
-  segments = (data.segments || []).map(seg => ({...seg}));
-  document.getElementById('manifestStatus').textContent = `saved ${segments.length} segment(s)`;
+  persistCurrentDraft();
+  let saved = 0;
+  for (const ep of visibleEpisodes()) {
+    const sourceSegments = cloneSegments(episodeSegments(ep));
+    if (!sourceSegments.length && !segmentDrafts[ep.name]) continue;
+    const data = await postJson('/api/segments/save', {source: ep.name, segments: sourceSegments});
+    saved += data.segments.length;
+    persistDraftFor(ep.name, data.segments, false);
+    if (episode?.name === ep.name) {
+      segments = cloneSegments(data.segments);
+      selectedSegmentIdx = Math.min(selectedSegmentIdx, segments.length - 1);
+      if (!segments.length) selectedSegmentIdx = -1;
+      dirty = false;
+    }
+  }
+  setStatus(`saved ${saved} output episode(s) across ${visibleEpisodes().length} source episode(s)`, 'ok');
   renderSegments();
 }
+function repoIdForExport() {
+  ensureOutputDatasetName();
+  const repo = document.getElementById('outputRepoId')?.value.trim() || defaultOutputRepoId();
+  return repo;
+}
+async function encodeExportedDataset(outputDatasetName, rowCount) {
+  const repoId = repoIdForExport();
+  if (!repoId.includes('/')) {
+    throw new Error('HF repo must look like namespace/dataset');
+  }
+  setExportProgress(45, `starting encode/upload to ${repoId}...`, 'warn');
+  await postJson('/api/dataset/compress', {
+    dataset_name: outputDatasetName,
+    episodes_root_name: outputDatasetName,
+    repo_id: repoId,
+    upload: true,
+    overwrite: true,
+  });
+  while (true) {
+    await sleep(1000);
+    const status = await api('/api/status?log_limit=80');
+    const dataset = status.dataset || {};
+    const tail = Array.isArray(dataset.output_tail) ? dataset.output_tail : [];
+    const encoded = tail.filter(line => String(line).startsWith('saved episode')).length;
+    let percent = dataset.state === 'encoding'
+      ? 45 + Math.min(40, (encoded / Math.max(1, rowCount)) * 40)
+      : dataset.uploaded
+        ? 95
+        : 50;
+    if (dataset.state === 'complete') {
+      setExportProgress(100, `encoded and uploaded ${repoId}`, 'ok');
+      return dataset;
+    }
+    if (dataset.state === 'failed') {
+      throw new Error(dataset.error || tail.slice(-1)[0] || 'encode/upload failed');
+    }
+    const label = dataset.state === 'encoding'
+      ? `encoding ${encoded}/${rowCount} episode(s)...`
+      : dataset.uploaded
+        ? `finalizing upload to ${repoId}...`
+        : `${dataset.state || 'running'}...`;
+    setExportProgress(percent, label, 'warn');
+  }
+}
 async function exportSegments() {
-  const data = await postJson('/api/busyboard/extract', {source: episode?.name || 'latest', segments});
-  document.getElementById('manifestStatus').textContent = `created ${data.episode_count || 0} episode(s), ${data.total_frames || 0} frames`;
+  persistCurrentDraft();
+  ensureOutputDatasetName();
+  const outputDatasetName = slugify(document.getElementById('outputDatasetName')?.value, '');
+  if (!outputDatasetName) {
+    setStatus('enter a new dataset name before export', 'warn');
+    return;
+  }
+  let episodeCount = 0;
+  let frameCount = 0;
+  let outputRoot = '';
+  const rows = outputRows();
+  if (!rows.length) {
+    setExportProgress(0, 'add at least one output episode before export', 'warn');
+    return;
+  }
+  try {
+    setExportProgress(1, `exporting 0/${rows.length} output episode(s)...`, 'warn');
+    for (let i = 0; i < rows.length; i++) {
+      const {ep, seg} = rows[i];
+      const sourceSegment = {...seg, cameras: segmentCameraNames(seg, ep)};
+      const data = await postJson('/api/busyboard/extract', {source: ep.name, segments: [sourceSegment], cameras: sourceSegment.cameras, output_dataset_name: outputDatasetName});
+      episodeCount += Number(data.episode_count || 0);
+      frameCount += Number(data.total_frames || 0);
+      outputRoot = data.output_root || outputRoot;
+      setExportProgress(5 + ((i + 1) / rows.length) * 40, `exported ${i + 1}/${rows.length} output episode(s)...`, 'warn');
+    }
+    const encode = document.getElementById('encodeAfterExport')?.checked;
+    if (encode) {
+      await encodeExportedDataset(outputDatasetName, rows.length);
+    } else {
+      setExportProgress(100, `created ${episodeCount} episode(s), ${frameCount} frames in ${outputRoot || outputDatasetName}`, 'ok');
+    }
+  } catch (err) {
+    setExportProgress(100, err.message || String(err), 'error');
+    throw err;
+  }
+  setStatus(`exported ${episodeCount} output episode(s) to ${outputDatasetName}`, 'ok');
   await loadEpisodes();
 }
 function stepFrame(delta) {
@@ -4497,9 +5159,17 @@ function togglePlay() {
     renderFrame(frameIdx + 1);
   }, Math.max(16, Math.round(1000 / fps)));
 }
+document.getElementById('sourceDatasetSelect').addEventListener('change', () => renderEpisodePicker());
 document.getElementById('episodeSelect').addEventListener('change', e => loadEpisode(e.target.value));
 document.getElementById('frameSlider').addEventListener('input', e => renderFrame(Number(e.target.value)));
 document.getElementById('frameNumber').addEventListener('change', e => renderFrame(Number(e.target.value)));
+document.getElementById('outputRepoId')?.addEventListener('input', () => { outputRepoUserEdited = true; });
+document.getElementById('outputDatasetName')?.addEventListener('input', () => {
+  if (!outputRepoUserEdited) {
+    const repo = document.getElementById('outputRepoId');
+    if (repo) repo.value = defaultOutputRepoId();
+  }
+});
 document.addEventListener('keydown', e => {
   if (e.key === 'ArrowLeft') stepFrame(-1);
   if (e.key === 'ArrowRight') stepFrame(1);
@@ -4564,6 +5234,64 @@ def _episode_dirs() -> list[Path]:
     return [path for path in _recording_dirs() if (path / "episode_meta.json").exists()]
 
 
+def _recordings_for_repo(repo_id: str) -> list[Path]:
+    repo_id = repo_id.strip()
+    if not repo_id:
+        return []
+    matches = []
+    for path in _recording_dirs():
+        meta_path = _recording_meta_path(path)
+        meta = _read_json_file(meta_path) if meta_path is not None else {}
+        if (meta.get("source_repo_id") or meta.get("dataset_repo_id")) == repo_id:
+            matches.append(path)
+    return matches
+
+
+def _download_dataset_for_editing(repo_id: str, overwrite: bool = False) -> dict[str, Any]:
+    repo_id = repo_id.strip().strip("/")
+    if not repo_id or "/" not in repo_id or any(part in {"", ".", ".."} for part in repo_id.split("/")):
+        raise ValueError("repo_id must look like namespace/dataset")
+
+    existing = _recordings_for_repo(repo_id)
+    if existing and not overwrite:
+        return {
+            "status": "already_imported",
+            "repo_id": repo_id,
+            "recordings": [_episode_summary(path) for path in existing],
+        }
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("huggingface_hub is required to download datasets") from exc
+
+    import import_lerobot_recordings
+
+    dataset_root = DEFAULT_LEROBOT_DATASET_ROOT / repo_id
+    dataset_root.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        local_dir=str(dataset_root),
+        local_dir_use_symlinks=False,
+    )
+    summary = import_lerobot_recordings.import_dataset(
+        argparse.Namespace(
+            dataset_root=str(dataset_root),
+            repo_id=repo_id,
+            recordings_root=str(RAW_RECORD_ROOT),
+            name_prefix="",
+            overwrite=overwrite,
+        )
+    )
+    return {
+        "status": "downloaded",
+        "repo_id": repo_id,
+        **summary,
+        "recordings": [_episode_summary(path) for path in _recordings_for_repo(repo_id)],
+    }
+
+
 def _safe_episode_dir(name: str) -> Path:
     dirs = _recording_dirs()
     if name == "latest":
@@ -4580,6 +5308,13 @@ def _safe_episode_dir(name: str) -> Path:
         if path.is_dir() and _recording_meta_path(path) is not None:
             return path
     raise FileNotFoundError(f"recording not found: {name}")
+
+
+def _safe_dataset_name(name: str, fallback: str = "edited-dataset") -> str:
+    slug = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in str(name or "").strip())
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug.strip("-_.") or fallback
 
 
 def _sample_file_for(path: Path, meta: dict[str, Any]) -> str:
@@ -4692,7 +5427,9 @@ def _episode_summary(path: Path) -> dict[str, Any]:
         "path": str(path),
         "kind": "recording" if meta_path is not None and meta_path.name == "session_meta.json" else "episode",
         "created_at": meta.get("created_at"),
+        "source_repo_id": meta.get("source_repo_id") or meta.get("dataset_repo_id"),
         "task": meta.get("task"),
+        "duration_s": meta.get("duration_s") or result.get("duration_s"),
         "result": result,
         "counts": {"samples": len(samples), **camera_counts},
         "cameras": cameras,
@@ -4741,13 +5478,23 @@ def _episode_frame_response(handler: BaseHTTPRequestHandler, episode_name: str, 
         episode_dir = _safe_episode_dir(episode_name)
         meta_path = _recording_meta_path(episode_dir)
         meta = _read_json_file(meta_path) if meta_path is not None else {}
-        camera_dirs = {
-            str(cam["name"]): str(cam["frames_dir"])
-            for cam in _camera_specs_for(episode_dir, meta)
-        }
-        if camera not in camera_dirs or "/" in frame or "\\" in frame or frame.startswith("."):
+        camera_specs = {str(cam["name"]): cam for cam in _camera_specs_for(episode_dir, meta)}
+        if camera not in camera_specs or "/" in frame or "\\" in frame or frame.startswith("."):
             raise ValueError("invalid frame path")
-        frame_path = (episode_dir / camera_dirs[camera] / frame).resolve()
+        camera_spec = camera_specs[camera]
+        frame_ref = frame
+        if frame_ref.isdigit():
+            rows = _read_jsonl_file(episode_dir / str(camera_spec["frames_file"]))
+            idx = int(frame_ref)
+            if idx < 0 or idx >= len(rows):
+                raise FileNotFoundError(f"frame index {idx} out of range")
+            row = rows[idx]
+            frame_ref = str(row.get("path") or row.get("frame") or "")
+            if not frame_ref:
+                raise FileNotFoundError(f"frame index {idx} has no path")
+        frame_path = (episode_dir / frame_ref).resolve()
+        if not frame_path.exists() and "/" not in frame_ref:
+            frame_path = (episode_dir / str(camera_spec["frames_dir"]) / frame_ref).resolve()
         if episode_dir.resolve() not in frame_path.parents:
             raise ValueError("invalid frame path")
         if frame_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
@@ -5075,6 +5822,14 @@ def make_handler(controller: SO101Controller):
                     summary = controller.extract_busyboard_segments(
                         source_name=str(data.get("source", "latest")),
                         segments=data.get("segments", []),
+                        cameras=[str(camera) for camera in data.get("cameras", [])],
+                        output_dataset_name=str(data.get("output_dataset_name", "")),
+                    )
+                    _json_response(self, 200, {"ok": True, **summary})
+                elif parsed.path == "/api/datasets/download":
+                    summary = _download_dataset_for_editing(
+                        repo_id=str(data.get("repo_id", "")),
+                        overwrite=bool(data.get("overwrite", False)),
                     )
                     _json_response(self, 200, {"ok": True, **summary})
                 elif parsed.path == "/api/dataset/compress":
@@ -5082,9 +5837,11 @@ def make_handler(controller: SO101Controller):
                         repo_id=str(data.get("repo_id", "")),
                         dataset_name=str(data.get("dataset_name", "")),
                         root=str(data.get("root", "")),
+                        episodes_root_name=str(data.get("episodes_root_name", "")),
                         upload=bool(data.get("upload", False)),
                         private=bool(data.get("private", False)),
                         include_failures=bool(data.get("include_failures", False)),
+                        overwrite=bool(data.get("overwrite", False)),
                     )
                     _json_response(self, 200, {"ok": True, "dataset": status})
                 elif parsed.path == "/api/sam3/preview":

@@ -39,7 +39,9 @@ HUB_DASHBOARD_HTML = r"""<!doctype html>
 body { margin:0; background:#101214; color:#f1f3f4; }
 header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:12px 16px; border-bottom:1px solid #2d3338; background:#15181b; }
 h1 { margin:0; font-size:18px; font-weight:650; }
-main { padding:14px; display:grid; gap:12px; }
+main { padding:14px; display:grid; gap:12px; grid-template-columns:minmax(0, 1fr) 260px; align-items:start; }
+.editor-main { display:grid; gap:12px; min-width:0; }
+.episode-panel { position:sticky; top:12px; max-height:calc(100vh - 88px); overflow:auto; }
 button, input { font:inherit; color:#f1f3f4; background:#1b2025; border:1px solid #3a424a; border-radius:5px; padding:7px 9px; }
 button { cursor:pointer; }
 button.primary { background:#1f6feb; border-color:#2f81f7; }
@@ -66,7 +68,7 @@ th { color:#9aa4af; font-weight:600; }
 .cams { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:8px; }
 .cam { display:grid; gap:5px; }
 .cam img { width:100%; aspect-ratio:4 / 3; object-fit:contain; background:#050607; border:1px solid #30363d; border-radius:5px; }
-.cam span { color:#9aa4af; font-size:12px; }
+.cam span { display:none; }
 .log { white-space:pre-wrap; max-height:90px; overflow:auto; background:#0f1215; border:1px solid #30363d; border-radius:5px; padding:8px; color:#c9d1d9; font-size:12px; }
 .error { color:#ffb4b4; }
 .mono { font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
@@ -305,7 +307,9 @@ body { margin:0; background:#101214; color:#f1f3f4; }
 header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:12px 16px; border-bottom:1px solid #2d3338; background:#15181b; }
 h1 { margin:0; font-size:18px; }
 a { color:#8ab4f8; }
-main { padding:14px; display:grid; gap:12px; }
+main { padding:14px; display:grid; gap:12px; grid-template-columns:minmax(0, 1fr) 260px; align-items:start; }
+.editor-main { display:grid; gap:12px; min-width:0; }
+.episode-panel { position:sticky; top:12px; max-height:calc(100vh - 88px); overflow:auto; }
 .panel { border:1px solid #30363d; border-radius:6px; background:#171b1f; padding:12px; }
 .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 button, input, select, textarea { font:inherit; color:#f1f3f4; background:#1b2025; border:1px solid #3a424a; border-radius:5px; padding:7px 9px; }
@@ -316,10 +320,10 @@ button:disabled { opacity:.5; cursor:not-allowed; }
 .stat { background:#0f1215; border:1px solid #30363d; border-radius:5px; padding:8px; min-height:36px; }
 .stat span { display:block; color:#9aa4af; font-size:11px; margin-bottom:3px; }
 .stat b { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:13px; }
-.cams { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:10px; }
+.cams { display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:8px; }
 .cam { display:grid; gap:5px; }
-.cam img { width:100%; aspect-ratio:4 / 3; object-fit:contain; background:#050607; border:1px solid #30363d; border-radius:5px; }
-.cam span { color:#9aa4af; font-size:12px; }
+.cam img { width:100%; max-height:210px; aspect-ratio:4 / 3; object-fit:contain; background:#050607; border:1px solid #30363d; border-radius:5px; }
+.cam span { display:none; }
 table { width:100%; border-collapse:collapse; font-size:13px; }
 th, td { border-bottom:1px solid #30363d; padding:6px; text-align:left; vertical-align:top; }
 th { color:#9aa4af; font-weight:600; }
@@ -330,11 +334,19 @@ tr.active:not(.selected) { background:#1d2630; }
 .segment-meta { color:#9aa4af; font-size:12px; margin-top:4px; }
 .timeline { position:relative; flex:1 1 360px; min-width:180px; height:18px; border:1px solid #30363d; border-radius:5px; background:#0f1215; overflow:hidden; }
 .timeline-empty { color:#9aa4af; font-size:12px; line-height:18px; padding-left:7px; }
-.timeline-segment { position:absolute; top:3px; height:10px; min-width:3px; border-radius:3px; background:#2f81f7; opacity:.72; cursor:pointer; }
+.timeline-segment { position:absolute; top:3px; height:10px; min-width:3px; border-radius:3px; background:#2ea043; opacity:.82; cursor:pointer; }
 .timeline-segment.selected { background:#9ee493; opacity:1; }
 .timeline-segment.active { outline:1px solid #ffd166; }
 .timeline-cursor { position:absolute; top:0; bottom:0; width:2px; background:#ffdf7e; pointer-events:none; }
 .recording-nav { min-width:34px; }
+.camera-picker { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.camera-picker label { background:#0f1215; border:1px solid #30363d; border-radius:5px; padding:5px 7px; }
+.episode-list { display:grid; grid-template-columns:1fr; gap:8px; }
+.episode-button { text-align:left; min-height:52px; }
+.episode-button.active { border-color:#9ee493; background:#17351f; }
+.episode-button span { display:block; color:#9aa4af; font-size:11px; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.episode-mini-timeline { position:relative; height:8px; margin-top:8px; border-radius:3px; background:#0f1215; overflow:hidden; border:1px solid #30363d; }
+.episode-mini-segment { position:absolute; top:0; bottom:0; min-width:3px; background:#2ea043; }
 .status.ok { color:#9ee493; }
 .status.warn { color:#ffd166; }
 .status.error { color:#ffb4b4; }
@@ -344,6 +356,8 @@ tr.active:not(.selected) { background:#1d2630; }
 .mono { font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 #frameSlider { flex:1 1 360px; min-width:180px; }
 @media (max-width:700px) {
+  main { grid-template-columns:1fr; }
+  .episode-panel { position:static; max-height:none; }
   .stats { grid-template-columns:1fr; }
   .cams { grid-template-columns:1fr; }
 }
@@ -355,50 +369,65 @@ tr.active:not(.selected) { background:#1d2630; }
   <a href="/dashboard">Station dashboard</a>
 </header>
 <main>
+  <div class="editor-main">
   <section class="panel">
     <div class="row">
-      <label>Station <select id="stationSelect"></select></label>
-      <label>Recording <select id="recordingSelect"></select></label>
-      <button class="recording-nav" title="Previous recording" onclick="stepRecording(-1)">Prev Episode</button>
-      <button class="recording-nav" title="Next recording" onclick="stepRecording(1)">Next Episode</button>
-      <button onclick="loadRecordings()">Refresh</button>
-      <button onclick="stepFrame(-1)">Prev</button>
+      <label>Dataset <select id="sourceDatasetSelect"></select></label>
+      <label>Default Prompt <input id="defaultPrompt" type="text" placeholder="Prompt for new output episodes" style="min-width:260px"></label>
+      <label style="display:none">Station <select id="stationSelect"></select></label>
+      <label style="display:none">Episode <select id="datasetSelect"></select></label>
+      <label style="display:none">Recording <select id="recordingSelect"></select></label>
+      <button onclick="loadDatasets()">Refresh</button>
       <button id="playButton" class="primary" onclick="togglePlay()">Play</button>
-      <button onclick="stepFrame(1)">Next</button>
       <button onclick="markStart()">Mark Start</button>
       <button onclick="markEnd()">Mark End</button>
+      <div class="camera-picker mono" id="cameraPicker"></div>
       <label>Frame <input id="frameNumber" type="number" min="0" value="0" style="width:84px"></label>
       <input id="frameSlider" type="range" min="0" max="0" value="0">
       <div class="timeline" id="segmentTimeline"></div>
     </div>
   </section>
-  <section class="stats mono" id="stats"></section>
-  <section class="cams" id="cams"></section>
   <section class="panel">
     <div class="row" style="justify-content:space-between">
       <div class="row">
-        <button onclick="addSegment()">Add Segment</button>
-        <button onclick="loadManifest()">Load Manifest</button>
-        <button onclick="saveManifest()">Save Manifest</button>
-        <button class="primary" onclick="exportSegments()">Export Episodes</button>
+        <button onclick="addSegment()">Add Output Episode</button>
       </div>
-      <div class="status mono" id="manifestStatus"></div>
     </div>
+  </section>
+  <section class="cams" id="cams"></section>
+  <section class="panel">
     <div style="overflow:auto; margin-top:10px">
       <table>
         <thead>
-          <tr><th>Start</th><th>End</th><th>Task</th><th>Outcome</th><th>Type</th><th>Notes</th><th></th></tr>
+          <tr><th>Start</th><th>End</th><th>Prompt</th><th>Outcome</th><th>Type</th><th>Notes</th><th></th></tr>
         </thead>
         <tbody id="segmentsBody"></tbody>
       </table>
     </div>
   </section>
   <section class="panel">
+    <div class="row" style="justify-content:space-between">
+      <div class="row">
+        <button onclick="loadManifest()">Load Manifest</button>
+        <button onclick="saveManifest()">Save Manifest</button>
+        <button class="primary" onclick="exportSegments()">Export Episodes</button>
+      </div>
+      <div class="status mono" id="manifestStatus"></div>
+    </div>
+  </section>
+  <section class="panel">
     <div class="mono" id="sample"></div>
   </section>
+  </div>
+  <aside class="panel episode-panel">
+    <div class="episode-list" id="episodeList"></div>
+  </aside>
 </main>
 <script>
 let stations = [];
+let allDatasets = [];
+let datasetSources = [];
+let datasets = [];
 let recordings = [];
 let recording = null;
 let frameIdx = 0;
@@ -424,11 +453,19 @@ async function postJson(path, payload = {}) {
 }
 function selectedStation() { return document.getElementById('stationSelect').value; }
 function selectedRecording() { return document.getElementById('recordingSelect').value; }
+function defaultPrompt() { return document.getElementById('defaultPrompt')?.value.trim() || ''; }
 function queryStation() { return new URLSearchParams(location.search).get('station') || ''; }
+function queryDataset() { return new URLSearchParams(location.search).get('dataset') || ''; }
+function querySourceDataset() { return new URLSearchParams(location.search).get('source') || ''; }
+function selectedSourceDataset() { return document.getElementById('sourceDatasetSelect')?.value || ''; }
 function cameraList() {
   const cams = Array.isArray(recording?.cameras) ? recording.cameras : [];
   if (cams.length) return cams.map(cam => ({name: cam.name || cam, frames_dir: cam.frames_dir || cam.name || cam}));
   return Object.keys(recording?.frames || {}).map(name => ({name, frames_dir: name}));
+}
+function selectedCameraNames() {
+  const checked = [...document.querySelectorAll('input[name="keepCamera"]:checked')].map(input => input.value);
+  return checked.length ? checked : cameraList().map(cam => cam.name);
 }
 function timestampFor(idx) {
   const sample = (recording?.samples || [])[idx] || {};
@@ -437,7 +474,7 @@ function timestampFor(idx) {
   return idx / fps;
 }
 function currentTimeS() { return Number(timestampFor(frameIdx).toFixed(3)); }
-function segmentLabel(idx) { return idx >= 0 ? `segment ${idx + 1}` : 'no segment selected'; }
+function segmentLabel(idx) { return idx >= 0 ? `episode ${idx + 1}` : 'no output episode selected'; }
 function durationLabel(seg) {
   if (!seg) return '-';
   const duration = Number(seg.end_s || 0) - Number(seg.start_s || 0);
@@ -478,7 +515,139 @@ async function loadStations() {
   const selected = select.value || queryStation() || stations[0]?.id || '';
   select.innerHTML = stations.map(st => `<option value="${escapeHtml(st.id)}">${escapeHtml(st.name || st.id)}</option>`).join('');
   if (selected && stations.some(st => st.id === selected)) select.value = selected;
-  if (select.value) await loadRecordings();
+  await loadDatasets();
+}
+async function loadDatasets() {
+  allDatasets = [];
+  for (const station of stations) {
+    try {
+      const data = await getJson(`/api/stations/${encodeURIComponent(station.id)}/recordings`);
+      for (const ep of (data.episodes || data.recordings || [])) {
+        const sourceKey = ep.source_repo_id || ep.dataset_repo_id || station.name || station.id;
+        let manifestSegments = [];
+        try {
+          const manifest = await getJson(`/api/stations/${encodeURIComponent(station.id)}/segments?source=${encodeURIComponent(ep.name)}`);
+          manifestSegments = Array.isArray(manifest.segments) ? manifest.segments : [];
+        } catch (_) {
+          manifestSegments = [];
+        }
+        allDatasets.push({
+          station_id: station.id,
+          station_name: station.name || station.id,
+          source_key: sourceKey,
+          source_label: sourceKey,
+          name: ep.name,
+          detail: ep.task || '',
+          kind: ep.kind || 'recording',
+          duration_s: ep.duration_s || ep.meta?.duration_s || ep.result?.duration_s || 0,
+          segments: manifestSegments,
+        });
+      }
+    } catch (err) {
+      allDatasets.push({
+        station_id: station.id,
+        station_name: station.name || station.id,
+        source_key: station.name || station.id,
+        source_label: station.name || station.id,
+        name: '',
+        label: `${station.name || station.id}: ${err.message}`,
+        kind: 'error',
+        disabled: true,
+      });
+    }
+  }
+  const sourceMap = new Map();
+  for (const ds of allDatasets) {
+    if (!sourceMap.has(ds.source_key)) {
+      sourceMap.set(ds.source_key, {key: ds.source_key, label: ds.source_label || ds.source_key});
+    }
+  }
+  datasetSources = [...sourceMap.values()];
+  const sourceSelect = document.getElementById('sourceDatasetSelect');
+  const requestedSource = querySourceDataset();
+  const selectedSource = sourceSelect.value || requestedSource || datasetSources[0]?.key || '';
+  sourceSelect.innerHTML = datasetSources.map(source => `<option value="${escapeHtml(source.key)}">${escapeHtml(source.label)}</option>`).join('');
+  if (selectedSource && datasetSources.some(source => source.key === selectedSource)) {
+    sourceSelect.value = selectedSource;
+  }
+  const activeSource = sourceSelect.value;
+  datasets = allDatasets.filter(ds => ds.source_key === activeSource);
+  datasets.forEach((ds, idx) => {
+    if (!ds.disabled) ds.label = `Episode ${idx + 1}`;
+  });
+  const select = document.getElementById('datasetSelect');
+  const requested = queryDataset();
+  const previous = select.value;
+  const selected = datasets.some(ds => datasetValue(ds) === previous && !ds.disabled)
+    ? previous
+    : (datasets.some(ds => datasetValue(ds) === requested && !ds.disabled)
+      ? requested
+      : (datasets.find(ds => !ds.disabled)?.name ? datasetValue(datasets.find(ds => !ds.disabled)) : ''));
+  select.innerHTML = datasets.map(ds => {
+    const value = datasetValue(ds);
+    const text = ds.disabled ? ds.label : ds.label;
+    return `<option value="${escapeHtml(value)}" ${ds.disabled ? 'disabled' : ''}>${escapeHtml(text)}</option>`;
+  }).join('');
+  if (selected && datasets.some(ds => datasetValue(ds) === selected && !ds.disabled)) {
+    select.value = selected;
+  }
+  if (select.value) await loadDataset(select.value);
+  renderEpisodeList();
+}
+function renderEpisodeList() {
+  const el = document.getElementById('episodeList');
+  if (!el) return;
+  const current = document.getElementById('datasetSelect')?.value || '';
+  const visible = datasets.filter(ds => !ds.disabled);
+  el.innerHTML = visible.map(ds => {
+    const value = datasetValue(ds);
+    const active = value === current ? 'active' : '';
+    return `<button class="episode-button ${active}" value="${escapeHtml(value)}" title="${escapeHtml(ds.name)}" onclick="selectDatasetValue(this.value)">
+      ${escapeHtml(ds.label)}
+      ${ds.detail ? `<span>${escapeHtml(ds.detail)}</span>` : ''}
+      ${miniTimeline(ds)}
+    </button>`;
+  }).join('');
+}
+function segmentsForDataset(ds) {
+  return datasetValue(ds) === (document.getElementById('datasetSelect')?.value || '') ? segments : (ds.segments || []);
+}
+function miniTimeline(ds) {
+  const ranges = segmentsForDataset(ds);
+  const maxEnd = Math.max(0, ...ranges.map(seg => Number(seg.end_s || 0)));
+  const total = Math.max(0.001, Number(ds.duration_s || 0) || maxEnd || 1);
+  const bars = ranges.map(seg => {
+    const start = Math.max(0, Math.min(100, Number(seg.start_s || 0) / total * 100));
+    const end = Math.max(start, Math.min(100, Number(seg.end_s || 0) / total * 100));
+    const width = Math.max(0.5, end - start);
+    const title = `${Number(seg.start_s || 0).toFixed(3)}-${Number(seg.end_s || 0).toFixed(3)}s`;
+    return `<div class="episode-mini-segment" title="${escapeHtml(title)}" style="left:${start}%;width:${width}%"></div>`;
+  }).join('');
+  return `<div class="episode-mini-timeline">${bars}</div>`;
+}
+function selectDatasetValue(value) {
+  document.getElementById('datasetSelect').value = value;
+  loadDataset(value);
+}
+function datasetValue(ds) {
+  if (!ds) return '';
+  return `${ds.station_id}::${ds.name}`;
+}
+function selectedDataset() {
+  const value = document.getElementById('datasetSelect').value;
+  return datasets.find(ds => datasetValue(ds) === value) || null;
+}
+async function loadDataset(value) {
+  const ds = datasets.find(item => datasetValue(item) === value);
+  if (!ds || ds.disabled) return;
+  document.getElementById('stationSelect').value = ds.station_id;
+  document.getElementById('sourceDatasetSelect').value = ds.source_key;
+  recordings = datasets.filter(item => item.station_id === ds.station_id && !item.disabled);
+  const recordingSelect = document.getElementById('recordingSelect');
+  recordingSelect.innerHTML = recordings.map(item => `<option value="${escapeHtml(item.name)}">${escapeHtml(item.label)}</option>`).join('');
+  recordingSelect.value = ds.name;
+  renderEpisodeList();
+  await loadRecording(ds.name);
 }
 async function loadRecordings() {
   const station = selectedStation();
@@ -491,27 +660,46 @@ async function loadRecordings() {
   if (select.value) await loadRecording(select.value);
 }
 async function stepRecording(delta) {
-  const select = document.getElementById('recordingSelect');
+  const select = document.getElementById('datasetSelect');
   if (!select.options.length) return;
   const next = Math.max(0, Math.min(select.selectedIndex + delta, select.options.length - 1));
   if (next === select.selectedIndex) return;
   select.selectedIndex = next;
-  await loadRecording(select.value);
+  await loadDataset(select.value);
 }
 async function loadRecording(name) {
   const station = selectedStation();
   recording = await getJson(`/api/stations/${encodeURIComponent(station)}/recording?name=${encodeURIComponent(name)}`);
+  const ds = selectedDataset();
+  if (ds) {
+    ds.duration_s = recording?.meta?.duration_s || recording?.result?.duration_s || ds.duration_s || 0;
+  }
   frameIdx = 0;
   segments = (recording.manifest?.segments || []).map(seg => ({...seg}));
+  if (ds) ds.segments = segments.map(seg => ({...seg}));
   selectedSegmentIdx = segments.length ? 0 : -1;
   dirty = false;
   const maxIdx = Math.max(0, Number(recording.length || 0) - 1);
   document.getElementById('frameSlider').max = maxIdx;
   document.getElementById('frameNumber').max = maxIdx;
+  renderCameraPicker();
   renderCameras();
   renderSegments();
   renderFrame(0);
+  renderEpisodeList();
   setStatus(`loaded ${recording.name}`, segments.length ? '' : 'warn');
+}
+function renderCameraPicker() {
+  const cams = cameraList();
+  document.getElementById('cameraPicker').innerHTML = [
+    '<span>Keep cameras</span>',
+    ...cams.map(cam => `
+      <label title="Include ${escapeHtml(cam.name)} in exported episodes">
+        <input type="checkbox" name="keepCamera" value="${escapeHtml(cam.name)}" checked>
+        ${escapeHtml(cam.name)}
+      </label>
+    `),
+  ].join('');
 }
 function renderCameras() {
   document.getElementById('cams').innerHTML = cameraList().map(cam => `
@@ -547,44 +735,25 @@ function renderFrame(idx) {
     `<div>state ${escapeHtml(Array.isArray(sample.observation_state) ? sample.observation_state.map(v => Number(v).toFixed(2)).join(', ') : '-')}</div>`,
     `<div>action ${escapeHtml(Array.isArray(sample.action) ? sample.action.map(v => Number(v).toFixed(2)).join(', ') : '-')}</div>`,
   ].join('');
-  renderStats();
   renderSegments();
   renderTimeline();
-}
-function renderStats() {
-  const meta = recording?.meta || {};
-  const counts = recording?.counts || {};
-  const cameraCounts = cameraList().map(cam => `${cam.name}:${counts[cam.name] || 0}`).join(' ');
-  const activeIdx = activeSegmentIndex();
-  const selected = segments[selectedSegmentIdx] || null;
-  document.getElementById('stats').innerHTML = [
-    `<div class="stat"><span>task</span><b title="${escapeHtml(meta.task || '')}">${escapeHtml(meta.task || '-')}</b></div>`,
-    `<div class="stat"><span>kind</span><b>${escapeHtml(recording?.kind || '-')}</b></div>`,
-    `<div class="stat"><span>samples</span><b>${counts.samples || 0}</b></div>`,
-    `<div class="stat"><span>cameras</span><b title="${escapeHtml(cameraCounts)}">${escapeHtml(cameraCounts || '-')}</b></div>`,
-    `<div class="stat"><span>fps</span><b>${Number(meta.fps || 0).toFixed(1)}</b></div>`,
-    `<div class="stat"><span>time</span><b>${currentTimeS().toFixed(3)}s</b></div>`,
-    `<div class="stat"><span>selected</span><b>${escapeHtml(selected ? `${segmentLabel(selectedSegmentIdx)} ${Number(selected.start_s || 0).toFixed(3)}-${Number(selected.end_s || 0).toFixed(3)} (${durationLabel(selected)})` : '-')}</b></div>`,
-    `<div class="stat"><span>active</span><b>${activeIdx >= 0 ? escapeHtml(segmentLabel(activeIdx)) : '-'}</b></div>`,
-    `<div class="stat"><span>manifest</span><b>${dirty ? 'unsaved changes' : `${segments.length} segment(s)`}</b></div>`,
-  ].join('');
 }
 function renderSegments() {
   const activeIdx = activeSegmentIndex();
   document.getElementById('segmentsBody').innerHTML = segments.map((seg, idx) => `
     <tr class="${idx === selectedSegmentIdx ? 'selected' : ''} ${idx === activeIdx ? 'active' : ''}" onclick="selectSegment(${idx})">
-      <td><input class="compact" type="number" step="0.001" value="${Number(seg.start_s || 0)}" oninput="updateSegment(${idx}, 'start_s', this.value)"></td>
-      <td><input class="compact" type="number" step="0.001" value="${Number(seg.end_s || 0)}" oninput="updateSegment(${idx}, 'end_s', this.value)"></td>
-      <td><input value="${escapeHtml(seg.task || '')}" oninput="updateSegment(${idx}, 'task', this.value)"></td>
-      <td><select oninput="updateSegment(${idx}, 'outcome', this.value)">
+      <td><input class="compact" type="number" step="0.001" value="${Number(seg.start_s || 0)}" onclick="event.stopPropagation()" oninput="updateSegment(${idx}, 'start_s', this.value)"></td>
+      <td><input class="compact" type="number" step="0.001" value="${Number(seg.end_s || 0)}" onclick="event.stopPropagation()" oninput="updateSegment(${idx}, 'end_s', this.value)"></td>
+      <td><input value="${escapeHtml(seg.task || '')}" placeholder="Prompt for this output episode" onclick="event.stopPropagation()" oninput="updateSegment(${idx}, 'task', this.value)"></td>
+      <td><select onclick="event.stopPropagation()" oninput="updateSegment(${idx}, 'outcome', this.value)">
         <option value="success" ${seg.outcome === 'success' ? 'selected' : ''}>success</option>
         <option value="failure" ${seg.outcome === 'failure' ? 'selected' : ''}>failure</option>
       </select></td>
-      <td><select oninput="updateSegment(${idx}, 'type', this.value)">
+      <td><select onclick="event.stopPropagation()" oninput="updateSegment(${idx}, 'type', this.value)">
         <option value="teleop" ${seg.type !== 'intervention' ? 'selected' : ''}>teleop</option>
         <option value="intervention" ${seg.type === 'intervention' ? 'selected' : ''}>intervention</option>
       </select></td>
-      <td><textarea oninput="updateSegment(${idx}, 'notes', this.value)">${escapeHtml(seg.notes || '')}</textarea><div class="segment-meta mono">${durationLabel(seg)} ${idx === activeIdx ? 'active at current frame' : ''}</div></td>
+      <td><textarea onclick="event.stopPropagation()" oninput="updateSegment(${idx}, 'notes', this.value)">${escapeHtml(seg.notes || '')}</textarea><div class="segment-meta mono">${durationLabel(seg)} ${idx === activeIdx ? 'active at current frame' : ''}</div></td>
       <td><button onclick="event.stopPropagation(); removeSegment(${idx})">Remove</button></td>
     </tr>
   `).join('');
@@ -593,7 +762,6 @@ function renderSegments() {
 function selectSegment(idx) {
   selectedSegmentIdx = idx;
   setStatus(`selected ${segmentLabel(idx)}`, dirty ? 'warn' : '');
-  renderStats();
   renderSegments();
 }
 function jumpToSegment(idx, edge = 'start') {
@@ -617,11 +785,11 @@ function renderTimeline() {
       idx === selectedSegmentIdx ? 'selected' : '',
       idx === activeIdx ? 'active' : '',
     ].filter(Boolean).join(' ');
-    const title = `${segmentLabel(idx)} ${Number(seg.start_s || 0).toFixed(3)}-${Number(seg.end_s || 0).toFixed(3)}s`;
+    const title = `kept in export: ${segmentLabel(idx)} ${Number(seg.start_s || 0).toFixed(3)}-${Number(seg.end_s || 0).toFixed(3)}s`;
     return `<div class="${cls}" title="${escapeHtml(title)}" style="left:${start}%;width:${width}%" onclick="jumpToSegment(${idx}, 'start')"></div>`;
   }).join('');
   const cursor = Math.max(0, Math.min(100, currentTimeS() / total * 100));
-  el.innerHTML = spans || '<div class="timeline-empty">no segments marked</div>';
+  el.innerHTML = spans || '<div class="timeline-empty">no output episodes marked</div>';
   el.innerHTML += `<div class="timeline-cursor" style="left:${cursor}%"></div>`;
 }
 function updateSegment(idx, key, value) {
@@ -630,28 +798,28 @@ function updateSegment(idx, key, value) {
   segments[idx][key] = ['start_s', 'end_s'].includes(key) ? Number(value) : value;
   dirty = true;
   setStatus(`${segmentLabel(idx)} edited; save manifest when ready`, 'warn');
-  renderStats();
   renderTimeline();
+  renderEpisodeList();
 }
 function addSegment() {
   const t = timestampFor(frameIdx);
-  segments.push({start_s:Number(t.toFixed(3)), end_s:Number((t + 5).toFixed(3)), task:recording?.meta?.task || '', outcome:'success', type:'teleop', notes:''});
+  segments.push({start_s:Number(t.toFixed(3)), end_s:Number((t + 5).toFixed(3)), task:defaultPrompt() || recording?.meta?.task || '', outcome:'success', type:'teleop', notes:''});
   selectedSegmentIdx = segments.length - 1;
   dirty = true;
-  setStatus(`added ${segmentLabel(selectedSegmentIdx)} at ${Number(t).toFixed(3)}s`, 'warn');
+  setStatus(`added output ${segmentLabel(selectedSegmentIdx)} at ${Number(t).toFixed(3)}s`, 'warn');
   renderSegments();
-  renderStats();
   renderTimeline();
+  renderEpisodeList();
 }
 function removeSegment(idx) {
   segments.splice(idx, 1);
   selectedSegmentIdx = Math.min(selectedSegmentIdx, segments.length - 1);
   if (!segments.length) selectedSegmentIdx = -1;
   dirty = true;
-  setStatus(`removed segment ${idx + 1}; save manifest when ready`, 'warn');
+  setStatus(`removed output episode ${idx + 1}; save manifest when ready`, 'warn');
   renderSegments();
-  renderStats();
   renderTimeline();
+  renderEpisodeList();
 }
 function editableSegmentIndex() {
   if (selectedSegmentIdx >= 0 && segments[selectedSegmentIdx]) return selectedSegmentIdx;
@@ -672,8 +840,8 @@ function markStart() {
   dirty = true;
   setStatus(`${segmentLabel(idx)} start marked at ${t.toFixed(3)}s`, 'warn');
   renderSegments();
-  renderStats();
   renderTimeline();
+  renderEpisodeList();
 }
 function markEnd() {
   const idx = editableSegmentIndex();
@@ -685,33 +853,42 @@ function markEnd() {
   dirty = true;
   setStatus(`${segmentLabel(idx)} end marked at ${t.toFixed(3)}s`, 'warn');
   renderSegments();
-  renderStats();
   renderTimeline();
+  renderEpisodeList();
 }
 async function loadManifest() {
   const data = await getJson(`/api/stations/${encodeURIComponent(selectedStation())}/segments?source=${encodeURIComponent(selectedRecording())}`);
   segments = (data.segments || []).map(seg => ({...seg}));
+  const ds = selectedDataset();
+  if (ds) ds.segments = segments.map(seg => ({...seg}));
   selectedSegmentIdx = segments.length ? 0 : -1;
   dirty = false;
-  setStatus(`loaded ${segments.length} segment(s)`, 'ok');
+  setStatus(`loaded ${segments.length} output episode(s)`, 'ok');
   renderSegments();
-  renderStats();
   renderTimeline();
+  renderEpisodeList();
 }
 async function saveManifest() {
   const data = await postJson(`/api/stations/${encodeURIComponent(selectedStation())}/segments/save`, {source:selectedRecording(), segments});
   segments = (data.segments || []).map(seg => ({...seg}));
+  const ds = selectedDataset();
+  if (ds) ds.segments = segments.map(seg => ({...seg}));
   selectedSegmentIdx = Math.min(selectedSegmentIdx, segments.length - 1);
   if (!segments.length) selectedSegmentIdx = -1;
   dirty = false;
-  setStatus(`saved ${segments.length} segment(s)`, 'ok');
+  setStatus(`saved ${segments.length} output episode(s)`, 'ok');
   renderSegments();
-  renderStats();
+  renderEpisodeList();
 }
 async function exportSegments() {
-  const data = await postJson(`/api/stations/${encodeURIComponent(selectedStation())}/segments/export`, {source:selectedRecording(), segments});
+  const cameras = selectedCameraNames();
+  if (!cameras.length) {
+    setStatus('select at least one camera to export', 'error');
+    return;
+  }
+  const data = await postJson(`/api/stations/${encodeURIComponent(selectedStation())}/segments/export`, {source:selectedRecording(), segments, cameras});
   dirty = false;
-  setStatus(`created ${data.episode_count || 0} episode(s), ${data.total_frames || 0} frames`, 'ok');
+  setStatus(`created ${data.episode_count || 0} episode(s), ${data.total_frames || 0} frames using ${cameras.join(', ')}`, 'ok');
   await loadRecordings();
 }
 function stepFrame(delta) { renderFrame(frameIdx + delta); }
@@ -734,10 +911,15 @@ function togglePlay() {
 }
 document.getElementById('stationSelect').addEventListener('change', loadRecordings);
 document.getElementById('recordingSelect').addEventListener('change', e => loadRecording(e.target.value));
+document.getElementById('datasetSelect').addEventListener('change', e => loadDataset(e.target.value));
+document.getElementById('sourceDatasetSelect').addEventListener('change', () => {
+  document.getElementById('datasetSelect').value = '';
+  loadDatasets();
+});
 document.getElementById('frameSlider').addEventListener('input', e => renderFrame(Number(e.target.value)));
 document.getElementById('frameNumber').addEventListener('change', e => renderFrame(Number(e.target.value)));
 loadStations().catch(err => {
-  document.getElementById('stats').innerHTML = `<div class="stat error"><span>error</span><b>${escapeHtml(err.message)}</b></div>`;
+  setStatus(err.message, 'error');
 });
 </script>
 </body>

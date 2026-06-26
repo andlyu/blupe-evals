@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coding Practices"
+  short_description: "Keep project work reproducible and repo-owned."
+  default_prompt: "Apply the coding practices skill: keep durable code in the repository, make environment changes reproducible, and avoid unrecoverable manual setup."
