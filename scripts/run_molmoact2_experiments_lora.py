@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -294,6 +295,90 @@ def _patch_data_mix_metrics(extra_metrics: dict[str, float]) -> None:
     trainer_mod.lerobot_tag_sampling_rate_metrics = lerobot_tag_sampling_rate_metrics_with_mix
 
 
+def _runtime_split_metrics(
+    *,
+    elapsed_seconds: float,
+    train_step_seconds: float,
+    validation_seconds: float,
+) -> dict[str, float]:
+    elapsed_seconds = max(float(elapsed_seconds), 0.0)
+    train_step_seconds = max(float(train_step_seconds), 0.0)
+    validation_seconds = max(float(validation_seconds), 0.0)
+    training_seconds = max(elapsed_seconds - validation_seconds, 0.0)
+    overhead_seconds = max(training_seconds - train_step_seconds, 0.0)
+
+    def pct(seconds: float) -> float:
+        return 100.0 * seconds / elapsed_seconds if elapsed_seconds else 0.0
+
+    return {
+        "runtime/elapsed_seconds": elapsed_seconds,
+        "runtime/training_seconds": training_seconds,
+        "runtime/validation_seconds": validation_seconds,
+        "runtime/train_step_seconds": train_step_seconds,
+        "runtime/overhead_seconds": overhead_seconds,
+        "runtime/training_pct": pct(training_seconds),
+        "runtime/validation_pct": pct(validation_seconds),
+        "runtime/train_step_pct": pct(train_step_seconds),
+        "runtime/overhead_pct": pct(overhead_seconds),
+    }
+
+
+def _patch_runtime_split_metrics() -> None:
+    import olmo.train.trainer as trainer_mod
+
+    if getattr(trainer_mod.Trainer, "_blupe_runtime_split_patched", False):
+        return
+
+    original_fit = trainer_mod.Trainer.fit
+    original_loss_eval = trainer_mod.Trainer.loss_eval
+    original_train_step = trainer_mod.Trainer.train_step
+
+    def ensure_runtime_state(trainer) -> None:
+        if not hasattr(trainer, "_blupe_runtime_start_time"):
+            trainer._blupe_runtime_start_time = time.perf_counter()
+            trainer._blupe_train_step_seconds = 0.0
+            trainer._blupe_validation_seconds = 0.0
+
+    def runtime_metrics(trainer) -> dict[str, float]:
+        ensure_runtime_state(trainer)
+        elapsed_seconds = time.perf_counter() - trainer._blupe_runtime_start_time
+        return _runtime_split_metrics(
+            elapsed_seconds=elapsed_seconds,
+            train_step_seconds=trainer._blupe_train_step_seconds,
+            validation_seconds=trainer._blupe_validation_seconds,
+        )
+
+    def fit_with_runtime_split(trainer, *args, **kwargs):
+        trainer._blupe_runtime_start_time = time.perf_counter()
+        trainer._blupe_train_step_seconds = 0.0
+        trainer._blupe_validation_seconds = 0.0
+        return original_fit(trainer, *args, **kwargs)
+
+    def train_step_with_runtime_split(trainer, *args, **kwargs):
+        ensure_runtime_state(trainer)
+        t0 = time.perf_counter()
+        metrics = original_train_step(trainer, *args, **kwargs)
+        trainer._blupe_train_step_seconds += time.perf_counter() - t0
+        if isinstance(metrics, dict):
+            metrics.update(runtime_metrics(trainer))
+        return metrics
+
+    def loss_eval_with_runtime_split(trainer, *args, **kwargs):
+        ensure_runtime_state(trainer)
+        t0 = time.perf_counter()
+        metrics = original_loss_eval(trainer, *args, **kwargs)
+        trainer._blupe_validation_seconds += time.perf_counter() - t0
+        if isinstance(metrics, dict):
+            metrics = dict(metrics)
+            metrics.update(runtime_metrics(trainer))
+        return metrics
+
+    trainer_mod.Trainer.fit = fit_with_runtime_split
+    trainer_mod.Trainer.train_step = train_step_with_runtime_split
+    trainer_mod.Trainer.loss_eval = loss_eval_with_runtime_split
+    trainer_mod.Trainer._blupe_runtime_split_patched = True
+
+
 def _patch_validation_evaluators(
     train_lerobot,
     *,
@@ -507,6 +592,7 @@ def main() -> int:
     from launch_scripts import train_lerobot
 
     _patch_data_mix_metrics(data_mix_metrics)
+    _patch_runtime_split_metrics()
 
     if args.validation_dataset_spec:
         _patch_validation_evaluators(

@@ -3,7 +3,14 @@ import sys
 import types
 from pathlib import Path
 
-from scripts.run_molmoact2_experiments_lora import _data_mix_rows, _log_data_mix_bar_charts, _set_default_env
+import scripts.run_molmoact2_experiments_lora as run_lora
+from scripts.run_molmoact2_experiments_lora import (
+    _data_mix_rows,
+    _log_data_mix_bar_charts,
+    _patch_runtime_split_metrics,
+    _runtime_split_metrics,
+    _set_default_env,
+)
 
 
 def test_set_default_env_adds_single_process_torch_distributed_defaults(monkeypatch):
@@ -114,3 +121,63 @@ def test_log_data_mix_bar_charts_waits_for_wandb_run(monkeypatch):
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
 
     assert _log_data_mix_bar_charts(_data_mix_test_metrics()) is False
+
+
+def test_runtime_split_metrics_tracks_training_validation_and_overhead():
+    metrics = _runtime_split_metrics(
+        elapsed_seconds=100.0,
+        train_step_seconds=70.0,
+        validation_seconds=20.0,
+    )
+
+    assert metrics["runtime/training_seconds"] == 80.0
+    assert metrics["runtime/validation_seconds"] == 20.0
+    assert metrics["runtime/train_step_seconds"] == 70.0
+    assert metrics["runtime/overhead_seconds"] == 10.0
+    assert metrics["runtime/training_pct"] == 80.0
+    assert metrics["runtime/validation_pct"] == 20.0
+    assert metrics["runtime/train_step_pct"] == 70.0
+    assert metrics["runtime/overhead_pct"] == 10.0
+
+
+def test_patch_runtime_split_metrics_adds_metrics_to_train_and_eval(monkeypatch):
+    class FakeTrainer:
+        def fit(self):
+            return "fit-result"
+
+        def train_step(self):
+            return {"train/loss": 1.0}
+
+        def loss_eval(self):
+            return {"val/loss": 2.0}
+
+    olmo_mod = types.ModuleType("olmo")
+    train_mod = types.ModuleType("olmo.train")
+    trainer_mod = types.ModuleType("olmo.train.trainer")
+    trainer_mod.Trainer = FakeTrainer
+    train_mod.trainer = trainer_mod
+    olmo_mod.train = train_mod
+    monkeypatch.setitem(sys.modules, "olmo", olmo_mod)
+    monkeypatch.setitem(sys.modules, "olmo.train", train_mod)
+    monkeypatch.setitem(sys.modules, "olmo.train.trainer", trainer_mod)
+
+    perf_counter_values = iter([100.0, 101.0, 111.0, 112.0, 120.0, 125.0, 130.0])
+    monkeypatch.setattr(run_lora.time, "perf_counter", lambda: next(perf_counter_values))
+
+    _patch_runtime_split_metrics()
+
+    trainer = FakeTrainer()
+    assert trainer.fit() == "fit-result"
+
+    train_metrics = trainer.train_step()
+    assert train_metrics["train/loss"] == 1.0
+    assert train_metrics["runtime/train_step_seconds"] == 10.0
+    assert train_metrics["runtime/validation_seconds"] == 0.0
+    assert train_metrics["runtime/elapsed_seconds"] == 12.0
+
+    eval_metrics = trainer.loss_eval()
+    assert eval_metrics["val/loss"] == 2.0
+    assert eval_metrics["runtime/train_step_seconds"] == 10.0
+    assert eval_metrics["runtime/validation_seconds"] == 5.0
+    assert eval_metrics["runtime/training_seconds"] == 25.0
+    assert eval_metrics["runtime/validation_pct"] == 100.0 * 5.0 / 30.0
