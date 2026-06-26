@@ -136,6 +136,28 @@ def _camera_keys_from_info(info: dict[str, Any]) -> list[str]:
     return keys
 
 
+def _camera_codec(info: dict[str, Any], key: str) -> str:
+    features = info.get("features") or {}
+    value = features.get(key) or {}
+    metadata = value.get("info") if isinstance(value, dict) else {}
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("video.codec") or metadata.get("codec") or "").strip().lower()
+
+
+def _select_camera_keys(info: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    skipped_codecs = {str(codec).strip().lower() for codec in args.skip_video_codec if str(codec).strip()}
+    keys = _camera_keys_from_info(info)
+    if not skipped_codecs:
+        return keys
+    filtered = [
+        key
+        for key in keys
+        if _camera_codec(info, key) not in skipped_codecs
+    ]
+    return filtered
+
+
 def _feature_shape(info: dict[str, Any], key: str) -> tuple[int, ...]:
     features = info.get("features") or {}
     value = features.get(key) or {}
@@ -189,7 +211,7 @@ def _to_uint8_hwc(value: Any) -> np.ndarray:
 
 def _resize_image(value: Any, *, width: int, height: int) -> Image.Image:
     arr = _to_uint8_hwc(value)
-    image = Image.fromarray(arr, mode="RGB")
+    image = Image.fromarray(arr)
     if image.size != (width, height):
         image = image.resize((width, height), Image.BILINEAR)
     return image
@@ -422,7 +444,7 @@ def _load_episode_rows(
             f"incompatible state/action shapes: state={_feature_shape(info, STATE_KEY)} "
             f"action={_feature_shape(info, ACTION_KEY)}"
         )
-    camera_keys = _camera_keys_from_info(info)
+    camera_keys = _select_camera_keys(info, args)
     if len(camera_keys) < 2:
         raise RuntimeError(f"not enough cameras: {camera_keys}")
 
@@ -495,6 +517,12 @@ def main() -> int:
     parser.add_argument("--vcodec", default="h264")
     parser.add_argument("--encoder-threads", type=int, default=2)
     parser.add_argument("--video-backend", default="pyav")
+    parser.add_argument(
+        "--skip-video-codec",
+        action="append",
+        default=["av1"],
+        help="Skip source cameras with this codec according to metadata. Repeatable. Defaults to av1.",
+    )
     parser.add_argument("--revision", action="append", default=[])
     parser.add_argument("--keep-source-cache", action="store_true")
     parser.add_argument("--no-parallel-encoding", action="store_true")
