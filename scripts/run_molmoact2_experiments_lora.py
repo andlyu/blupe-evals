@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -51,28 +52,76 @@ def _set_default_env(experiments_dir: Path, lerobot_data_root: str) -> None:
             sys.path.insert(0, path)
 
 
-def _register_move_blue_ball_mixture() -> None:
+@dataclass(frozen=True)
+class DatasetSpec:
+    repo_id: str
+    tag: str
+    camera_keys: list[str]
+    rate: float
+    setup_type: str
+
+
+def _parse_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_dataset_spec(value: str) -> DatasetSpec:
+    parts = [part.strip() for part in value.split("|")]
+    if len(parts) != 5:
+        raise argparse.ArgumentTypeError(
+            "--dataset-spec must be 'repo_id|tag|camera_key_1,camera_key_2|rate|setup_type'"
+        )
+    repo_id, tag, camera_keys_text, rate_text, setup_type = parts
+    camera_keys = _parse_csv(camera_keys_text)
+    if not repo_id or not tag or len(camera_keys) < 1 or not setup_type:
+        raise argparse.ArgumentTypeError(
+            "--dataset-spec repo_id, tag, camera keys, and setup_type must be non-empty"
+        )
+    try:
+        rate = float(rate_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--dataset-spec rate must be a float") from exc
+    if rate <= 0:
+        raise argparse.ArgumentTypeError("--dataset-spec rate must be positive")
+    return DatasetSpec(
+        repo_id=repo_id,
+        tag=tag,
+        camera_keys=camera_keys,
+        rate=rate,
+        setup_type=setup_type,
+    )
+
+
+def _register_lerobot_mixture(
+    *,
+    mixture_name: str,
+    specs: list[DatasetSpec],
+) -> None:
     from launch_scripts import data_mixtures
 
-    def build_move_blue_ball():
-        return data_mixtures.build_single_lerobot_mixture(
-            name="move_blue_ball",
-            tag="so101_move_blue_ball",
-            repo_ids=["andlyu/move_blue_ball_training_v21"],
-            action_key="action",
-            state_keys=["observation.state"],
-            camera_keys=[
-                "observation.images.front",
-                "observation.images.wrist",
-            ],
-            normalize_gripper=True,
-            setup_type="single SO-101 follower arm moving a blue ball",
-            control_mode="absolute joint pose",
-            action_horizon=30,
-            n_action_steps=30,
-        )
+    def build_mixture():
+        data_mixture = []
+        metadata_per_tag = {}
+        for spec in specs:
+            partial_mixture, partial_metadata = data_mixtures.build_single_lerobot_mixture(
+                name=mixture_name,
+                tag=spec.tag,
+                repo_ids=[spec.repo_id],
+                action_key="action",
+                state_keys=["observation.state"],
+                camera_keys=spec.camera_keys,
+                normalize_gripper=True,
+                setup_type=spec.setup_type,
+                control_mode="absolute joint pose",
+                action_horizon=30,
+                n_action_steps=30,
+                rate=spec.rate,
+            )
+            data_mixture.extend(partial_mixture)
+            metadata_per_tag.update(partial_metadata)
+        return data_mixture, metadata_per_tag
 
-    data_mixtures.MOLMOACT2_LEROBOT_MIXTURES["move_blue_ball"] = build_move_blue_ball
+    data_mixtures.MOLMOACT2_LEROBOT_MIXTURES[mixture_name] = build_mixture
 
 
 def main() -> int:
@@ -81,6 +130,27 @@ def main() -> int:
     parser.add_argument("--lerobot-data-root", default=os.environ.get("LEROBOT_DATA_ROOT", "/workspace/lerobot_data"))
     parser.add_argument("--checkpoint", default=os.environ.get("MOLMOACT2_CHECKPOINT", "allenai/MolmoAct2-SO100_101"))
     parser.add_argument("--mixture", default="move_blue_ball")
+    parser.add_argument("--dataset-repo-id", default=os.environ.get("DATASET_REPO_ID", "andlyu/move_blue_ball_training"))
+    parser.add_argument("--dataset-tag", default=os.environ.get("DATASET_TAG", "so101_move_blue_ball"))
+    parser.add_argument(
+        "--camera-keys",
+        default=os.environ.get("CAMERA_KEYS", "observation.images.front,observation.images.wrist"),
+    )
+    parser.add_argument(
+        "--setup-type",
+        default=os.environ.get("SETUP_TYPE", "single SO-101 follower arm moving a blue ball"),
+    )
+    parser.add_argument(
+        "--dataset-spec",
+        action="append",
+        type=_parse_dataset_spec,
+        default=[],
+        help=(
+            "Add a dataset to a multi-tag mixture as "
+            "'repo_id|tag|camera_key_1,camera_key_2|rate|setup_type'. "
+            "When provided, these replace --dataset-repo-id/--dataset-tag/--camera-keys."
+        ),
+    )
     parser.add_argument("--run-name", default=os.environ.get("RUN_NAME", "molmoact2-so101-move-blue-ball-lora"))
     parser.add_argument("--save-folder", default=os.environ.get("SAVE_FOLDER", "/workspace/outputs/molmoact2-so101-move-blue-ball-lora"))
     parser.add_argument("--max-duration", type=int, default=int(os.environ.get("MAX_DURATION", "1000")))
@@ -104,7 +174,16 @@ def main() -> int:
     if args.offline_wandb:
         os.environ["WANDB_MODE"] = "offline"
 
-    _register_move_blue_ball_mixture()
+    specs = args.dataset_spec or [
+        DatasetSpec(
+            repo_id=args.dataset_repo_id,
+            tag=args.dataset_tag,
+            camera_keys=_parse_csv(args.camera_keys),
+            rate=1.0,
+            setup_type=args.setup_type,
+        )
+    ]
+    _register_lerobot_mixture(mixture_name=args.mixture, specs=specs)
 
     data_timeout = args.data_timeout
     if data_timeout < 0:
