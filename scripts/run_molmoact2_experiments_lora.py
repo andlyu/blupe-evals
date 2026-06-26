@@ -58,7 +58,7 @@ def _register_move_blue_ball_mixture() -> None:
         return data_mixtures.build_single_lerobot_mixture(
             name="move_blue_ball",
             tag="so101_move_blue_ball",
-            repo_ids=["andlyu/move_blue_ball_training"],
+            repo_ids=["andlyu/move_blue_ball_training_v21"],
             action_key="action",
             state_keys=["observation.state"],
             camera_keys=[

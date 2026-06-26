@@ -46,15 +46,15 @@ python scripts/run_molmoact2_full_finetune.py --dry-run
 Initial blue-ball dataset:
 
 ```text
-dataset:    andlyu/move_blue_ball_training
+dataset:    andlyu/move_blue_ball_training_v21
 revision:   main
 checkpoint: allenai/MolmoAct2
 steps:      1000
 batch:      8
 wandb:      project molmoact-so101
 images:     observation.images.front, observation.images.wrist
-state:      6D SO101 joints
-action:     6D SO101 joints
+state:      6D SO101 joints, converted to MolmoAct2 v2.1 policy convention
+action:     6D SO101 joints, converted to MolmoAct2 v2.1 policy convention
 ```
 
 Use `--dataset.revision=main` for this dataset. Without an explicit revision, the installed
@@ -68,7 +68,7 @@ The experiments-path LoRA run uses the upstream `allenai/molmoact2/experiments`
 launcher with a runtime-registered single LeRobot mixture for:
 
 ```text
-dataset:    andlyu/move_blue_ball_training
+dataset:    andlyu/move_blue_ball_training_v21
 checkpoint: allenai/MolmoAct2-SO100_101
 project:    molmoact-so101
 mixture:    move_blue_ball

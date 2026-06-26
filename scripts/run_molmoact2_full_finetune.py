@@ -11,8 +11,8 @@ import sys
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-repo", default=os.environ.get("DATASET_REPO", "andlyu/move_blue_ball_training"))
-    parser.add_argument("--dataset-root", default=os.environ.get("DATASET_ROOT", "/workspace/lerobot_data/andlyu/move_blue_ball_training"))
+    parser.add_argument("--dataset-repo", default=os.environ.get("DATASET_REPO", "andlyu/move_blue_ball_training_v21"))
+    parser.add_argument("--dataset-root", default=os.environ.get("DATASET_ROOT", "/workspace/lerobot_data/andlyu/move_blue_ball_training_v21"))
     parser.add_argument("--dataset-revision", default=os.environ.get("DATASET_REVISION", "main"))
     parser.add_argument("--checkpoint", default=os.environ.get("MOLMOACT2_CHECKPOINT", "allenai/MolmoAct2"))
     parser.add_argument("--job-name", default=os.environ.get("RUN_NAME", "molmoact2-so101-move-blue-ball-success"))
