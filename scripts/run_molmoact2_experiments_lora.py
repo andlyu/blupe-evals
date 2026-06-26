@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -92,6 +93,31 @@ def _parse_dataset_spec(value: str) -> DatasetSpec:
     )
 
 
+def _build_lerobot_mixture_payload(mixture_name: str, specs: list[DatasetSpec]):
+    from launch_scripts import data_mixtures
+
+    data_mixture = []
+    metadata_per_tag = {}
+    for spec in specs:
+        partial_mixture, partial_metadata = data_mixtures.build_single_lerobot_mixture(
+            name=mixture_name,
+            tag=spec.tag,
+            repo_ids=[spec.repo_id],
+            action_key="action",
+            state_keys=["observation.state"],
+            camera_keys=spec.camera_keys,
+            normalize_gripper=True,
+            setup_type=spec.setup_type,
+            control_mode="absolute joint pose",
+            action_horizon=30,
+            n_action_steps=30,
+            rate=spec.rate,
+        )
+        data_mixture.extend(partial_mixture)
+        metadata_per_tag.update(partial_metadata)
+    return data_mixture, metadata_per_tag
+
+
 def _register_lerobot_mixture(
     *,
     mixture_name: str,
@@ -100,28 +126,82 @@ def _register_lerobot_mixture(
     from launch_scripts import data_mixtures
 
     def build_mixture():
-        data_mixture = []
-        metadata_per_tag = {}
-        for spec in specs:
-            partial_mixture, partial_metadata = data_mixtures.build_single_lerobot_mixture(
-                name=mixture_name,
-                tag=spec.tag,
-                repo_ids=[spec.repo_id],
-                action_key="action",
-                state_keys=["observation.state"],
-                camera_keys=spec.camera_keys,
-                normalize_gripper=True,
-                setup_type=spec.setup_type,
-                control_mode="absolute joint pose",
-                action_horizon=30,
-                n_action_steps=30,
-                rate=spec.rate,
-            )
-            data_mixture.extend(partial_mixture)
-            metadata_per_tag.update(partial_metadata)
-        return data_mixture, metadata_per_tag
+        return _build_lerobot_mixture_payload(mixture_name, specs)
 
     data_mixtures.MOLMOACT2_LEROBOT_MIXTURES[mixture_name] = build_mixture
+
+
+def _load_env_json(name: str) -> object | None:
+    raw = os.environ.get(name)
+    if raw:
+        return json.loads(raw)
+    path = os.environ.get(f"{name}_PATH")
+    if path:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def _bare_lerobot_tag(tag: str) -> str:
+    prefix = "lerobot:"
+    return tag[len(prefix):] if tag.startswith(prefix) else tag
+
+
+def _patch_validation_evaluators(
+    train_lerobot,
+    *,
+    validation_specs: list[DatasetSpec],
+    eval_interval: int,
+    eval_max_examples: int,
+    eval_device_batch_size: int,
+    log_interval: int,
+) -> None:
+    from launch_scripts.lerobot_utils.env import _store_env_json_in_file
+    from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
+
+    original_run_trainer = train_lerobot.run_trainer
+
+    def run_trainer_with_validation(conf):
+        repo_to_tag = _load_env_json("LEROBOT_REPO_TO_TAG") or {}
+        tag_metadata = _load_env_json("LEROBOT_TAG_METADATA") or {}
+        if not isinstance(repo_to_tag, dict) or not isinstance(tag_metadata, dict):
+            raise RuntimeError("LeRobot tag metadata was not initialized before validation injection")
+
+        evaluators = list(conf.evaluators or [])
+        for spec in validation_specs:
+            repo_to_tag[spec.repo_id] = spec.tag
+            _, spec_metadata = _build_lerobot_mixture_payload("validation", [spec])
+            for raw_tag, metadata in spec_metadata.items():
+                tag_metadata.setdefault(_bare_lerobot_tag(str(raw_tag)), metadata)
+
+            val_mixture, _ = _build_lerobot_mixture_payload("validation", [spec])
+            val_data = replace(
+                conf.data,
+                kwargs_mixture=val_mixture,
+                shuffle=False,
+                drop_last=False,
+                seed=conf.data.seed + len(evaluators) + 1,
+                packing=None,
+            )
+            evaluators.append(
+                LossDatasetEvaluatorConfig(
+                    label=f"val_{spec.tag}",
+                    data=val_data,
+                    device_batch_size=eval_device_batch_size,
+                    max_examples=eval_max_examples if eval_max_examples > 0 else None,
+                    console_log_interval=log_interval,
+                    response_logits_only=bool(conf.response_logits_only),
+                )
+            )
+
+        _store_env_json_in_file("LEROBOT_REPO_TO_TAG", repo_to_tag)
+        _store_env_json_in_file("LEROBOT_TAG_METADATA", tag_metadata)
+        conf.evaluators = evaluators
+        conf.eval_interval = eval_interval
+        conf.inf_eval_interval = -1
+        return original_run_trainer(conf)
+
+    train_lerobot.run_trainer = run_trainer_with_validation
 
 
 def main() -> int:
@@ -151,6 +231,19 @@ def main() -> int:
             "When provided, these replace --dataset-repo-id/--dataset-tag/--camera-keys."
         ),
     )
+    parser.add_argument(
+        "--validation-dataset-spec",
+        action="append",
+        type=_parse_dataset_spec,
+        default=[],
+        help=(
+            "Add a held-out LeRobot dataset to validation loss tracking as "
+            "'repo_id|tag|camera_key_1,camera_key_2|rate|setup_type'. Tags should match training tags."
+        ),
+    )
+    parser.add_argument("--eval-interval", type=int, default=int(os.environ.get("EVAL_INTERVAL", "25")))
+    parser.add_argument("--eval-max-examples", type=int, default=int(os.environ.get("EVAL_MAX_EXAMPLES", "0")))
+    parser.add_argument("--eval-device-batch-size", type=int, default=int(os.environ.get("EVAL_DEVICE_BATCH_SIZE", "1")))
     parser.add_argument("--run-name", default=os.environ.get("RUN_NAME", "molmoact2-so101-move-blue-ball-lora"))
     parser.add_argument("--save-folder", default=os.environ.get("SAVE_FOLDER", "/workspace/outputs/molmoact2-so101-move-blue-ball-lora"))
     parser.add_argument("--max-duration", type=int, default=int(os.environ.get("MAX_DURATION", "1000")))
@@ -228,10 +321,37 @@ def main() -> int:
     ]
 
     print(" ".join(train_argv), flush=True)
+    if args.validation_dataset_spec:
+        print(
+            "validation="
+            + json.dumps(
+                [
+                    {
+                        "repo_id": spec.repo_id,
+                        "tag": spec.tag,
+                        "camera_keys": spec.camera_keys,
+                        "rate": spec.rate,
+                    }
+                    for spec in args.validation_dataset_spec
+                ],
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     if args.dry_run:
         return 0
 
     from launch_scripts import train_lerobot
+
+    if args.validation_dataset_spec:
+        _patch_validation_evaluators(
+            train_lerobot,
+            validation_specs=args.validation_dataset_spec,
+            eval_interval=args.eval_interval,
+            eval_max_examples=args.eval_max_examples,
+            eval_device_batch_size=args.eval_device_batch_size,
+            log_interval=args.log_interval,
+        )
 
     sys.argv = train_argv
     train_lerobot.main()
