@@ -86,6 +86,24 @@ def _safe_dir_name(repo_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "__", repo_id).strip("_") or "repo"
 
 
+def _free_gb(path: Path) -> float:
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return shutil.disk_usage(probe).free / (1024**3)
+
+
+def _check_min_free(path: Path, *, min_free_gb: float, label: str) -> None:
+    if min_free_gb <= 0:
+        return
+    free_gb = _free_gb(path)
+    if free_gb < min_free_gb:
+        raise SystemExit(
+            f"low disk space for {label}: {free_gb:.1f} GiB free at {path} "
+            f"is below --min-free-gb {min_free_gb:.1f}"
+        )
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
@@ -518,6 +536,12 @@ def main() -> int:
     parser.add_argument("--encoder-threads", type=int, default=2)
     parser.add_argument("--video-backend", default="pyav")
     parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=4.0,
+        help="Abort before starting a source repo if output/cache free space is below this threshold.",
+    )
+    parser.add_argument(
         "--skip-video-codec",
         action="append",
         default=["av1"],
@@ -553,6 +577,8 @@ def main() -> int:
         for repo_id in repos:
             if len(report.selected) >= args.count:
                 break
+            _check_min_free(output_root.parent, min_free_gb=args.min_free_gb, label="output")
+            _check_min_free(cache_root, min_free_gb=args.min_free_gb, label="cache")
             repo_root = cache_root / _safe_dir_name(repo_id)
             try:
                 revision, info = _snapshot_metadata(repo_id, repo_root, revisions)
