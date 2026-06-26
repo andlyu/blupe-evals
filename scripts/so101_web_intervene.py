@@ -49,7 +49,8 @@ DEFAULT_POLICY_CAMERA_NAMES = tuple(
 DEFAULT_INSTRUCTION = "Move to blue ball, grab it, and place it in the cardboard cylinder"
 DEFAULT_DURATION_S = 300.0
 DEFAULT_EXEC_STEPS = 30
-DEFAULT_MAX_STEP_DEG = 90.0
+DEFAULT_MAX_STEP_DEG = 1.0
+POLICY_HARD_MAX_STEP_DEG = float(os.environ.get("SO101_POLICY_HARD_MAX_STEP_DEG", "2.0"))
 DEFAULT_HZ = 30.0
 MOLMO_TIMEOUT_S = 75.0
 RECORD_ROOT = REPO_ROOT / "episodes"
@@ -107,6 +108,35 @@ DEFAULT_CUP_POLYGON = np.array(
 
 
 DEFAULT_CAMERA_CONFIGS = default_camera_configs(SEMANTIC_CAMERA_NAMES)
+
+
+def _load_policy_joint_offsets() -> np.ndarray:
+    raw = os.environ.get("SO101_POLICY_JOINT_OFFSETS_DEG", "[0,180,0,0,0,0]")
+    offsets = np.asarray(json.loads(raw), dtype=np.float32).reshape(-1)
+    if offsets.shape != (len(JOINTS),):
+        raise ValueError(f"SO101_POLICY_JOINT_OFFSETS_DEG must have {len(JOINTS)} values")
+    return offsets
+
+
+POLICY_JOINT_OFFSETS_DEG = _load_policy_joint_offsets()
+
+
+def policy_step_limit(requested_max_step_deg: float) -> tuple[float, bool]:
+    requested = float(requested_max_step_deg)
+    if not np.isfinite(requested) or requested <= 0:
+        requested = DEFAULT_MAX_STEP_DEG
+    hard_cap = max(0.0, float(POLICY_HARD_MAX_STEP_DEG))
+    if hard_cap <= 0:
+        return requested, False
+    return min(requested, hard_cap), requested > hard_cap
+
+
+def robot_state_to_policy_state(state: np.ndarray) -> np.ndarray:
+    return np.asarray(state, dtype=np.float32) + POLICY_JOINT_OFFSETS_DEG
+
+
+def policy_action_to_robot_target(action: np.ndarray) -> np.ndarray:
+    return np.asarray(action, dtype=np.float32) - POLICY_JOINT_OFFSETS_DEG
 
 
 def _fmt(values: np.ndarray) -> str:
@@ -3007,9 +3037,12 @@ class SO101Controller:
     ) -> None:
         self.set_mode("policy")
         self.set_stage("starting")
+        effective_max_step_deg, max_step_clamped = policy_step_limit(max_step_deg)
+        clamp_note = f" clamped_to={effective_max_step_deg}" if max_step_clamped else ""
         self.log(
             f"policy start duration={duration_s}s exec_steps={exec_steps} "
-            f"max_step={max_step_deg} hz={hz} instruction={instruction!r}"
+            f"max_step={max_step_deg}{clamp_note} hz={hz} "
+            f"policy_offsets={_fmt(POLICY_JOINT_OFFSETS_DEG)} instruction={instruction!r}"
         )
         start = time.monotonic()
         period = 1.0 / hz if hz > 0 else 0.0
@@ -3018,7 +3051,11 @@ class SO101Controller:
                 next_chunk = self.chunks + 1
                 self.set_stage("read_state")
                 measured = self.read_state()
-                self.log(f"chunk {next_chunk} capture start measured {_fmt(measured)}")
+                policy_state = robot_state_to_policy_state(measured)
+                self.log(
+                    f"chunk {next_chunk} capture start measured {_fmt(measured)} "
+                    f"policy_state {_fmt(policy_state)}"
+                )
                 self.set_stage("capture")
                 images: dict[str, np.ndarray] = {}
                 capture_times = []
@@ -3032,7 +3069,7 @@ class SO101Controller:
                 self.log(f"chunk {next_chunk} query start timeout={MOLMO_TIMEOUT_S:.0f}s")
                 chunk = self.policy_client.act(
                     images=images,
-                    state=measured,
+                    state=policy_state,
                     instruction=instruction,
                     joints=JOINTS,
                 )
@@ -3058,9 +3095,13 @@ class SO101Controller:
                     if self.stop_event.is_set() or time.monotonic() - start >= duration_s:
                         break
                     self.set_stage("execute")
-                    model_target = chunk[k]
-                    if max_step_deg > 0:
-                        target = cur_cmd + np.clip(model_target - cur_cmd, -max_step_deg, max_step_deg)
+                    model_target = policy_action_to_robot_target(chunk[k])
+                    if effective_max_step_deg > 0:
+                        target = cur_cmd + np.clip(
+                            model_target - cur_cmd,
+                            -effective_max_step_deg,
+                            effective_max_step_deg,
+                        )
                     else:
                         target = model_target
                     self.send_state(target)
@@ -3378,7 +3419,7 @@ body.page-monitor #liveToggle { display:none; }
     <div class="row setup-only">
       <label>Duration <input id="duration" type="number" value="300" min="1" max="900" style="width:72px"></label>
       <label>Steps/chunk <input id="execSteps" type="number" value="30" min="1" max="30" style="width:72px"></label>
-      <label>Max step deg <input id="maxStep" type="number" value="90" min="0" max="180" step="0.5" style="width:72px"></label>
+      <label>Max step deg <input id="maxStep" type="number" value="1" min="0.1" max="10" step="0.1" style="width:72px"></label>
       <label>Hz <input id="hz" type="number" value="30" min="1" max="60" step="0.5" style="width:64px"></label>
     </div>
     <div class="row setup-only">
