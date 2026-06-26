@@ -1,0 +1,11 @@
+{
+  "stations": [
+    {
+      "id": "so101-jetson",
+      "name": "SO101 Jetson",
+      "base_url": "http://127.0.0.1:8092",
+      "robot_type": "so101_follower",
+      "cameras": ["front", "side", "wrist"]
+    }
+  ]
+}
