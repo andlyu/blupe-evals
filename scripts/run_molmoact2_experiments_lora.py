@@ -269,7 +269,9 @@ def _log_data_mix_bar_charts(extra_metrics: dict[str, float]) -> bool:
                 "frame_pct",
                 title="Data Mix: Frame %",
             ),
-        }
+        },
+        step=0,
+        commit=False,
     )
     return True
 

@@ -80,6 +80,9 @@ def test_data_mix_rows_are_wandb_table_ready():
 def test_log_data_mix_bar_charts_sends_wandb_payload(monkeypatch):
     logged_payloads = []
 
+    def log(payload, **kwargs):
+        logged_payloads.append((payload, kwargs))
+
     class FakeTable:
         def __init__(self, *, columns, data):
             self.columns = columns
@@ -94,13 +97,14 @@ def test_log_data_mix_bar_charts_sends_wandb_payload(monkeypatch):
         run=object(),
         Table=FakeTable,
         plot=FakePlot(),
-        log=logged_payloads.append,
+        log=log,
     )
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
 
     assert _log_data_mix_bar_charts(_data_mix_test_metrics()) is True
 
-    payload = logged_payloads[0]
+    payload, kwargs = logged_payloads[0]
+    assert kwargs == {"step": 0, "commit": False}
     assert payload["data_mix/table"].columns == [
         "source",
         "sample_pct",
