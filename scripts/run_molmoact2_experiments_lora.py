@@ -38,6 +38,12 @@ def _set_default_env(experiments_dir: Path, lerobot_data_root: str) -> None:
     os.environ.setdefault("LEROBOT_VIDEO_BACKEND", "pyav")
     os.environ.setdefault("WANDB_PROJECT", "molmoact-so101")
     os.environ.setdefault("WANDB_ENTITY", "")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_WORLD_SIZE", "1")
 
     pythonpath = [
         str(experiments_dir),
