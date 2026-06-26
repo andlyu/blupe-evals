@@ -126,6 +126,47 @@ cd /workspace/molmoact2/experiments
 Keep checkpoint outputs outside this repo, or under ignored artifact storage on the training
 machine. Do not commit checkpoints.
 
+## Remote Policy Eval
+
+For hardware evals, keep MolmoAct2 on the A100 and let the Jetson call it over HTTP.
+The Jetson remains responsible for SO101 IO, camera capture, safety clipping, teleop
+intervention, and recording. The Mac only opens the Jetson browser UI through SSH tunnels.
+
+A100:
+
+```bash
+cd /workspace/blupe_training/blupe-evals
+export MOLMOACT2_EXPERIMENTS_DIR=/workspace/molmoact2/experiments
+export MOLMOACT2_POLICY_PATH=/workspace/outputs/molmoact2-so101-move-blue-ball-lora/checkpoint-1000
+export MOLMOACT2_IMAGE_KEYS='["observation.images.front","observation.images.wrist"]'
+scripts/start_a100_molmoact2_policy_server.sh
+```
+
+Use `MOLMOACT2_POLICY_PATH` when the run saved a LeRobot policy directory. Use
+`MOLMOACT2_CHECKPOINT_PATH` plus `MOLMOACT2_NORM_TAG` for a base/released MolmoAct2
+checkpoint path instead.
+
+Jetson, first forward a local port to the A100 policy server:
+
+```bash
+ssh -N -L 8202:127.0.0.1:8202 root@A100_HOST
+```
+
+Then start the SO101 UI against that forwarded policy URL:
+
+```bash
+cd ~/blupe-evals
+export SO101_POLICY_URL=http://127.0.0.1:8202
+export SO101_POLICY_CAMERAS=front,wrist
+scripts/start_jetson_so101_remote_policy.sh
+```
+
+Then open LeLab from the Mac and use the Evals tab. The task instruction can stay:
+
+```text
+Move to blue ball, grab it, and place it in the cardboard cylinder
+```
+
 ## Checkpoint Pull
 
 Mirror checkpoints from a gstack machine to the eval host:

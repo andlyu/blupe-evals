@@ -41,7 +41,11 @@ from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
 
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 SEMANTIC_CAMERA_NAMES = ("front", "side", "wrist")
-POLICY_CAMERA_NAMES = ("front", "side")
+DEFAULT_POLICY_CAMERA_NAMES = tuple(
+    name.strip()
+    for name in os.environ.get("SO101_POLICY_CAMERAS", "front,side").split(",")
+    if name.strip()
+)
 DEFAULT_INSTRUCTION = "Move to blue ball, grab it, and place it in the cardboard cylinder"
 DEFAULT_DURATION_S = 300.0
 DEFAULT_EXEC_STEPS = 30
@@ -632,6 +636,7 @@ class SO101Controller:
         leader_port: str = "/dev/ttyACM1",
         leader_id: str = "blupe_leader",
         camera_configs: list[CameraConfig] | None = None,
+        policy_camera_names: list[str] | tuple[str, ...] | None = None,
         success_enabled: bool = True,
         success_fps: float = DEFAULT_SUCCESS_FPS,
     ):
@@ -643,6 +648,7 @@ class SO101Controller:
         self.camera_configs = list(camera_configs or DEFAULT_CAMERA_CONFIGS)
         self.cameras_by_name = {cam.name: cam for cam in self.camera_configs}
         self.cameras_by_id = {cam.id: cam for cam in self.camera_configs}
+        self.policy_camera_names = tuple(policy_camera_names or DEFAULT_POLICY_CAMERA_NAMES)
         self.success_enabled = success_enabled
         self.success_fps = success_fps
         self.robot: SO101Follower | None = None
@@ -1397,6 +1403,8 @@ class SO101Controller:
                 "steps": self.steps,
                 "chunks": self.chunks,
                 "last_query_s": self.last_query_s,
+                "policy_url": self.molmo_url,
+                "policy_cameras": list(self.policy_camera_names),
                 "log_path": "/tmp/so101_web_intervene.log",
                 "running": self.policy_thread is not None and self.policy_thread.is_alive(),
                 "elapsed": None if self.started_at is None else round(time.monotonic() - self.started_at, 1),
@@ -1680,7 +1688,7 @@ class SO101Controller:
         return deduped
 
     def _policy_cameras(self) -> list[CameraConfig]:
-        selected = [self.cameras_by_name[name] for name in POLICY_CAMERA_NAMES if name in self.cameras_by_name]
+        selected = [self.cameras_by_name[name] for name in self.policy_camera_names if name in self.cameras_by_name]
         return selected or self.camera_configs[:2]
 
     def _wait_motion_done(self, timeout_s: float) -> bool:
@@ -5888,6 +5896,16 @@ def main() -> int:
         default=[],
         help="Semantic camera mapping NAME=URL. Repeat for front, side, wrist. Defaults to local cam0/cam1/cam2 MJPEG.",
     )
+    parser.add_argument(
+        "--policy-camera",
+        action="append",
+        default=[],
+        choices=SEMANTIC_CAMERA_NAMES,
+        help=(
+            "Camera name sent to the policy runner, in order. Repeat to match the checkpoint's trained "
+            "image keys. Defaults to SO101_POLICY_CAMERAS or front,side."
+        ),
+    )
     parser.add_argument("--success-fps", type=float, default=DEFAULT_SUCCESS_FPS)
     parser.add_argument("--no-success-tracking", action="store_true")
     args = parser.parse_args()
@@ -5903,6 +5921,7 @@ def main() -> int:
         leader_port=args.leader_port,
         leader_id=args.leader_id,
         camera_configs=camera_configs,
+        policy_camera_names=args.policy_camera or DEFAULT_POLICY_CAMERA_NAMES,
         success_enabled=not args.no_success_tracking,
         success_fps=args.success_fps,
     )
