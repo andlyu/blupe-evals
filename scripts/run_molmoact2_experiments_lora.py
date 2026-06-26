@@ -255,10 +255,12 @@ def _patch_validation_evaluators(
             for raw_tag, metadata in spec_metadata.items():
                 tag_metadata.setdefault(_bare_lerobot_tag(str(raw_tag)), metadata)
 
-            val_mixture, _ = _build_lerobot_mixture_payload("validation", [spec])
             val_data = replace(
                 conf.data,
-                kwargs_mixture=val_mixture,
+                dataset=f"lerobot:{spec.repo_id}",
+                mixture=None,
+                root_size_mixture=None,
+                kwargs_mixture=None,
                 shuffle=False,
                 drop_last=False,
                 seed=conf.data.seed + len(evaluators) + 1,
