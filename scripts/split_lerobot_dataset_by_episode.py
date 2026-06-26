@@ -80,7 +80,10 @@ def _feature_subset(info: dict[str, Any], camera_keys: list[str]) -> dict[str, A
         value = source.get(key)
         if not isinstance(value, dict):
             raise ValueError(f"missing feature spec for {key}")
-        features[key] = dict(value)
+        feature = dict(value)
+        if isinstance(feature.get("shape"), list):
+            feature["shape"] = tuple(feature["shape"])
+        features[key] = feature
     return features
 
 
