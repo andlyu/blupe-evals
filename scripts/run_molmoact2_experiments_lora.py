@@ -215,14 +215,80 @@ def _data_mix_metrics(
     return metrics
 
 
+def _data_mix_rows(extra_metrics: dict[str, float]) -> list[dict[str, float | str]]:
+    return [
+        {
+            "source": "custom",
+            "sample_pct": extra_metrics["data_mix/custom_sample_pct"],
+            "episode_pct": extra_metrics["data_mix/custom_episode_pct"],
+            "frame_pct": extra_metrics["data_mix/custom_frame_pct"],
+            "sample_weight": extra_metrics["data_mix/custom_sample_weight"],
+            "episodes": extra_metrics["data_mix/custom_episodes"],
+            "frames": extra_metrics["data_mix/custom_frames"],
+        },
+        {
+            "source": "general",
+            "sample_pct": extra_metrics["data_mix/general_sample_pct"],
+            "episode_pct": extra_metrics["data_mix/general_episode_pct"],
+            "frame_pct": extra_metrics["data_mix/general_frame_pct"],
+            "sample_weight": extra_metrics["data_mix/general_sample_weight"],
+            "episodes": extra_metrics["data_mix/general_episodes"],
+            "frames": extra_metrics["data_mix/general_frames"],
+        },
+    ]
+
+
+def _log_data_mix_bar_charts(extra_metrics: dict[str, float]) -> bool:
+    import wandb
+
+    if wandb.run is None:
+        return False
+
+    rows = _data_mix_rows(extra_metrics)
+    columns = list(rows[0])
+    table = wandb.Table(columns=columns, data=[[row[column] for column in columns] for row in rows])
+    wandb.log(
+        {
+            "data_mix/table": table,
+            "data_mix/sample_pct_bar": wandb.plot.bar(
+                table,
+                "source",
+                "sample_pct",
+                title="Data Mix: Sampling %",
+            ),
+            "data_mix/episode_pct_bar": wandb.plot.bar(
+                table,
+                "source",
+                "episode_pct",
+                title="Data Mix: Episode %",
+            ),
+            "data_mix/frame_pct_bar": wandb.plot.bar(
+                table,
+                "source",
+                "frame_pct",
+                title="Data Mix: Frame %",
+            ),
+        }
+    )
+    return True
+
+
 def _patch_data_mix_metrics(extra_metrics: dict[str, float]) -> None:
     import olmo.train.trainer as trainer_mod
 
     original = trainer_mod.lerobot_tag_sampling_rate_metrics
+    logged_chart = False
 
     def lerobot_tag_sampling_rate_metrics_with_mix(*args, **kwargs):
+        nonlocal logged_chart
         metrics = dict(original(*args, **kwargs))
         metrics.update(extra_metrics)
+        if not logged_chart:
+            try:
+                logged_chart = _log_data_mix_bar_charts(extra_metrics)
+            except Exception as exc:
+                print(f"warning: failed to log W&B data mix bar chart: {exc}", file=sys.stderr, flush=True)
+                logged_chart = True
         return metrics
 
     trainer_mod.lerobot_tag_sampling_rate_metrics = lerobot_tag_sampling_rate_metrics_with_mix
