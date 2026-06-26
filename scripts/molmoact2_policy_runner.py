@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import inspect
 import json
 import sys
 import time
@@ -66,6 +67,16 @@ def _decode_image(payload: dict[str, Any]) -> np.ndarray:
 
 def _camera_name_from_image_key(image_key: str) -> str:
     return image_key.rsplit(".", 1)[-1]
+
+
+def _filter_kwargs_for_callable(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return dict(kwargs)
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return dict(kwargs)
+    return {key: value for key, value in kwargs.items() if key in signature.parameters}
 
 
 def _as_numpy_actions(actions: Any) -> np.ndarray:
@@ -201,13 +212,14 @@ class LeRobotMolmoAct2Runner:
             "use_amp": self.use_amp,
             "enable_inference_cuda_graph": self.enable_cuda_graph,
             "num_flow_timesteps": self.num_flow_timesteps,
+            "num_steps": self.num_flow_timesteps,
             "image_keys": self.image_keys,
             "chunk_size": self.num_actions,
             "n_action_steps": self.num_actions,
         }
         if self.norm_tag:
             cfg_kwargs["norm_tag"] = self.norm_tag
-        cfg = MolmoAct2Config(**cfg_kwargs)
+        cfg = MolmoAct2Config(**_filter_kwargs_for_callable(MolmoAct2Config, cfg_kwargs))
         self.policy = MolmoAct2Policy(cfg)
         self.policy_type = "molmoact2"
 
