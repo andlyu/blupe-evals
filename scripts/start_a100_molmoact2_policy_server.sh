@@ -15,6 +15,7 @@ NUM_ACTIONS="${MOLMOACT2_NUM_ACTIONS:-30}"
 ACTION_DIM="${MOLMOACT2_ACTION_DIM:-6}"
 MODEL_DTYPE="${MOLMOACT2_MODEL_DTYPE:-bfloat16}"
 FLOW_STEPS="${MOLMOACT2_NUM_FLOW_TIMESTEPS:-8}"
+NORM_TAG="${MOLMOACT2_NORM_TAG:-}"
 
 if [ -n "${MOLMOACT2_EXPERIMENTS_DIR:-}" ]; then
   export PYTHONPATH="${MOLMOACT2_EXPERIMENTS_DIR}:${MOLMOACT2_EXPERIMENTS_DIR}/lerobot/src:${PYTHONPATH:-}"
@@ -37,8 +38,11 @@ if [ -n "${MOLMOACT2_POLICY_PATH:-}" ]; then
   cmd+=(--policy-path "$MOLMOACT2_POLICY_PATH")
 elif [ -n "${MOLMOACT2_CHECKPOINT_PATH:-}" ]; then
   cmd+=(--checkpoint-path "$MOLMOACT2_CHECKPOINT_PATH")
-  if [ -n "${MOLMOACT2_NORM_TAG:-}" ]; then
-    cmd+=(--norm-tag "$MOLMOACT2_NORM_TAG")
+  if [ -z "$NORM_TAG" ] && [ "$MOLMOACT2_CHECKPOINT_PATH" = "allenai/MolmoAct2-SO100_101" ]; then
+    NORM_TAG="so100_so101_molmoact2"
+  fi
+  if [ -n "$NORM_TAG" ]; then
+    cmd+=(--norm-tag "$NORM_TAG")
   fi
 else
   echo "Set MOLMOACT2_POLICY_PATH for a LeRobot-saved policy, or MOLMOACT2_CHECKPOINT_PATH for a base HF checkpoint." >&2

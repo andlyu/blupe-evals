@@ -135,16 +135,19 @@ intervention, and recording. The Mac only opens the Jetson browser UI through SS
 A100:
 
 ```bash
-cd /workspace/blupe_training/blupe-evals
+cd /workspace/blupe-evals
 export MOLMOACT2_EXPERIMENTS_DIR=/workspace/molmoact2/experiments
-export MOLMOACT2_POLICY_PATH=/workspace/outputs/molmoact2-so101-move-blue-ball-lora/checkpoint-1000
+export MOLMOACT2_CHECKPOINT_PATH=allenai/MolmoAct2-SO100_101
+export MOLMOACT2_NORM_TAG=so100_so101_molmoact2
 export MOLMOACT2_IMAGE_KEYS='["observation.images.front","observation.images.wrist"]'
 scripts/start_a100_molmoact2_policy_server.sh
 ```
 
 Use `MOLMOACT2_POLICY_PATH` when the run saved a LeRobot policy directory. Use
 `MOLMOACT2_CHECKPOINT_PATH` plus `MOLMOACT2_NORM_TAG` for a base/released MolmoAct2
-checkpoint path instead.
+checkpoint path instead. For the released SO100/SO101 checkpoint, MolmoAct2's LeRobot
+docs specify `so100_so101_molmoact2`; the launcher defaults to that tag when
+`MOLMOACT2_CHECKPOINT_PATH=allenai/MolmoAct2-SO100_101`.
 
 Jetson, first forward a local port to the A100 policy server:
 
