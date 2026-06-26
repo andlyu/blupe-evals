@@ -147,6 +147,81 @@ def _bare_lerobot_tag(tag: str) -> str:
     return tag[len(prefix):] if tag.startswith(prefix) else tag
 
 
+def _repo_root_for_spec(lerobot_data_root: str, repo_id: str) -> Path:
+    root_base = Path(lerobot_data_root)
+    repo_path = Path(repo_id)
+    if repo_path.is_absolute():
+        return repo_path
+    return root_base / repo_path
+
+
+def _read_dataset_counts(root: Path) -> tuple[int, int]:
+    info_path = root / "meta" / "info.json"
+    if not info_path.exists():
+        return 0, 0
+    try:
+        info = json.loads(info_path.read_text())
+    except Exception:
+        return 0, 0
+    return int(info.get("total_episodes") or 0), int(info.get("total_frames") or 0)
+
+
+def _data_mix_metrics(
+    *,
+    specs: list[DatasetSpec],
+    lerobot_data_root: str,
+    custom_tags: set[str],
+) -> dict[str, float]:
+    custom_rate = 0.0
+    general_rate = 0.0
+    custom_episodes = 0
+    general_episodes = 0
+    custom_frames = 0
+    general_frames = 0
+    for spec in specs:
+        episodes, frames = _read_dataset_counts(_repo_root_for_spec(lerobot_data_root, spec.repo_id))
+        if spec.tag in custom_tags:
+            custom_rate += float(spec.rate)
+            custom_episodes += episodes
+            custom_frames += frames
+        else:
+            general_rate += float(spec.rate)
+            general_episodes += episodes
+            general_frames += frames
+
+    total_rate = custom_rate + general_rate
+    total_episodes = custom_episodes + general_episodes
+    total_frames = custom_frames + general_frames
+    metrics = {
+        "data_mix/custom_sample_pct": 100.0 * custom_rate / total_rate if total_rate else 0.0,
+        "data_mix/general_sample_pct": 100.0 * general_rate / total_rate if total_rate else 0.0,
+        "data_mix/custom_episode_pct": 100.0 * custom_episodes / total_episodes if total_episodes else 0.0,
+        "data_mix/general_episode_pct": 100.0 * general_episodes / total_episodes if total_episodes else 0.0,
+        "data_mix/custom_frame_pct": 100.0 * custom_frames / total_frames if total_frames else 0.0,
+        "data_mix/general_frame_pct": 100.0 * general_frames / total_frames if total_frames else 0.0,
+        "data_mix/custom_sample_weight": custom_rate,
+        "data_mix/general_sample_weight": general_rate,
+        "data_mix/custom_episodes": float(custom_episodes),
+        "data_mix/general_episodes": float(general_episodes),
+        "data_mix/custom_frames": float(custom_frames),
+        "data_mix/general_frames": float(general_frames),
+    }
+    return metrics
+
+
+def _patch_data_mix_metrics(extra_metrics: dict[str, float]) -> None:
+    import olmo.train.trainer as trainer_mod
+
+    original = trainer_mod.lerobot_tag_sampling_rate_metrics
+
+    def lerobot_tag_sampling_rate_metrics_with_mix(*args, **kwargs):
+        metrics = dict(original(*args, **kwargs))
+        metrics.update(extra_metrics)
+        return metrics
+
+    trainer_mod.lerobot_tag_sampling_rate_metrics = lerobot_tag_sampling_rate_metrics_with_mix
+
+
 def _patch_validation_evaluators(
     train_lerobot,
     *,
@@ -244,6 +319,12 @@ def main() -> int:
     parser.add_argument("--eval-interval", type=int, default=int(os.environ.get("EVAL_INTERVAL", "25")))
     parser.add_argument("--eval-max-examples", type=int, default=int(os.environ.get("EVAL_MAX_EXAMPLES", "0")))
     parser.add_argument("--eval-device-batch-size", type=int, default=int(os.environ.get("EVAL_DEVICE_BATCH_SIZE", "1")))
+    parser.add_argument(
+        "--custom-tag",
+        action="append",
+        default=[],
+        help="Training tag to count as custom/new data in W&B data_mix metrics. Repeatable.",
+    )
     parser.add_argument("--run-name", default=os.environ.get("RUN_NAME", "molmoact2-so101-move-blue-ball-lora"))
     parser.add_argument("--save-folder", default=os.environ.get("SAVE_FOLDER", "/workspace/outputs/molmoact2-so101-move-blue-ball-lora"))
     parser.add_argument("--max-duration", type=int, default=int(os.environ.get("MAX_DURATION", "1000")))
@@ -277,6 +358,12 @@ def main() -> int:
         )
     ]
     _register_lerobot_mixture(mixture_name=args.mixture, specs=specs)
+    custom_tags = set(args.custom_tag or [args.dataset_tag])
+    data_mix_metrics = _data_mix_metrics(
+        specs=specs,
+        lerobot_data_root=args.lerobot_data_root,
+        custom_tags=custom_tags,
+    )
 
     data_timeout = args.data_timeout
     if data_timeout < 0:
@@ -321,6 +408,7 @@ def main() -> int:
     ]
 
     print(" ".join(train_argv), flush=True)
+    print("data_mix=" + json.dumps(data_mix_metrics, sort_keys=True), flush=True)
     if args.validation_dataset_spec:
         print(
             "validation="
@@ -342,6 +430,8 @@ def main() -> int:
         return 0
 
     from launch_scripts import train_lerobot
+
+    _patch_data_mix_metrics(data_mix_metrics)
 
     if args.validation_dataset_spec:
         _patch_validation_evaluators(
