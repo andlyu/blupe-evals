@@ -263,6 +263,7 @@ def _patch_validation_evaluators(
                 drop_last=False,
                 seed=conf.data.seed + len(evaluators) + 1,
                 packing=None,
+                skip_overlong_examples=False,
             )
             evaluators.append(
                 LossDatasetEvaluatorConfig(
