@@ -235,7 +235,25 @@ def _resize_image(value: Any, *, width: int, height: int) -> Image.Image:
     return image
 
 
-def _decode_video(path: Path, *, width: int, height: int, max_frames: int = 0) -> list[Image.Image]:
+def _decode_video_pyav(path: Path, *, width: int, height: int, max_frames: int = 0) -> list[Image.Image]:
+    import av
+
+    frames: list[Image.Image] = []
+    with av.open(str(path)) as container:
+        stream = next((stream for stream in container.streams if stream.type == "video"), None)
+        if stream is None:
+            raise RuntimeError(f"no video stream in {path}")
+        for frame in container.decode(stream):
+            rgb = frame.to_ndarray(format="rgb24")
+            frames.append(_resize_image(rgb, width=width, height=height))
+            if max_frames > 0 and len(frames) >= max_frames:
+                break
+    if not frames:
+        raise RuntimeError(f"no frames decoded from {path}")
+    return frames
+
+
+def _decode_video_opencv(path: Path, *, width: int, height: int, max_frames: int = 0) -> list[Image.Image]:
     import cv2
 
     cap = cv2.VideoCapture(str(path))
@@ -256,6 +274,30 @@ def _decode_video(path: Path, *, width: int, height: int, max_frames: int = 0) -
     if not frames:
         raise RuntimeError(f"no frames decoded from {path}")
     return frames
+
+
+def _decode_video(
+    path: Path,
+    *,
+    width: int,
+    height: int,
+    max_frames: int = 0,
+    backend: str = "auto",
+) -> list[Image.Image]:
+    if backend == "pyav":
+        return _decode_video_pyav(path, width=width, height=height, max_frames=max_frames)
+    if backend == "opencv":
+        return _decode_video_opencv(path, width=width, height=height, max_frames=max_frames)
+    if backend != "auto":
+        raise ValueError(f"unsupported --source-video-backend {backend!r}")
+
+    errors: list[str] = []
+    for name, decoder in (("pyav", _decode_video_pyav), ("opencv", _decode_video_opencv)):
+        try:
+            return decoder(path, width=width, height=height, max_frames=max_frames)
+        except Exception as exc:
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+    raise RuntimeError(f"failed to decode {path}: {'; '.join(errors)}")
 
 
 def _make_output_dataset(args: argparse.Namespace):
@@ -422,6 +464,7 @@ def _load_v21_episode_rows(
             width=args.image_width,
             height=args.image_height,
             max_frames=args.max_frames_per_episode,
+            backend=args.source_video_backend,
         )
         for video_path in video_paths
     ]
@@ -536,6 +579,12 @@ def main() -> int:
     parser.add_argument("--encoder-threads", type=int, default=2)
     parser.add_argument("--video-backend", default="pyav")
     parser.add_argument(
+        "--source-video-backend",
+        choices=["auto", "pyav", "opencv"],
+        default="auto",
+        help="Decoder for source videos. auto tries PyAV first, then OpenCV.",
+    )
+    parser.add_argument(
         "--min-free-gb",
         type=float,
         default=4.0,
@@ -544,8 +593,8 @@ def main() -> int:
     parser.add_argument(
         "--skip-video-codec",
         action="append",
-        default=["av1"],
-        help="Skip source cameras with this codec according to metadata. Repeatable. Defaults to av1.",
+        default=[],
+        help="Skip source cameras with this codec according to metadata. Repeatable.",
     )
     parser.add_argument("--revision", action="append", default=[])
     parser.add_argument("--keep-source-cache", action="store_true")
