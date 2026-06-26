@@ -14,11 +14,9 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-from sam3.model.sam3_image_processor import Sam3Processor
-from sam3.model_builder import build_sam3_image_model
-
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
+DEFAULT_MODEL_ID = "facebook/sam3"
 
 
 def _to_numpy(value):
@@ -58,8 +56,32 @@ def _mask_png_b64(mask: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _box_list(box) -> list[float]:
+    return [float(v) for v in np.asarray(box).reshape(-1)[:4].tolist()]
+
+
+def _detection_from_mask(
+    mask: np.ndarray,
+    box,
+    score: float,
+    include_mask: bool,
+) -> dict:
+    mask = np.squeeze(mask) > 0
+    box_list = _box_list(box)
+    x0, y0, x1, y1 = box_list
+    detection = {
+        "score": float(score),
+        "box_xyxy": box_list,
+        "center_xy": [(x0 + x1) / 2.0, (y0 + y1) / 2.0],
+        "area_px": int(mask.sum()),
+    }
+    if include_mask:
+        detection["mask_png_b64"] = _mask_png_b64(mask)
+    return detection
+
+
 class Sam3Session:
-    def __init__(self, frames_dir: Path):
+    def __init__(self, frames_dir: Path, backend: str = "auto", model_id: str = DEFAULT_MODEL_ID):
         self.frames_dir = frames_dir
         self.frames = _frame_paths(frames_dir)
         if not self.frames:
@@ -67,14 +89,129 @@ class Sam3Session:
         first = Image.open(self.frames[0])
         self.size = first.size
         first.close()
+        if backend not in {"auto", "native", "transformers"}:
+            raise ValueError("backend must be auto, native, or transformers")
+        self.backend = backend
+        self.model_id = model_id
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._lock = threading.Lock()
+        self._active_backend = None
         self._processor = None
+        self._model = None
 
     def _processor_ready(self):
-        if self._processor is None:
-            model = build_sam3_image_model(bpe_path=str(_find_bpe_path()))
-            self._processor = Sam3Processor(model)
+        if self._processor is not None:
+            return self._processor
+
+        if self.backend in {"auto", "native"}:
+            try:
+                from sam3.model.sam3_image_processor import Sam3Processor
+                from sam3.model_builder import build_sam3_image_model
+
+                try:
+                    model = build_sam3_image_model()
+                except TypeError:
+                    model = build_sam3_image_model(bpe_path=str(_find_bpe_path()))
+                self._processor = Sam3Processor(model)
+                self._active_backend = "native"
+                return self._processor
+            except (FileNotFoundError, ModuleNotFoundError):
+                if self.backend == "native":
+                    raise
+
+        if self.backend in {"auto", "transformers"}:
+            from transformers import Sam3Model, Sam3Processor
+
+            self._processor = Sam3Processor.from_pretrained(self.model_id)
+            self._model = Sam3Model.from_pretrained(self.model_id).to(self.device).eval()
+            self._active_backend = "transformers"
+            return self._processor
+
         return self._processor
+
+    def _prompt_native(
+        self,
+        image: Image.Image,
+        prompt: str,
+        max_masks: int,
+        include_masks: bool,
+        min_score: float | None,
+    ) -> tuple[list[dict], int]:
+        processor = self._processor_ready()
+        state = processor.set_image(image)
+        output = processor.set_text_prompt(state=state, prompt=prompt)
+        masks = _to_numpy(output["masks"])
+        boxes = _to_numpy(output["boxes"])
+        scores = _to_numpy(output["scores"])
+        detections = []
+        count = min(max_masks, len(masks))
+        for mask_idx in range(count):
+            score = float(scores[mask_idx])
+            if min_score is not None and score < min_score:
+                continue
+            detections.append(
+                _detection_from_mask(
+                    masks[mask_idx],
+                    boxes[mask_idx],
+                    score,
+                    include_mask=include_masks,
+                )
+            )
+        return detections, int(len(masks))
+
+    def _prompt_transformers(
+        self,
+        image: Image.Image,
+        prompt: str,
+        max_masks: int,
+        include_masks: bool,
+        min_score: float | None,
+    ) -> tuple[list[dict], int]:
+        processor = self._processor_ready()
+        assert self._model is not None
+        inputs = processor(images=image, text=prompt, return_tensors="pt").to(self.device)
+        outputs = self._model(**inputs)
+        target_sizes = inputs.get("original_sizes")
+        if hasattr(target_sizes, "tolist"):
+            target_sizes = target_sizes.tolist()
+        results = processor.post_process_instance_segmentation(
+            outputs,
+            threshold=0.0 if min_score is None else float(min_score),
+            mask_threshold=0.5,
+            target_sizes=target_sizes,
+        )[0]
+        masks = _to_numpy(results.get("masks", []))
+        boxes = _to_numpy(results.get("boxes", []))
+        scores = _to_numpy(results.get("scores", []))
+        detections = []
+        count = min(max_masks, len(masks))
+        for mask_idx in range(count):
+            score = float(scores[mask_idx])
+            if min_score is not None and score < min_score:
+                continue
+            detections.append(
+                _detection_from_mask(
+                    masks[mask_idx],
+                    boxes[mask_idx],
+                    score,
+                    include_mask=include_masks,
+                )
+            )
+        return detections, int(len(masks))
+
+    def _prompt(
+        self,
+        image: Image.Image,
+        prompt: str,
+        max_masks: int,
+        include_masks: bool,
+        min_score: float | None,
+    ) -> tuple[list[dict], int]:
+        processor = self._processor_ready()
+        del processor
+        if self._active_backend == "transformers":
+            return self._prompt_transformers(image, prompt, max_masks, include_masks, min_score)
+        return self._prompt_native(image, prompt, max_masks, include_masks, min_score)
 
     def detect(self, frame_idx: int, prompts: list[str], max_masks: int, alpha: float) -> dict:
         if frame_idx < 0 or frame_idx >= len(self.frames):
@@ -146,42 +283,41 @@ class Sam3Session:
                 else torch.autocast("cpu", enabled=False)
             )
             with autocast:
-                processor = self._processor_ready()
-                state = processor.set_image(image)
+                self._processor_ready()
                 for prompt_idx, prompt in enumerate(prompts):
-                    output = processor.set_text_prompt(state=state, prompt=prompt)
-                    masks = _to_numpy(output["masks"])
-                    boxes = _to_numpy(output["boxes"])
-                    scores = _to_numpy(output["scores"])
-                    count = min(max_masks, len(masks))
-                    prompt_results = []
                     color = colors[prompt_idx % len(colors)]
-                    for mask_idx in range(count):
-                        mask = np.squeeze(masks[mask_idx]) > 0
-                        box = boxes[mask_idx].tolist()
-                        score = float(scores[mask_idx])
-                        if min_score is not None and score < min_score:
-                            continue
+                    prompt_results, num_masks = self._prompt(
+                        image,
+                        prompt,
+                        max_masks=max_masks,
+                        include_masks=True,
+                        min_score=min_score,
+                    )
+                    response_results = []
+                    for mask_idx, detection in enumerate(prompt_results):
+                        mask_payload = detection.get("mask_png_b64")
+                        if mask_payload:
+                            mask_bytes = base64.b64decode(mask_payload)
+                            mask_image = Image.open(io.BytesIO(mask_bytes)).convert("L")
+                            mask = np.array(mask_image) > 0
+                        else:
+                            mask = np.zeros(base.shape[:2], dtype=bool)
+                        box = detection["box_xyxy"]
+                        score = float(detection["score"])
                         overlay[mask] = (1.0 - alpha) * overlay[mask] + alpha * color
-                        x0, y0, x1, y1 = box
-                        detection = {
-                            "score": score,
-                            "box_xyxy": box,
-                            "center_xy": [(x0 + x1) / 2.0, (y0 + y1) / 2.0],
-                            "area_px": int(mask.sum()),
-                        }
-                        if include_masks:
-                            detection["mask_png_b64"] = _mask_png_b64(mask)
-                        prompt_results.append(detection)
+                        response_detection = dict(detection)
+                        if not include_masks:
+                            response_detection.pop("mask_png_b64", None)
                         if top_mask is None or score > float(top_mask.get("score", -1.0)):
-                            top_mask = {"prompt": prompt, **detection}
+                            top_mask = {"prompt": prompt, **response_detection}
                         if mask_idx == 0:
                             draw_items.append((prompt, score, box, tuple(int(v) for v in color)))
+                        response_results.append(response_detection)
                     results.append(
                         {
                             "prompt": prompt,
-                            "num_masks": int(len(masks)),
-                            "detections": prompt_results,
+                            "num_masks": num_masks,
+                            "detections": response_results,
                         }
                     )
                 if torch.cuda.is_available():
@@ -492,9 +628,11 @@ def main() -> None:
     parser.add_argument("--frames-dir", required=True)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8202)
+    parser.add_argument("--backend", choices=("auto", "native", "transformers"), default="auto")
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     args = parser.parse_args()
 
-    Handler.session = Sam3Session(Path(args.frames_dir))
+    Handler.session = Sam3Session(Path(args.frames_dir), backend=args.backend, model_id=args.model_id)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[sam3-ui] serving http://{args.host}:{args.port}", flush=True)
     server.serve_forever()

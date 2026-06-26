@@ -13,7 +13,7 @@ ROBOT_PORT="${SO101_ROBOT_PORT:-/dev/ttyACM0}"
 ROBOT_ID="${SO101_ROBOT_ID:-blupe_follower}"
 LEADER_PORT="${SO101_LEADER_PORT:-/dev/ttyACM1}"
 LEADER_ID="${SO101_LEADER_ID:-blupe_leader}"
-SUCCESS_TRACKING="${SO101_SUCCESS_TRACKING:-0}"
+SUCCESS_TRACKING="${SO101_SUCCESS_TRACKING:-1}"
 
 if [ -z "$POLICY_URL" ]; then
   echo "Set SO101_POLICY_URL to the A100 policy server, e.g. http://127.0.0.1:8202 through a tunnel." >&2
