@@ -16,7 +16,10 @@ import shutil
 from pathlib import Path
 
 
-DEFAULT_BLUPE_EVALS_URL = "http://127.0.0.1:8099/dashboard"
+DEFAULT_BLUPE_EVALS_URL = "http://127.0.0.1:8092/"
+OLD_BLUPE_EVALS_URLS = (
+    "http://127.0.0.1:8099/dashboard",
+)
 
 SOURCE_HANDLER = (
     "  const handleBlupeEvalsClick = () => "
@@ -60,6 +63,10 @@ def _backup(path: Path) -> None:
 
 def patch_landing_source(text: str) -> tuple[str, bool]:
     changed = False
+    for old_url in OLD_BLUPE_EVALS_URLS:
+        if old_url in text:
+            text = text.replace(old_url, DEFAULT_BLUPE_EVALS_URL)
+            changed = True
 
     if "handleBlupeEvalsClick" not in text:
         if "const handleEditDatasetClick" in text:
@@ -93,6 +100,10 @@ def patch_landing_source(text: str) -> tuple[str, bool]:
 
 def patch_dist_bundle_text(text: str) -> tuple[str, bool]:
     changed = False
+    for old_url in OLD_BLUPE_EVALS_URLS:
+        if old_url in text:
+            text = text.replace(old_url, DEFAULT_BLUPE_EVALS_URL)
+            changed = True
 
     if DIST_HANDLER_NEEDLE not in text:
         marker = f"window.location.assign(`{DEFAULT_BLUPE_EVALS_URL}`)"

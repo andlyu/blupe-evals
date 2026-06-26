@@ -56,3 +56,24 @@ def test_blupe_tab_patch_updates_production_bundle_text() -> None:
     assert "md:grid-cols-4" in patched
     assert "BluPe Evals" in patched
     assert "Open Evals" in patched
+
+
+def test_blupe_tab_patch_updates_old_hub_url() -> None:
+    old_url = "http://127.0.0.1:8099/dashboard"
+    source = (
+        f'  const handleBlupeEvalsClick = () => window.location.assign("{old_url}");\n'
+        '<div className="grid grid-cols-1 md:grid-cols-4 gap-3">\n'
+        f"{SOURCE_TRAINING_CARD}"
+        "BluPe Evals"
+    )
+    bundle = f"window.location.assign(`{old_url}`);BluPe Evals"
+
+    patched_source, source_changed = patch_landing_source(source)
+    patched_bundle, bundle_changed = patch_dist_bundle_text(bundle)
+
+    assert source_changed is True
+    assert bundle_changed is True
+    assert old_url not in patched_source
+    assert old_url not in patched_bundle
+    assert DEFAULT_BLUPE_EVALS_URL in patched_source
+    assert DEFAULT_BLUPE_EVALS_URL in patched_bundle
