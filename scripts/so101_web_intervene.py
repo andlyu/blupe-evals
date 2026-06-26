@@ -3405,28 +3405,6 @@ body.page-monitor #liveToggle { display:none; }
       <div id="sam3PreviewStatus" class="sam3-status mono"></div>
       <img id="sam3Preview" alt="SAM3 prompt preview">
     </div>
-    <hr class="setup-only" style="border-color:#333">
-    <div class="busyboard-editor setup-only">
-      <label>Busyboard Data Collection</label>
-      <div class="row">
-        <label>Duration <input id="busyboardDuration" type="number" value="600" min="1" max="3600" style="width:82px"></label>
-        <label>FPS <input id="busyboardFps" type="number" value="30" min="0.5" max="30" step="0.5" style="width:64px"></label>
-        <button class="primary" onclick="startBusyboardRecording()">Start Long Take</button>
-        <button class="danger" onclick="stopBusyboardRecording()">Stop Long Take</button>
-        <span id="busyboardStatus" class="mono"></span>
-      </div>
-      <label>Subepisode Segments</label>
-      <div class="row">
-        <label>Source <input id="busyboardSource" type="text" value="latest" style="width:260px"></label>
-        <button onclick="useLatestBusyboardSource()">Use Current Recording</button>
-        <button class="good" onclick="extractBusyboardSegments()">Extract Subepisodes</button>
-        <span id="busyboardExtractStatus" class="mono"></span>
-      </div>
-      <textarea id="busyboardSegments">[
-  {"start_s": 0.0, "end_s": 3.0, "task": "press red button", "outcome": "success"},
-  {"start_s": 4.0, "end_s": 7.0, "task": "press green button", "outcome": "success"}
-]</textarea>
-    </div>
     <div class="hidden" aria-hidden="true">
       <input id="evalHours" type="number" value="1" min="0.05" max="8" step="0.05">
       <input id="evalAttempt" type="number" value="60" min="5" max="600" step="1">
@@ -3461,7 +3439,6 @@ let lastStatus = null;
 let teleopLeaseId = sessionStorage.getItem('so101TeleopLeaseId') || '';
 const teleopOperatorKey = 'so101TeleopOperator';
 let datasetPromptDismissedFor = sessionStorage.getItem('so101DatasetPromptDismissedFor') || '';
-let lastBusyboardRecordingName = localStorage.getItem('so101BusyboardSource') || '';
 const cameraTimers = [];
 
 function setPage(page) {
@@ -3520,10 +3497,6 @@ if (teleopOperatorInput) {
   teleopOperatorInput.addEventListener('input', () => {
     localStorage.setItem(teleopOperatorKey, teleopOperatorInput.value || 'operator');
   });
-}
-const busyboardSourceInput = document.getElementById('busyboardSource');
-if (busyboardSourceInput && lastBusyboardRecordingName) {
-  busyboardSourceInput.value = lastBusyboardRecordingName;
 }
 document.getElementById('sam3Prompt')?.addEventListener('input', () => { sam3PromptDirty = true; });
 document.getElementById('sam3MinScore')?.addEventListener('input', () => { sam3MinScoreDirty = true; });
@@ -3710,61 +3683,6 @@ async function startRecording() {
   await refresh();
 }
 async function stopRecording() { await api('/api/record/stop', {}); await refresh(); }
-function basename(path) {
-  return String(path || '').split(/[\\/]/).filter(Boolean).pop() || '';
-}
-function useLatestBusyboardSource() {
-  const rec = lastStatus?.recording || {};
-  const name = basename(rec.dir) || lastBusyboardRecordingName || 'latest';
-  const input = document.getElementById('busyboardSource');
-  if (input) input.value = name;
-}
-async function startBusyboardRecording() {
-  const data = await api('/api/record/start', {
-    duration_s: Number(val('busyboardDuration')),
-    fps: Number(val('busyboardFps')),
-    cameras: ['front', 'side', 'wrist'],
-    task: 'busyboard long recording',
-    name_prefix: 'so101_busyboard_long',
-    capture_mode: 'continuous',
-    extra_meta: {
-      collection_type: 'busyboard_long_take',
-      expected_subtasks: ['press red button', 'press green button'],
-    },
-  });
-  lastBusyboardRecordingName = basename(data.dir);
-  if (lastBusyboardRecordingName) {
-    localStorage.setItem('so101BusyboardSource', lastBusyboardRecordingName);
-    const input = document.getElementById('busyboardSource');
-    if (input) input.value = lastBusyboardRecordingName;
-  }
-  await refresh();
-}
-async function stopBusyboardRecording() {
-  await api('/api/record/stop', {});
-  await refresh();
-}
-async function extractBusyboardSegments() {
-  const statusEl = document.getElementById('busyboardExtractStatus');
-  if (statusEl) statusEl.textContent = 'extracting...';
-  let segments;
-  try {
-    segments = JSON.parse(val('busyboardSegments'));
-  } catch (e) {
-    if (statusEl) statusEl.textContent = `invalid JSON: ${e.message}`;
-    return;
-  }
-  try {
-    const data = await api('/api/busyboard/extract', {
-      source: val('busyboardSource') || lastBusyboardRecordingName || 'latest',
-      segments,
-    });
-    if (statusEl) statusEl.textContent = `created ${data.episode_count || 0} episode(s), ${data.total_frames || 0} frames`;
-  } catch (e) {
-    if (statusEl) statusEl.textContent = e.message;
-  }
-  await refresh();
-}
 function renderState(data) {
   const el = document.getElementById('state');
   const joints = data.joints || [];
@@ -3987,20 +3905,6 @@ function renderLiveStats(data) {
     `<div class="live-stat"><span>last event</span><b>${escapeHtml(last)}</b></div>`,
   ].join('');
 }
-function renderBusyboard(data) {
-  const el = document.getElementById('busyboardStatus');
-  if (!el) return;
-  const rec = data.recording || {};
-  const counts = rec.counts ? Object.entries(rec.counts).map(([k, v]) => `${k}=${v}`).join(' ') : '';
-  const name = basename(rec.dir);
-  if (rec.running && rec.capture_mode === 'continuous') {
-    el.textContent = `recording ${rec.elapsed || 0}s ${counts} ${name}`;
-  } else if (name) {
-    el.textContent = `idle ${rec.capture_mode || ''} ${counts} ${name}`;
-  } else {
-    el.textContent = '';
-  }
-}
 function datasetFingerprint(dataset) {
   return `${dataset.success_count || 0}:${dataset.failure_count || 0}:${dataset.uncompressed_success_count || 0}:${dataset.started_at || ''}:${dataset.completed_at || ''}`;
 }
@@ -4091,7 +3995,6 @@ async function refresh() {
     renderLivePrompt(data);
     renderLiveEvents(data);
     renderLiveStats(data);
-    renderBusyboard(data);
     renderDatasetPrompt(data);
     updateLiveView(data);
     const sam3PreviewButton = document.getElementById('sam3PreviewButton');
