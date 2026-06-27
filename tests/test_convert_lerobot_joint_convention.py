@@ -83,7 +83,11 @@ def test_convert_dataset_rewrites_state_action_and_stats(tmp_path):
 
     stats = json.loads((dest / "meta" / "stats.json").read_text())
     np.testing.assert_allclose(stats["observation.state"]["mean"], [0.5, 175, 162.5, 1, -44.5, 1.5])
+    np.testing.assert_allclose(stats["observation.state"]["q01"], [0.01, 170.1, 160.05, 0.02, -44.99, 0.03])
+    np.testing.assert_allclose(stats["observation.state"]["q99"], [0.99, 179.9, 164.95, 1.98, -44.01, 2.97])
     np.testing.assert_allclose(stats["action"]["mean"], [1, 174, 163.5, 1.5, -44, 2.5])
+    np.testing.assert_allclose(stats["action"]["q01"], [0.02, 169.1, 161.05, 0.03, -44.98, 1.03])
+    np.testing.assert_allclose(stats["action"]["q99"], [1.98, 178.9, 165.95, 2.97, -43.02, 3.97])
 
     episode_stats = pd.read_parquet(dest / "meta" / "episodes" / "chunk-000" / "file-000.parquet")
     np.testing.assert_allclose(episode_stats["stats/observation.state/mean"].iloc[0], [0.5, 175, 162.5, 1, -44.5, 1.5])
