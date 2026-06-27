@@ -399,6 +399,68 @@ def _data_mix_rows(extra_metrics: dict[str, float]) -> list[dict[str, float | st
     ]
 
 
+def _episode_count_rows(
+    segment_rows: list[dict[str, float | str]],
+    *,
+    split: str | None = None,
+) -> list[dict[str, float | str]]:
+    rows: list[dict[str, float | str]] = []
+    for row in segment_rows:
+        row_split = str(row["split"])
+        if split is not None and row_split != split:
+            continue
+        output: dict[str, float | str] = {
+            "group": str(row["group"]),
+            "dataset": str(row["segment"]),
+            "episodes": float(row["episodes"]),
+        }
+        if split is None:
+            output = {"split": row_split, **output}
+        rows.append(output)
+    return rows
+
+
+def _dataset_episode_count_rows(segment_rows: list[dict[str, float | str]]) -> list[dict[str, float | str]]:
+    rows_by_key: dict[tuple[str, str], dict[str, float | str]] = {}
+    for row in segment_rows:
+        group = str(row["group"])
+        dataset = str(row["segment"])
+        key = (group, dataset)
+        output = rows_by_key.setdefault(
+            key,
+            {
+                "group": group,
+                "dataset": dataset,
+                "train_episodes": 0.0,
+                "val_episodes": 0.0,
+            },
+        )
+        if row["split"] == "train":
+            output["train_episodes"] = float(output["train_episodes"]) + float(row["episodes"])
+        elif row["split"] == "validation":
+            output["val_episodes"] = float(output["val_episodes"]) + float(row["episodes"])
+    return list(rows_by_key.values())
+
+
+def _group_episode_count_rows(segment_rows: list[dict[str, float | str]]) -> list[dict[str, float | str]]:
+    rows_by_group: dict[str, dict[str, float | str]] = {}
+    for row in segment_rows:
+        group = str(row["group"])
+        output = rows_by_group.setdefault(
+            group,
+            {
+                "group": group,
+                "train_episodes": 0.0,
+                "val_episodes": 0.0,
+            },
+        )
+        if row["split"] == "train":
+            output["train_episodes"] = float(output["train_episodes"]) + float(row["episodes"])
+        elif row["split"] == "validation":
+            output["val_episodes"] = float(output["val_episodes"]) + float(row["episodes"])
+    return list(rows_by_group.values())
+
+
 def _log_data_mix_bar_charts(
     extra_metrics: dict[str, float],
     segment_rows: list[dict[str, float | str]],
@@ -435,14 +497,29 @@ def _log_data_mix_bar_charts(
     if segment_rows:
         segment_table = _wandb_table(segment_rows)
         payload["data_segments/table"] = segment_table
+        episode_count_rows = _episode_count_rows(segment_rows)
+        if episode_count_rows:
+            payload["data_segments/episode_counts_table"] = _wandb_table(episode_count_rows)
+        dataset_episode_count_rows = _dataset_episode_count_rows(segment_rows)
+        if dataset_episode_count_rows:
+            payload["data_segments/dataset_episode_counts_table"] = _wandb_table(
+                dataset_episode_count_rows
+            )
+        group_episode_count_rows = _group_episode_count_rows(segment_rows)
+        if group_episode_count_rows:
+            payload["data_segments/group_episode_counts_table"] = _wandb_table(
+                group_episode_count_rows
+            )
         train_rows = [row for row in segment_rows if row["split"] == "train"]
         validation_rows = [row for row in segment_rows if row["split"] == "validation"]
         if train_rows:
             train_table = _wandb_table(train_rows)
+            train_episode_count_rows = _episode_count_rows(segment_rows, split="train")
             payload["data_segments/train_table"] = train_table
+            payload["data_segments/train_episode_counts_table"] = _wandb_table(train_episode_count_rows)
             payload["data_segments/train_episodes_bar"] = wandb.plot.bar(
-                train_table,
-                "segment",
+                payload["data_segments/train_episode_counts_table"],
+                "dataset",
                 "episodes",
                 title="Train Segments: Episodes",
             )
@@ -454,10 +531,14 @@ def _log_data_mix_bar_charts(
             )
         if validation_rows:
             validation_table = _wandb_table(validation_rows)
+            validation_episode_count_rows = _episode_count_rows(segment_rows, split="validation")
             payload["data_segments/validation_table"] = validation_table
+            payload["data_segments/validation_episode_counts_table"] = _wandb_table(
+                validation_episode_count_rows
+            )
             payload["data_segments/validation_episodes_bar"] = wandb.plot.bar(
-                validation_table,
-                "segment",
+                payload["data_segments/validation_episode_counts_table"],
+                "dataset",
                 "episodes",
                 title="Validation Segments: Episodes",
             )

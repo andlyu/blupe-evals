@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_NAME="${RUN_NAME:-molmoact2-so101-pickup-mix-blueball-v21-plus-general500-2val-segments-s10k-eval50}"
+RUN_NAME="${RUN_NAME:-molmoact2-so101-pickup-mix-blueball-v21-plus-general500-2val-tables-s10k-eval50}"
 SAVE_FOLDER="${SAVE_FOLDER:-/backup/outputs/${RUN_NAME}}"
 LOG_DIR="${LOG_DIR:-/backup/logs}"
 EXPERIMENTS_DIR="${MOLMOACT2_EXPERIMENTS_DIR:-/workspace/molmoact2/experiments}"
