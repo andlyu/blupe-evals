@@ -73,11 +73,41 @@ def _parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _parse_episode_selector(raw_episodes: str) -> list[int]:
+    episodes: list[int] = []
+    for part in raw_episodes.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            raw_start, raw_end = part.split("-", 1)
+            start = int(raw_start)
+            end = int(raw_end)
+            if end < start:
+                start, end = end, start
+            episodes.extend(range(start, end + 1))
+        else:
+            episodes.append(int(part))
+    if not episodes:
+        raise ValueError(f"no episodes in selector {raw_episodes!r}")
+    return sorted(set(episodes))
+
+
+def _split_repo_episode_selector(repo_id: str) -> tuple[str, list[int] | None]:
+    if "@" not in repo_id:
+        return repo_id, None
+    base_repo_id, raw_episodes = repo_id.split("@", 1)
+    base_repo_id = base_repo_id.strip()
+    if not base_repo_id:
+        raise ValueError(f"invalid episode-qualified repo id {repo_id!r}")
+    return base_repo_id, _parse_episode_selector(raw_episodes)
+
+
 def _parse_dataset_spec(value: str) -> DatasetSpec:
     parts = [part.strip() for part in value.split("|")]
     if len(parts) != 5:
         raise argparse.ArgumentTypeError(
-            "--dataset-spec must be 'repo_id|tag|camera_key_1,camera_key_2|rate|setup_type'"
+            "--dataset-spec must be 'repo_id[@episodes]|tag|camera_key_1,camera_key_2|rate|setup_type'"
         )
     repo_id, tag, camera_keys_text, rate_text, setup_type = parts
     camera_keys = _parse_csv(camera_keys_text)
@@ -155,11 +185,38 @@ def _bare_lerobot_tag(tag: str) -> str:
 
 
 def _repo_root_for_spec(lerobot_data_root: str, repo_id: str) -> Path:
+    repo_id, _episodes = _split_repo_episode_selector(repo_id)
     root_base = Path(lerobot_data_root)
     repo_path = Path(repo_id)
     if repo_path.is_absolute():
         return repo_path
     return root_base / repo_path
+
+
+def _selected_episode_frame_count(root: Path, episodes: list[int]) -> int | None:
+    episodes_root = root / "meta" / "episodes"
+    if not episodes_root.exists():
+        return None
+    try:
+        import pandas as pd
+    except Exception:
+        return None
+
+    selected = set(episodes)
+    frames = 0
+    found = False
+    for path in sorted(episodes_root.glob("**/*.parquet")):
+        try:
+            df = pd.read_parquet(path, columns=["episode_index", "length"])
+        except Exception:
+            continue
+        if "episode_index" not in df or "length" not in df:
+            continue
+        mask = df["episode_index"].isin(selected)
+        if bool(mask.any()):
+            found = True
+            frames += int(df.loc[mask, "length"].sum())
+    return frames if found else None
 
 
 def _read_dataset_counts(root: Path) -> tuple[int, int]:
@@ -171,6 +228,19 @@ def _read_dataset_counts(root: Path) -> tuple[int, int]:
     except Exception:
         return 0, 0
     return int(info.get("total_episodes") or 0), int(info.get("total_frames") or 0)
+
+
+def _read_dataset_counts_for_spec(lerobot_data_root: str, repo_id: str) -> tuple[int, int]:
+    root = _repo_root_for_spec(lerobot_data_root, repo_id)
+    total_episodes, total_frames = _read_dataset_counts(root)
+    _base_repo_id, selected_episodes = _split_repo_episode_selector(repo_id)
+    if selected_episodes is None:
+        return total_episodes, total_frames
+    selected_count = len(selected_episodes)
+    selected_frames = _selected_episode_frame_count(root, selected_episodes)
+    if selected_frames is None and total_episodes > 0:
+        selected_frames = round(total_frames * selected_count / total_episodes)
+    return selected_count, int(selected_frames or 0)
 
 
 def _data_mix_metrics(
@@ -186,7 +256,7 @@ def _data_mix_metrics(
     custom_frames = 0
     general_frames = 0
     for spec in specs:
-        episodes, frames = _read_dataset_counts(_repo_root_for_spec(lerobot_data_root, spec.repo_id))
+        episodes, frames = _read_dataset_counts_for_spec(lerobot_data_root, spec.repo_id)
         if spec.tag in custom_tags:
             custom_rate += float(spec.rate)
             custom_episodes += episodes
@@ -495,9 +565,7 @@ def main() -> int:
     parser.add_argument("--num-workers", type=int, default=int(os.environ.get("NUM_WORKERS", "2")))
     parser.add_argument("--data-timeout", type=int, default=int(os.environ.get("DATA_TIMEOUT", "-1")))
     parser.add_argument("--save-interval", type=int, default=int(os.environ.get("SAVE_INTERVAL", "0")))
-    parser.add_argument("--lora-save-interval", type=int, default=int(os.environ.get("LORA_SAVE_INTERVAL", "250")))
     parser.add_argument("--save-keep", type=int, default=int(os.environ.get("SAVE_KEEP", "20")))
-    parser.add_argument("--lora-save-keep", type=int, default=int(os.environ.get("LORA_SAVE_KEEP", "20")))
     parser.add_argument("--lora-rank", type=int, default=int(os.environ.get("LORA_RANK", "64")))
     parser.add_argument("--log-interval", type=int, default=int(os.environ.get("LOG_INTERVAL", "1")))
     parser.add_argument("--save-merged-lora", action="store_true")
@@ -545,9 +613,7 @@ def main() -> int:
         "--pin_memory=true",
         f"--data.timeout={data_timeout}",
         f"--save_interval={save_interval}",
-        f"--save_lora_interval={args.lora_save_interval}",
         f"--save_num_checkpoints_to_keep={args.save_keep}",
-        f"--save_lora_num_checkpoints_to_keep={args.lora_save_keep}",
         f"--save_folder={args.save_folder}",
         "--packing=false",
         "--dynamic_seq_len=true",

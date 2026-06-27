@@ -57,10 +57,10 @@ cleanup_loop() {
 
 common_args=(
   --mixture move_blue_ball_plus_general25
-  --dataset-spec 'andlyu/so100_so101_original_25eps_camera12_train20|so100_so101_original_25eps|observation.images.camera1,observation.images.camera2|0.5|SO100/SO101 original manipulation task'
-  --dataset-spec 'andlyu/move_blue_ball_training_v21_train6|so101_move_blue_ball_v21|observation.images.front,observation.images.wrist|0.5|single SO-101 follower arm moving a blue ball'
-  --validation-dataset-spec 'andlyu/so100_so101_original_25eps_camera12_val5|so100_so101_original_25eps|observation.images.camera1,observation.images.camera2|1.0|SO100/SO101 original manipulation task'
-  --validation-dataset-spec 'andlyu/move_blue_ball_training_v21_val2|so101_move_blue_ball_v21|observation.images.front,observation.images.wrist|1.0|single SO-101 follower arm moving a blue ball'
+  --dataset-spec 'andlyu/so100_so101_original_25eps_camera12@0-19|so100_so101_original_25eps|observation.images.camera1,observation.images.camera2|0.5|SO100/SO101 original manipulation task'
+  --dataset-spec 'andlyu/move_blue_ball_training_v21@0-5|so101_move_blue_ball_v21|observation.images.front,observation.images.wrist|0.5|single SO-101 follower arm moving a blue ball'
+  --validation-dataset-spec 'andlyu/so100_so101_original_25eps_camera12@20-24|so100_so101_original_25eps|observation.images.camera1,observation.images.camera2|1.0|SO100/SO101 original manipulation task'
+  --validation-dataset-spec 'andlyu/move_blue_ball_training_v21@6-7|so101_move_blue_ball_v21|observation.images.front,observation.images.wrist|1.0|single SO-101 follower arm moving a blue ball'
   --custom-tag so101_move_blue_ball_v21
   --run-name "${RUN_NAME}"
   --save-folder "${SAVE_FOLDER}"
@@ -71,7 +71,6 @@ common_args=(
   --eval-max-examples "${EVAL_MAX_EXAMPLES:-16}"
   --eval-device-batch-size "${EVAL_DEVICE_BATCH_SIZE:-1}"
   --save-keep "${SAVE_KEEP:-20}"
-  --lora-save-keep "${LORA_SAVE_KEEP:-20}"
   --save-merged-lora
 )
 
@@ -87,7 +86,6 @@ run_phase() {
     "${common_args[@]}" \
     --max-duration "${max_duration}" \
     --save-interval "${save_interval}" \
-    --lora-save-interval "${save_interval}" \
     2>&1 | tee -a "${LOG_DIR}/${RUN_NAME}.log"
   cleanup_full_checkpoints || true
 }

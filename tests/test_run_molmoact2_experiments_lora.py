@@ -3,11 +3,18 @@ import sys
 import types
 from pathlib import Path
 
+import pandas as pd
+
 import scripts.run_molmoact2_experiments_lora as run_lora
 from scripts.run_molmoact2_experiments_lora import (
+    DatasetSpec,
+    _data_mix_metrics,
     _data_mix_rows,
     _log_data_mix_bar_charts,
+    _parse_dataset_spec,
+    _repo_root_for_spec,
     _patch_runtime_split_metrics,
+    _read_dataset_counts_for_spec,
     _runtime_split_metrics,
     _set_default_env,
 )
@@ -35,6 +42,68 @@ def test_set_default_env_adds_single_process_torch_distributed_defaults(monkeypa
         "WORLD_SIZE": "1",
         "LOCAL_WORLD_SIZE": "1",
     }.items() <= dict(os.environ).items()
+
+
+def test_dataset_spec_accepts_episode_selector():
+    spec = _parse_dataset_spec(
+        "andlyu/example@0-2,4|example_tag|observation.images.front,observation.images.wrist|0.5|setup"
+    )
+
+    assert spec == DatasetSpec(
+        repo_id="andlyu/example@0-2,4",
+        tag="example_tag",
+        camera_keys=["observation.images.front", "observation.images.wrist"],
+        rate=0.5,
+        setup_type="setup",
+    )
+
+
+def test_episode_selected_counts_use_base_repo_path_and_episode_lengths(tmp_path):
+    root = tmp_path / "lerobot_data" / "andlyu" / "example"
+    (root / "meta" / "episodes" / "chunk-000").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text('{"total_episodes": 5, "total_frames": 150}\n')
+    pd.DataFrame(
+        {
+            "episode_index": [0, 1, 2, 3, 4],
+            "length": [10, 20, 30, 40, 50],
+        }
+    ).to_parquet(root / "meta" / "episodes" / "chunk-000" / "file-000.parquet", index=False)
+
+    assert _repo_root_for_spec(str(tmp_path / "lerobot_data"), "andlyu/example@1-3") == root
+    assert _read_dataset_counts_for_spec(str(tmp_path / "lerobot_data"), "andlyu/example@1-3") == (3, 90)
+
+
+def test_data_mix_metrics_count_episode_selected_specs(tmp_path):
+    data_root = tmp_path / "lerobot_data"
+    for repo_id, lengths in {
+        "andlyu/general": [100, 100, 100, 100, 100],
+        "andlyu/custom": [10, 20, 30],
+    }.items():
+        root = data_root / repo_id
+        (root / "meta" / "episodes" / "chunk-000").mkdir(parents=True)
+        (root / "meta" / "info.json").write_text(
+            f'{{"total_episodes": {len(lengths)}, "total_frames": {sum(lengths)}}}\n'
+        )
+        pd.DataFrame(
+            {
+                "episode_index": list(range(len(lengths))),
+                "length": lengths,
+            }
+        ).to_parquet(root / "meta" / "episodes" / "chunk-000" / "file-000.parquet", index=False)
+
+    metrics = _data_mix_metrics(
+        specs=[
+            DatasetSpec("andlyu/general@0-1", "general", ["camera1"], 0.5, "setup"),
+            DatasetSpec("andlyu/custom@1-2", "custom", ["camera1"], 0.5, "setup"),
+        ],
+        lerobot_data_root=str(data_root),
+        custom_tags={"custom"},
+    )
+
+    assert metrics["data_mix/general_episodes"] == 2.0
+    assert metrics["data_mix/general_frames"] == 200.0
+    assert metrics["data_mix/custom_episodes"] == 2.0
+    assert metrics["data_mix/custom_frames"] == 50.0
 
 
 def _data_mix_test_metrics() -> dict[str, float]:
