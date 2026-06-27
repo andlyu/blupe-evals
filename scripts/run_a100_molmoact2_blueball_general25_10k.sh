@@ -67,7 +67,7 @@ common_args=(
   --global-batch-size "${GLOBAL_BATCH_SIZE:-8}"
   --device-batch-size "${DEVICE_BATCH_SIZE:-1}"
   --num-workers "${NUM_WORKERS:-2}"
-  --eval-interval "${EVAL_INTERVAL:-250}"
+  --eval-interval "${EVAL_INTERVAL:-50}"
   --eval-max-examples "${EVAL_MAX_EXAMPLES:-16}"
   --eval-device-batch-size "${EVAL_DEVICE_BATCH_SIZE:-1}"
   --save-keep "${SAVE_KEEP:-20}"
