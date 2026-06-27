@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -464,6 +466,16 @@ def _patch_validation_evaluators(
     from olmo.eval.loss_evaluator import LossDatasetEvaluatorConfig
 
     original_run_trainer = train_lerobot.run_trainer
+    tag_counts = Counter(spec.tag for spec in validation_specs)
+
+    def validation_label(spec: DatasetSpec) -> str:
+        label = f"val_{spec.tag}"
+        if tag_counts[spec.tag] <= 1:
+            return label
+        repo_id, _ = _split_repo_episode_selector(spec.repo_id)
+        repo_slug = repo_id.rsplit("/", 1)[-1]
+        repo_slug = re.sub(r"[^A-Za-z0-9_]+", "_", repo_slug).strip("_")
+        return f"{label}_{repo_slug}"
 
     def run_trainer_with_validation(conf):
         repo_to_tag = _load_env_json("LEROBOT_REPO_TO_TAG") or {}
@@ -492,7 +504,7 @@ def _patch_validation_evaluators(
             )
             evaluators.append(
                 LossDatasetEvaluatorConfig(
-                    label=f"val_{spec.tag}",
+                    label=validation_label(spec),
                     data=val_data,
                     device_batch_size=eval_device_batch_size,
                     max_examples=eval_max_examples if eval_max_examples > 0 else None,
