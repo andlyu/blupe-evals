@@ -8,8 +8,15 @@ EXPERIMENTS_DIR="${MOLMOACT2_EXPERIMENTS_DIR:-/workspace/molmoact2/experiments}"
 PYTHON_BIN="${PYTHON_BIN:-/workspace/venv/bin/python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-/workspace/venv/bin/torchrun}"
 SCRIPT_PATH="${SCRIPT_PATH:-/workspace/blupe-evals/scripts/run_molmoact2_experiments_lora.py}"
+export HF_HOME="${HF_HOME:-/workspace/.hf_home}"
+export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 
-mkdir -p "${SAVE_FOLDER}" "${LOG_DIR}"
+mkdir -p "${SAVE_FOLDER}" "${LOG_DIR}" "${HF_HOME}"
+if [[ ! -f "${HF_HOME}/token" && -f /root/.cache/huggingface/token ]]; then
+  cp /root/.cache/huggingface/token "${HF_HOME}/token"
+  chmod 600 "${HF_HOME}/token"
+fi
 
 cleanup_full_checkpoints() {
   "${PYTHON_BIN}" - "${SAVE_FOLDER}" <<'PY'
