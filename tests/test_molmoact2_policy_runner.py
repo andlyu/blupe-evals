@@ -108,3 +108,64 @@ def test_hf_checkpoint_path_calls_model_card_predict_action(monkeypatch):
     assert policy.kwargs["normalize_language"] is True
     assert policy.kwargs["enable_cuda_graph"] is True
     assert "action_tokenizer" not in policy.kwargs
+
+
+def test_local_training_checkpoint_chunk_is_unnormalized_with_robot_processor():
+    class FakeTorch:
+        @staticmethod
+        def inference_mode():
+            return contextlib.nullcontext()
+
+    class FakeRobotProcessor:
+        def __init__(self):
+            self.calls = []
+
+        def unnormalize_action(self, actions, repo_id):
+            self.calls.append(repo_id)
+            return np.asarray(actions, dtype=np.float32) * 10.0 + 100.0
+
+    class FakePolicy:
+        def __init__(self, robot_processor):
+            self._handles = SimpleNamespace(robot_processor=robot_processor, norm_tag="")
+
+        def reset(self):
+            pass
+
+        def predict_action_chunk(self, batch):
+            del batch
+            return np.asarray(
+                [
+                    [
+                        [-0.5, 0.0, 0.5, 1.0, -1.0, 0.25],
+                        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                        [0.9, 0.9, 0.9, 0.9, 0.9, 0.9],
+                    ]
+                ],
+                dtype=np.float32,
+            )
+
+    robot_processor = FakeRobotProcessor()
+    runner = LeRobotMolmoAct2Runner.__new__(LeRobotMolmoAct2Runner)
+    runner.policy = FakePolicy(robot_processor)
+    runner.torch = FakeTorch()
+    runner.preprocessor = None
+    runner.postprocessor = lambda action: (_ for _ in ()).throw(AssertionError("postprocessor should be skipped"))
+    runner.runner_api = "lerobot_local_training_checkpoint"
+    runner.norm_tag = "so101_move_blue_ball_v21"
+    runner.num_actions = 2
+
+    actions = runner._predict_action_chunk({"observation.state": np.zeros((1, 6), dtype=np.float32)})
+
+    assert robot_processor.calls == ["so101_move_blue_ball_v21"]
+    np.testing.assert_allclose(
+        actions,
+        np.asarray(
+            [
+                [
+                    [95.0, 100.0, 105.0, 110.0, 90.0, 102.5],
+                    [101.0, 102.0, 103.0, 104.0, 105.0, 106.0],
+                ]
+            ],
+            dtype=np.float32,
+        ),
+    )

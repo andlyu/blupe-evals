@@ -80,6 +80,13 @@ def _filter_kwargs_for_callable(callable_obj: Any, kwargs: dict[str, Any]) -> di
     return {key: value for key, value in kwargs.items() if key in signature.parameters}
 
 
+def _is_local_training_checkpoint(checkpoint_path: str | None) -> bool:
+    if not checkpoint_path:
+        return False
+    checkpoint_dir = Path(checkpoint_path).expanduser()
+    return checkpoint_dir.exists() and (checkpoint_dir / "config.yaml").exists()
+
+
 def _as_numpy_actions(actions: Any) -> np.ndarray:
     if hasattr(actions, "detach"):
         actions = actions.detach().cpu().numpy()
@@ -152,7 +159,10 @@ class LeRobotMolmoAct2Runner:
             self._load_lerobot_policy(self.policy_path)
         else:
             assert self.checkpoint_path is not None
-            self._load_original_hf_checkpoint(self.checkpoint_path)
+            if _is_local_training_checkpoint(self.checkpoint_path):
+                self._load_local_training_checkpoint(self.checkpoint_path)
+            else:
+                self._load_original_hf_checkpoint(self.checkpoint_path)
 
         self.policy.to(self.device)
         self.policy.eval()
@@ -197,6 +207,45 @@ class LeRobotMolmoAct2Runner:
             )
         except Exception as exc:
             print(f"[molmoact2] warning: could not load saved processors: {exc}", file=sys.stderr, flush=True)
+
+    def _load_local_training_checkpoint(self, checkpoint_path: str) -> None:
+        try:
+            import lerobot.policies.molmoact2.configuration_molmoact2  # noqa: F401
+            from lerobot.configs.types import FeatureType, PolicyFeature
+            from lerobot.policies.factory import make_pre_post_processors
+            from lerobot.policies.molmoact2.configuration_molmoact2 import MolmoAct2Config
+            from lerobot.policies.molmoact2.modeling_molmoact2 import MolmoAct2Policy
+            from lerobot.utils.constants import ACTION
+        except Exception as exc:
+            raise SystemExit(
+                "LeRobot MolmoAct2 is not importable. Run this in the MolmoAct2 experiments environment."
+            ) from exc
+
+        if not self.norm_tag:
+            raise SystemExit("--norm-tag is required for local MolmoAct2 training checkpoints.")
+
+        cfg = MolmoAct2Config(
+            checkpoint_path=str(Path(checkpoint_path).expanduser()),
+            device=self.device,
+            num_steps=self.num_flow_timesteps,
+            inference_action_mode=self.inference_action_mode,
+            norm_tag=self.norm_tag,
+            enable_inference_cuda_graph=self.enable_cuda_graph,
+        )
+        cfg.input_features = {
+            self.state_key: PolicyFeature(type=FeatureType.STATE, shape=(self.action_dim,)),
+            **{
+                image_key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 360, 640))
+                for image_key in self.image_keys
+            },
+        }
+        cfg.output_features = {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(self.action_dim,)),
+        }
+        self.policy = MolmoAct2Policy(cfg)
+        self.preprocessor, self.postprocessor = make_pre_post_processors(cfg)
+        self.policy_type = "molmoact2"
+        self.runner_api = "lerobot_local_training_checkpoint"
 
     def _load_original_hf_checkpoint(self, checkpoint_path: str) -> None:
         try:
@@ -379,6 +428,7 @@ class LeRobotMolmoAct2Runner:
         if hasattr(self.policy, "reset"):
             self.policy.reset()
 
+        already_unnormalized = False
         with self.torch.inference_mode():
             if hasattr(self.policy, "predict_action_chunk"):
                 actions = self.policy.predict_action_chunk(batch)
@@ -390,13 +440,32 @@ class LeRobotMolmoAct2Runner:
             actions = actions.unsqueeze(0)
         actions = actions[:, : self.num_actions, :]
 
-        if self.postprocessor is not None:
+        if self.runner_api == "lerobot_local_training_checkpoint":
+            actions, already_unnormalized = self._unnormalize_local_training_actions(actions)
+
+        if self.postprocessor is not None and not already_unnormalized:
             processed = []
             for idx in range(actions.shape[1]):
                 processed.append(self.postprocessor(actions[:, idx, :]))
             actions = self.torch.stack(processed, dim=1)
 
         return actions
+
+    def _unnormalize_local_training_actions(self, actions: Any) -> tuple[Any, bool]:
+        handles = getattr(self.policy, "_handles", None)
+        robot_processor = getattr(handles, "robot_processor", None)
+        if robot_processor is None or not hasattr(robot_processor, "unnormalize_action"):
+            return actions, False
+
+        norm_tag = self.norm_tag or str(getattr(handles, "norm_tag", "") or "").strip()
+        if not norm_tag:
+            return actions, False
+
+        try:
+            actions = robot_processor.unnormalize_action(actions, repo_id=norm_tag)
+        except Exception as exc:
+            raise RuntimeError(f"failed to unnormalize MolmoAct2 actions for norm_tag={norm_tag!r}") from exc
+        return actions, True
 
     def act(self, payload: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
