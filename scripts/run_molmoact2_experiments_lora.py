@@ -186,6 +186,22 @@ def _bare_lerobot_tag(tag: str) -> str:
     return tag[len(prefix):] if tag.startswith(prefix) else tag
 
 
+def _metric_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
+    return slug or "unknown"
+
+
+def _repo_segment_name(repo_id: str) -> str:
+    base_repo_id, _episodes = _split_repo_episode_selector(repo_id)
+    return _metric_slug(base_repo_id.rsplit("/", 1)[-1])
+
+
+def _episode_selector_text(repo_id: str) -> str:
+    if "@" not in repo_id:
+        return "all"
+    return repo_id.split("@", 1)[1].strip() or "all"
+
+
 def _repo_root_for_spec(lerobot_data_root: str, repo_id: str) -> Path:
     repo_id, _episodes = _split_repo_episode_selector(repo_id)
     root_base = Path(lerobot_data_root)
@@ -196,29 +212,44 @@ def _repo_root_for_spec(lerobot_data_root: str, repo_id: str) -> Path:
 
 
 def _selected_episode_frame_count(root: Path, episodes: list[int]) -> int | None:
-    episodes_root = root / "meta" / "episodes"
-    if not episodes_root.exists():
-        return None
     try:
         import pandas as pd
     except Exception:
         return None
 
     selected = set(episodes)
+    data_root = root / "data"
+    if data_root.exists():
+        frames = 0
+        for path in sorted(data_root.glob("**/*.parquet")):
+            try:
+                df = pd.read_parquet(path, columns=["episode_index"])
+            except Exception:
+                continue
+            if "episode_index" not in df:
+                continue
+            frames += int(df["episode_index"].isin(selected).sum())
+        return frames
+
+    episodes_root = root / "meta" / "episodes"
     frames = 0
     found = False
-    for path in sorted(episodes_root.glob("**/*.parquet")):
-        try:
-            df = pd.read_parquet(path, columns=["episode_index", "length"])
-        except Exception:
-            continue
-        if "episode_index" not in df or "length" not in df:
-            continue
-        mask = df["episode_index"].isin(selected)
-        if bool(mask.any()):
-            found = True
-            frames += int(df.loc[mask, "length"].sum())
-    return frames if found else None
+    if episodes_root.exists():
+        for path in sorted(episodes_root.glob("**/*.parquet")):
+            try:
+                df = pd.read_parquet(path, columns=["episode_index", "length"])
+            except Exception:
+                continue
+            if "episode_index" not in df or "length" not in df:
+                continue
+            mask = df["episode_index"].isin(selected)
+            if bool(mask.any()):
+                found = True
+                frames += int(df.loc[mask, "length"].sum())
+        if found:
+            return frames
+
+    return None
 
 
 def _read_dataset_counts(root: Path) -> tuple[int, int]:
@@ -243,6 +274,56 @@ def _read_dataset_counts_for_spec(lerobot_data_root: str, repo_id: str) -> tuple
     if selected_frames is None and total_episodes > 0:
         selected_frames = round(total_frames * selected_count / total_episodes)
     return selected_count, int(selected_frames or 0)
+
+
+def _data_segment_rows(
+    *,
+    specs: list[DatasetSpec],
+    validation_specs: list[DatasetSpec],
+    lerobot_data_root: str,
+    custom_tags: set[str],
+) -> list[dict[str, float | str]]:
+    rows: list[dict[str, float | str]] = []
+    train_rate_total = sum(float(spec.rate) for spec in specs)
+
+    def add_row(split: str, spec: DatasetSpec, sample_pct: float) -> None:
+        episodes, frames = _read_dataset_counts_for_spec(lerobot_data_root, spec.repo_id)
+        group = "custom" if spec.tag in custom_tags else "general"
+        rows.append(
+            {
+                "split": split,
+                "segment": _repo_segment_name(spec.repo_id),
+                "repo_id": _split_repo_episode_selector(spec.repo_id)[0],
+                "episode_selector": _episode_selector_text(spec.repo_id),
+                "tag": spec.tag,
+                "group": group,
+                "sample_weight": float(spec.rate),
+                "sample_pct": sample_pct,
+                "episodes": float(episodes),
+                "frames": float(frames),
+            }
+        )
+
+    for spec in specs:
+        sample_pct = 100.0 * float(spec.rate) / train_rate_total if train_rate_total else 0.0
+        add_row("train", spec, sample_pct)
+    for spec in validation_specs:
+        add_row("validation", spec, 0.0)
+    return rows
+
+
+def _data_segment_scalar_metrics(rows: list[dict[str, float | str]]) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for row in rows:
+        split = str(row["split"])
+        segment = _metric_slug(str(row["segment"]))
+        prefix = f"data_segments/{split}/{segment}"
+        metrics[f"{prefix}/episodes"] = float(row["episodes"])
+        metrics[f"{prefix}/frames"] = float(row["frames"])
+        if split == "train":
+            metrics[f"{prefix}/sample_pct"] = float(row["sample_pct"])
+            metrics[f"{prefix}/sample_weight"] = float(row["sample_weight"])
+    return metrics
 
 
 def _data_mix_metrics(
@@ -288,6 +369,13 @@ def _data_mix_metrics(
     return metrics
 
 
+def _wandb_table(rows: list[dict[str, float | str]]):
+    import wandb
+
+    columns = list(rows[0])
+    return wandb.Table(columns=columns, data=[[row[column] for column in columns] for row in rows])
+
+
 def _data_mix_rows(extra_metrics: dict[str, float]) -> list[dict[str, float | str]]:
     return [
         {
@@ -311,44 +399,83 @@ def _data_mix_rows(extra_metrics: dict[str, float]) -> list[dict[str, float | st
     ]
 
 
-def _log_data_mix_bar_charts(extra_metrics: dict[str, float]) -> bool:
+def _log_data_mix_bar_charts(
+    extra_metrics: dict[str, float],
+    segment_rows: list[dict[str, float | str]],
+) -> bool:
     import wandb
 
     if wandb.run is None:
         return False
 
     rows = _data_mix_rows(extra_metrics)
-    columns = list(rows[0])
-    table = wandb.Table(columns=columns, data=[[row[column] for column in columns] for row in rows])
-    wandb.log(
-        {
-            "data_mix/table": table,
-            "data_mix/sample_pct_bar": wandb.plot.bar(
-                table,
-                "source",
-                "sample_pct",
-                title="Data Mix: Sampling %",
-            ),
-            "data_mix/episode_pct_bar": wandb.plot.bar(
-                table,
-                "source",
-                "episode_pct",
-                title="Data Mix: Episode %",
-            ),
-            "data_mix/frame_pct_bar": wandb.plot.bar(
-                table,
-                "source",
-                "frame_pct",
-                title="Data Mix: Frame %",
-            ),
-        },
-        step=0,
-        commit=False,
-    )
+    table = _wandb_table(rows)
+    payload = {
+        "data_mix/table": table,
+        "data_mix/sample_pct_bar": wandb.plot.bar(
+            table,
+            "source",
+            "sample_pct",
+            title="Data Mix: Sampling %",
+        ),
+        "data_mix/episode_pct_bar": wandb.plot.bar(
+            table,
+            "source",
+            "episode_pct",
+            title="Data Mix: Episode %",
+        ),
+        "data_mix/frame_pct_bar": wandb.plot.bar(
+            table,
+            "source",
+            "frame_pct",
+            title="Data Mix: Frame %",
+        ),
+    }
+
+    if segment_rows:
+        segment_table = _wandb_table(segment_rows)
+        payload["data_segments/table"] = segment_table
+        train_rows = [row for row in segment_rows if row["split"] == "train"]
+        validation_rows = [row for row in segment_rows if row["split"] == "validation"]
+        if train_rows:
+            train_table = _wandb_table(train_rows)
+            payload["data_segments/train_table"] = train_table
+            payload["data_segments/train_episodes_bar"] = wandb.plot.bar(
+                train_table,
+                "segment",
+                "episodes",
+                title="Train Segments: Episodes",
+            )
+            payload["data_segments/train_frames_bar"] = wandb.plot.bar(
+                train_table,
+                "segment",
+                "frames",
+                title="Train Segments: Frames",
+            )
+        if validation_rows:
+            validation_table = _wandb_table(validation_rows)
+            payload["data_segments/validation_table"] = validation_table
+            payload["data_segments/validation_episodes_bar"] = wandb.plot.bar(
+                validation_table,
+                "segment",
+                "episodes",
+                title="Validation Segments: Episodes",
+            )
+            payload["data_segments/validation_frames_bar"] = wandb.plot.bar(
+                validation_table,
+                "segment",
+                "frames",
+                title="Validation Segments: Frames",
+            )
+
+    wandb.log(payload, step=0, commit=False)
     return True
 
 
-def _patch_data_mix_metrics(extra_metrics: dict[str, float]) -> None:
+def _patch_data_mix_metrics(
+    extra_metrics: dict[str, float],
+    segment_rows: list[dict[str, float | str]],
+) -> None:
     import olmo.train.trainer as trainer_mod
 
     original = trainer_mod.lerobot_tag_sampling_rate_metrics
@@ -360,7 +487,7 @@ def _patch_data_mix_metrics(extra_metrics: dict[str, float]) -> None:
         metrics.update(extra_metrics)
         if not logged_chart:
             try:
-                logged_chart = _log_data_mix_bar_charts(extra_metrics)
+                logged_chart = _log_data_mix_bar_charts(extra_metrics, segment_rows)
             except Exception as exc:
                 print(f"warning: failed to log W&B data mix bar chart: {exc}", file=sys.stderr, flush=True)
                 logged_chart = True
@@ -606,6 +733,13 @@ def main() -> int:
         lerobot_data_root=args.lerobot_data_root,
         custom_tags=custom_tags,
     )
+    data_segment_rows = _data_segment_rows(
+        specs=specs,
+        validation_specs=args.validation_dataset_spec,
+        lerobot_data_root=args.lerobot_data_root,
+        custom_tags=custom_tags,
+    )
+    data_mix_metrics.update(_data_segment_scalar_metrics(data_segment_rows))
 
     data_timeout = args.data_timeout
     if data_timeout < 0:
@@ -649,6 +783,7 @@ def main() -> int:
 
     print(" ".join(train_argv), flush=True)
     print("data_mix=" + json.dumps(data_mix_metrics, sort_keys=True), flush=True)
+    print("data_segments=" + json.dumps(data_segment_rows, sort_keys=True), flush=True)
     if args.validation_dataset_spec:
         print(
             "validation="
@@ -671,7 +806,7 @@ def main() -> int:
 
     from launch_scripts import train_lerobot
 
-    _patch_data_mix_metrics(data_mix_metrics)
+    _patch_data_mix_metrics(data_mix_metrics, data_segment_rows)
     _patch_runtime_split_metrics()
 
     if args.validation_dataset_spec:

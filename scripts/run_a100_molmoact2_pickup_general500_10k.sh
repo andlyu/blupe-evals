@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_NAME="${RUN_NAME:-molmoact2-so101-pickup-mix-blueball-v21-plus-general500-s10k-eval50}"
+RUN_NAME="${RUN_NAME:-molmoact2-so101-pickup-mix-blueball-v21-plus-general500-2val-segments-s10k-eval50}"
 SAVE_FOLDER="${SAVE_FOLDER:-/backup/outputs/${RUN_NAME}}"
 LOG_DIR="${LOG_DIR:-/backup/logs}"
 EXPERIMENTS_DIR="${MOLMOACT2_EXPERIMENTS_DIR:-/workspace/molmoact2/experiments}"
@@ -62,7 +62,6 @@ common_args=(
   --dataset-spec 'andlyu/pick_up_ball_v21_pt2@0-22|so101_pick_up_ball_v21|observation.images.front,observation.images.wrist|0.1666666667|single SO-101 follower arm picking up a ball'
   --dataset-spec 'andlyu/move_blue_ball_training_v21@0-5|so101_move_blue_ball_v21|observation.images.front,observation.images.wrist|0.1666666667|single SO-101 follower arm moving a blue ball'
   --validation-dataset-spec 'andlyu/so100_so101_original_500eps_camera12@159-167|so100_so101_original_500eps|observation.images.camera1,observation.images.camera2|1.0|SO100/SO101 original manipulation task'
-  --validation-dataset-spec 'andlyu/pick_up_ball_v21_pt2@23-24|so101_pick_up_ball_v21|observation.images.front,observation.images.wrist|1.0|single SO-101 follower arm picking up a ball'
   --validation-dataset-spec 'andlyu/move_blue_ball_training_v21@6-7|so101_move_blue_ball_v21|observation.images.front,observation.images.wrist|1.0|single SO-101 follower arm moving a blue ball'
   --custom-tag so101_pick_up_ball_v21
   --custom-tag so101_move_blue_ball_v21
