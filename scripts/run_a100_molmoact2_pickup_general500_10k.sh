@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_NAME="${RUN_NAME:-molmoact2-so101-ballcup-edited-v21-plus-general500-s10k-eval50}"
+RUN_NAME="${RUN_NAME:-molmoact2-so101-ballcup-edited-v21-plus-general500-val4-s10k-eval50}"
 SAVE_FOLDER="${SAVE_FOLDER:-/backup/outputs/${RUN_NAME}}"
 LOG_DIR="${LOG_DIR:-/backup/logs}"
 EXPERIMENTS_DIR="${MOLMOACT2_EXPERIMENTS_DIR:-/workspace/molmoact2/experiments}"
@@ -61,9 +61,9 @@ cleanup_loop() {
 common_args=(
   --mixture ballcup_edited_v21_plus_general500
   --dataset-spec "andlyu/so100_so101_original_500eps_camera12@0-158|so100_so101_original_500eps|observation.images.camera1,observation.images.camera2|${GENERAL_SAMPLE_WEIGHT}|SO100/SO101 original manipulation task"
-  --dataset-spec "andlyu/so101-ball-cup-eval-edited_v21@0-14|so101_ball_cup_eval_edited_v21|observation.images.front,observation.images.wrist|${BALLCUP_SAMPLE_WEIGHT}|single SO-101 follower arm moving a light blue ball to a tall black cylinder"
+  --dataset-spec "andlyu/so101-ball-cup-eval-edited_v21@0-12|so101_ball_cup_eval_edited_v21|observation.images.front,observation.images.wrist|${BALLCUP_SAMPLE_WEIGHT}|single SO-101 follower arm moving a light blue ball to a tall black cylinder"
   --validation-dataset-spec 'andlyu/so100_so101_original_500eps_camera12@159-167|so100_so101_original_500eps|observation.images.camera1,observation.images.camera2|1.0|SO100/SO101 original manipulation task'
-  --validation-dataset-spec 'andlyu/so101-ball-cup-eval-edited_v21@15-16|so101_ball_cup_eval_edited_v21|observation.images.front,observation.images.wrist|1.0|single SO-101 follower arm moving a light blue ball to a tall black cylinder'
+  --validation-dataset-spec 'andlyu/so101-ball-cup-eval-edited_v21@13-16|so101_ball_cup_eval_edited_v21|observation.images.front,observation.images.wrist|1.0|single SO-101 follower arm moving a light blue ball to a tall black cylinder'
   --custom-tag so101_ball_cup_eval_edited_v21
   --run-name "${RUN_NAME}"
   --save-folder "${SAVE_FOLDER}"
