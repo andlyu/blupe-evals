@@ -11,10 +11,12 @@ from scripts.run_molmoact2_experiments_lora import (
     _data_mix_metrics,
     _data_mix_rows,
     _log_data_mix_bar_charts,
+    _norm_feature_stats_from_payload,
     _parse_dataset_spec,
     _repo_root_for_spec,
     _patch_runtime_split_metrics,
     _read_dataset_counts_for_spec,
+    _replace_stats_by_tag_with_norm_stats,
     _runtime_split_metrics,
     _set_default_env,
 )
@@ -106,6 +108,38 @@ def test_data_mix_metrics_count_episode_selected_specs(tmp_path):
     assert metrics["data_mix/custom_frames"] == 50.0
 
 
+def test_replace_stats_by_tag_uses_base_norm_stats_without_merging_tags():
+    payload = {
+        "metadata_by_tag": {
+            "so100_so101_molmoact2": {
+                "action_stats": {"q01": [1.0], "q99": [9.0]},
+                "state_stats": {"q01": [2.0], "q99": [8.0]},
+            }
+        }
+    }
+    norm_stats = _norm_feature_stats_from_payload(payload, "so100_so101_molmoact2")
+    dataset_stats = {
+        "general": {
+            "action": {"q01": [10.0], "q99": [90.0]},
+            "observation.state": {"q01": [20.0], "q99": [80.0]},
+            "other": {"mean": [3.0]},
+        },
+        "custom": {
+            "action": {"q01": [100.0], "q99": [900.0]},
+            "observation.state": {"q01": [200.0], "q99": [800.0]},
+        },
+    }
+
+    replaced = _replace_stats_by_tag_with_norm_stats(dataset_stats, norm_stats)
+
+    assert set(replaced) == {"general", "custom"}
+    assert replaced["general"]["action"] == {"q01": [1.0], "q99": [9.0]}
+    assert replaced["general"]["observation.state"] == {"q01": [2.0], "q99": [8.0]}
+    assert replaced["general"]["other"] == {"mean": [3.0]}
+    assert replaced["custom"]["action"] == {"q01": [1.0], "q99": [9.0]}
+    assert dataset_stats["general"]["action"] == {"q01": [10.0], "q99": [90.0]}
+
+
 def _data_mix_test_metrics() -> dict[str, float]:
     return {
         "data_mix/custom_sample_pct": 50.0,
@@ -170,7 +204,7 @@ def test_log_data_mix_bar_charts_sends_wandb_payload(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
 
-    assert _log_data_mix_bar_charts(_data_mix_test_metrics()) is True
+    assert _log_data_mix_bar_charts(_data_mix_test_metrics(), []) is True
 
     payload, kwargs = logged_payloads[0]
     assert kwargs == {"step": 0, "commit": False}
@@ -193,7 +227,7 @@ def test_log_data_mix_bar_charts_waits_for_wandb_run(monkeypatch):
     fake_wandb = types.SimpleNamespace(run=None)
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
 
-    assert _log_data_mix_bar_charts(_data_mix_test_metrics()) is False
+    assert _log_data_mix_bar_charts(_data_mix_test_metrics(), []) is False
 
 
 def test_runtime_split_metrics_tracks_training_validation_and_overhead():

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -184,6 +185,70 @@ def _load_env_json(name: str) -> object | None:
 def _bare_lerobot_tag(tag: str) -> str:
     prefix = "lerobot:"
     return tag[len(prefix):] if tag.startswith(prefix) else tag
+
+
+def _load_norm_stats_payload(checkpoint: str) -> dict:
+    checkpoint_path = Path(checkpoint).expanduser()
+    if checkpoint_path.is_dir():
+        norm_stats_path = checkpoint_path / "norm_stats.json"
+    else:
+        norm_stats_path = checkpoint_path
+    if norm_stats_path.is_file():
+        return json.loads(norm_stats_path.read_text())
+
+    from huggingface_hub import hf_hub_download
+
+    downloaded = hf_hub_download(repo_id=checkpoint, filename="norm_stats.json")
+    return json.loads(Path(downloaded).read_text())
+
+
+def _norm_feature_stats_from_payload(payload: dict, norm_tag: str) -> dict[str, dict]:
+    metadata_by_tag = payload.get("metadata_by_tag")
+    if not isinstance(metadata_by_tag, dict):
+        raise ValueError("norm stats payload is missing metadata_by_tag")
+    metadata = metadata_by_tag.get(norm_tag)
+    if not isinstance(metadata, dict):
+        available = ", ".join(sorted(str(tag) for tag in metadata_by_tag))
+        raise ValueError(f"norm tag {norm_tag!r} not found; available tags: {available}")
+
+    action_stats = metadata.get("action_stats")
+    state_stats = metadata.get("state_stats")
+    if not isinstance(action_stats, dict) or not isinstance(state_stats, dict):
+        raise ValueError(f"norm tag {norm_tag!r} must define action_stats and state_stats")
+
+    return {
+        "action": copy.deepcopy(action_stats),
+        "observation.state": copy.deepcopy(state_stats),
+    }
+
+
+def _replace_stats_by_tag_with_norm_stats(
+    stats_by_tag: dict,
+    norm_feature_stats: dict[str, dict],
+) -> dict:
+    replaced: dict = {}
+    for tag, tag_stats in stats_by_tag.items():
+        next_stats = copy.deepcopy(tag_stats)
+        next_stats["action"] = copy.deepcopy(norm_feature_stats["action"])
+        next_stats["observation.state"] = copy.deepcopy(norm_feature_stats["observation.state"])
+        replaced[str(tag)] = next_stats
+    return replaced
+
+
+def _patch_robot_norm_stats(train_lerobot, *, checkpoint: str, norm_tag: str) -> None:
+    payload = _load_norm_stats_payload(checkpoint)
+    norm_feature_stats = _norm_feature_stats_from_payload(payload, norm_tag)
+    original_collect = train_lerobot._collect_tagged_stats
+
+    def collect_tagged_stats_with_base_norm(*args, **kwargs):
+        stats_by_tag, repo_to_tag, default_tag = original_collect(*args, **kwargs)
+        return (
+            _replace_stats_by_tag_with_norm_stats(stats_by_tag, norm_feature_stats),
+            repo_to_tag,
+            default_tag,
+        )
+
+    train_lerobot._collect_tagged_stats = collect_tagged_stats_with_base_norm
 
 
 def _metric_slug(value: str) -> str:
@@ -736,6 +801,11 @@ def main() -> int:
     parser.add_argument("--experiments-dir", default=os.environ.get("MOLMOACT2_EXPERIMENTS_DIR", "/workspace/molmoact2/experiments"))
     parser.add_argument("--lerobot-data-root", default=os.environ.get("LEROBOT_DATA_ROOT", "/workspace/lerobot_data"))
     parser.add_argument("--checkpoint", default=os.environ.get("MOLMOACT2_CHECKPOINT", "allenai/MolmoAct2-SO100_101"))
+    parser.add_argument(
+        "--norm-stats-tag",
+        default=os.environ.get("MOLMOACT2_NORM_STATS_TAG", ""),
+        help="Use this checkpoint norm tag's state/action stats for every dataset tag.",
+    )
     parser.add_argument("--mixture", default="move_blue_ball")
     parser.add_argument("--dataset-repo-id", default=os.environ.get("DATASET_REPO_ID", "andlyu/move_blue_ball_training"))
     parser.add_argument("--dataset-tag", default=os.environ.get("DATASET_TAG", "so101_move_blue_ball"))
@@ -865,6 +935,19 @@ def main() -> int:
     print(" ".join(train_argv), flush=True)
     print("data_mix=" + json.dumps(data_mix_metrics, sort_keys=True), flush=True)
     print("data_segments=" + json.dumps(data_segment_rows, sort_keys=True), flush=True)
+    if args.norm_stats_tag:
+        print(
+            "norm_stats_override="
+            + json.dumps(
+                {
+                    "checkpoint": args.checkpoint,
+                    "norm_tag": args.norm_stats_tag,
+                    "applies_to_tags": sorted({spec.tag for spec in specs}),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     if args.validation_dataset_spec:
         print(
             "validation="
@@ -887,6 +970,12 @@ def main() -> int:
 
     from launch_scripts import train_lerobot
 
+    if args.norm_stats_tag:
+        _patch_robot_norm_stats(
+            train_lerobot,
+            checkpoint=args.checkpoint,
+            norm_tag=args.norm_stats_tag,
+        )
     _patch_data_mix_metrics(data_mix_metrics, data_segment_rows)
     _patch_runtime_split_metrics()
 
