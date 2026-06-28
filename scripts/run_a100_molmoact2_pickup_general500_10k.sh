@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_NAME="${RUN_NAME:-molmoact2-so101-ballcup-edited-v21-plus-general500-val4-s10k-eval50}"
+RUN_NAME="${RUN_NAME:-molmoact2-so101-ballcup-edited-v21-plus-general500-val4-s10k-earlyval10}"
 SAVE_FOLDER="${SAVE_FOLDER:-/backup/outputs/${RUN_NAME}}"
 LOG_DIR="${LOG_DIR:-/backup/logs}"
 EXPERIMENTS_DIR="${MOLMOACT2_EXPERIMENTS_DIR:-/workspace/molmoact2/experiments}"
@@ -70,7 +70,6 @@ common_args=(
   --global-batch-size "${GLOBAL_BATCH_SIZE:-8}"
   --device-batch-size "${DEVICE_BATCH_SIZE:-1}"
   --num-workers "${NUM_WORKERS:-2}"
-  --eval-interval "${EVAL_INTERVAL:-50}"
   --eval-max-examples "${EVAL_MAX_EXAMPLES:-64}"
   --eval-device-batch-size "${EVAL_DEVICE_BATCH_SIZE:-1}"
   --save-keep "${SAVE_KEEP:-20}"
@@ -81,17 +80,19 @@ run_phase() {
   local max_duration="$1"
   local save_interval="$2"
   local phase_name="$3"
+  local eval_interval="$4"
   local dry_run_args=()
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
     dry_run_args=(--dry-run)
   fi
 
-  echo "=== ${phase_name}: max_duration=${max_duration} save_interval=${save_interval} ==="
+  echo "=== ${phase_name}: max_duration=${max_duration} save_interval=${save_interval} eval_interval=${eval_interval} ==="
   cd "${EXPERIMENTS_DIR}"
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
     "${PYTHON_BIN}" \
       "${SCRIPT_PATH}" \
       "${common_args[@]}" \
+      --eval-interval "${eval_interval}" \
       --max-duration "${max_duration}" \
       --save-interval "${save_interval}" \
       "${dry_run_args[@]}" \
@@ -100,6 +101,7 @@ run_phase() {
     "${TORCHRUN_BIN}" --standalone --nproc-per-node=1 \
       "${SCRIPT_PATH}" \
       "${common_args[@]}" \
+      --eval-interval "${eval_interval}" \
       --max-duration "${max_duration}" \
       --save-interval "${save_interval}" \
       "${dry_run_args[@]}" \
@@ -109,7 +111,7 @@ run_phase() {
 }
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  run_phase 250 250 dry_run
+  run_phase 50 50 dry_run "${EARLY_EVAL_INTERVAL:-10}"
   exit 0
 fi
 
@@ -117,9 +119,10 @@ cleanup_loop &
 cleanup_pid="$!"
 trap 'kill "${cleanup_pid}" 2>/dev/null || true' EXIT
 
-run_phase 250 250 phase_step250
-run_phase 500 500 phase_step500
-run_phase 10000 1000 phase_step10000
+run_phase 50 50 phase_step50 "${EARLY_EVAL_INTERVAL:-10}"
+run_phase 250 250 phase_step250 "${EVAL_INTERVAL:-50}"
+run_phase 500 500 phase_step500 "${EVAL_INTERVAL:-50}"
+run_phase 10000 1000 phase_step10000 "${EVAL_INTERVAL:-50}"
 
 cleanup_full_checkpoints || true
 echo "Training complete: ${SAVE_FOLDER}"
