@@ -167,7 +167,7 @@ scripts/start_jetson_so101_remote_policy.sh
 Then open LeLab from the Mac and use the Evals tab. The task instruction can stay:
 
 ```text
-Move to blue ball, grab it, and place it in the cardboard cylinder
+Move to light blue ball, grab it, and move it to the tall black cylinder
 ```
 
 ## Checkpoint Pull

@@ -38,12 +38,20 @@ Installed Jetson files, Python site-packages, generated frontend bundles, runnin
 - Cache-bust patched LeLab frontend bundles with a new generated asset name or query string so the browser cannot keep stale preview code.
 - Make these changes durable through a repo-owned apply script and focused tests that check backend routes, frontend/source patching, compiled bundle patching, retry logic, stale hook removal, and index asset replacement.
 
+## LeLab Mac-Local Camera Previews
+
+- Browser `deviceId` values are opaque per-origin values. Do not seed Mac-local LeLab robot records with camera names as `device_id`; seed `camera_index` and let the UI bind to browser `deviceId` at runtime.
+- Verify both browser-facing camera discovery and Python/OpenCV capture. `/available-cameras` can list AVFoundation devices even when macOS privacy blocks `cv2.VideoCapture`.
+- Browser camera permission is per-origin. Google Meet camera access does not imply Chrome has granted `http://127.0.0.1:8000` or `http://localhost:8000` access.
+- Before calling Mac-local recording ready, run a direct OpenCV frame-read check for the selected indices. If it reports camera access denied, grant Camera permission to the app launching LeLab/Python in macOS System Settings, then retest.
+
 ## SO101 Eval UI Camera Relay
 
 - Keep LeLab recording UI and SO101 eval UI camera paths distinct. LeLab recording previews use `:8000` backend routes such as `/camera-preview/{index}.jpg`; the eval UI on `:8092` proxies semantic camera URLs from a robot-side MJPEG relay.
 - The eval UI launcher must own the camera stack. Do not rely on a remembered manual relay process or stale defaults.
-- Start the SO101 camera relay before launching eval UI with the known-good shape: `YAM_control/camera_relay.py --devices 0 2 4 --port 8089 --width 640 --height 360 --fps 30`.
-- Pass explicit semantic camera mappings to eval UI: `front=http://127.0.0.1:8089/0`, `side=http://127.0.0.1:8089/2`, and `wrist=http://127.0.0.1:8089/4`.
+- On macOS, list AVFoundation cameras by name before choosing indices: `ffmpeg -f avfoundation -list_devices true -i ""`. Do not blindly probe camera indices because this can activate FaceTime or Continuity/iPhone cameras.
+- Start the SO101 camera relay with USB camera indices only. For the current Mac SO101 setup, the three EMEET USB cameras are AVFoundation indices `0`, `1`, and `2`: `YAM_control/camera_relay.py --devices 0 1 2 --port 8089 --width 640 --height 360 --fps 30`.
+- Pass explicit semantic camera mappings to eval UI. For the current Mac SO101 setup: `front=http://127.0.0.1:8089/2`, `side=http://127.0.0.1:8089/1`, and `wrist=http://127.0.0.1:8089/0`.
 - Do not use the stale eval defaults `http://127.0.0.1:8080/cam0.mjpg`, `cam1.mjpg`, or `cam2.mjpg` unless a repo-owned service actually provides those exact routes.
 - Treat camera resolution as part of the contract. A camera can open but fail to produce frames at the wrong resolution; for the current SO101 three-camera eval path, verify `640x360`, not just that `/dev/video*` opened.
 - Keep policy camera selection separate from UI camera availability. The policy may consume only `front,wrist`, while the UI should still expose and verify `front`, `side`, and `wrist`.
@@ -56,7 +64,7 @@ Check at least one durable source artifact and one runtime behavior:
 - Runtime behavior: service health, reachable URL, expected route, dataset listing, frame/image response, or other user-visible behavior.
 - For dataset/media UI work, verify the actual media URLs the browser uses, not only the HTML shell or metadata APIs. Check at least one real frame/image/video response for the active dataset and each relevant camera path when cameras are part of the UI.
 - For LeLab Jetson camera-preview work, verify the served page loads the patched bundle and all configured camera preview endpoints return real image bytes. At minimum check `/`, the loaded asset name, stale-hook absence in the loaded bundle, and `/camera-preview/0.jpg`, `/camera-preview/2.jpg`, `/camera-preview/4.jpg` when front/side/wrist are configured.
-- For SO101 eval UI camera work, verify the relay streams and the eval UI proxy routes. At minimum check `:8089/0`, `:8089/2`, `:8089/4`, then `:8092/camera/front.jpg`, `:8092/camera/side.jpg`, and `:8092/camera/wrist.jpg`; each must return real JPEG bytes before calling the UI ready.
+- For SO101 eval UI camera work, verify the relay streams and the eval UI proxy routes. At minimum check `:8089/0`, `:8089/1`, `:8089/2`, then `:8092/camera/front.jpg`, `:8092/camera/side.jpg`, and `:8092/camera/wrist.jpg`; each must return real JPEG bytes before calling the UI ready, and visually confirm `side` is the wide USB table/arm view rather than FaceTime or Continuity/iPhone.
 - When imported datasets can represent frames differently than native recordings, test both the metadata row and the media endpoint. Numeric frame ids, filename frame ids, and manifest `path` fields must resolve to real media before calling the UI done.
 
 If a runtime change was made manually on the Jetson and there is no repo-owned way to recreate it, do not call the task complete. Add the missing script/patch first or clearly report the gap.

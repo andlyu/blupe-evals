@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_NAME="${RUN_NAME:-molmoact2-so101-pickup-mix-blueball-v21-plus-general500-2val-tables-s10k-eval50}"
+RUN_NAME="${RUN_NAME:-molmoact2-so101-pickup-mix-blueball-v21-plus-general500-custom-epweighted-2val-tables-s10k-eval50}"
 SAVE_FOLDER="${SAVE_FOLDER:-/backup/outputs/${RUN_NAME}}"
 LOG_DIR="${LOG_DIR:-/backup/logs}"
 EXPERIMENTS_DIR="${MOLMOACT2_EXPERIMENTS_DIR:-/workspace/molmoact2/experiments}"
@@ -11,6 +11,14 @@ SCRIPT_PATH="${SCRIPT_PATH:-/workspace/blupe-evals/scripts/run_molmoact2_experim
 export HF_HOME="${HF_HOME:-/workspace/.hf_home}"
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+
+# Keep the train mix 50/50 general vs custom. Within the custom half, weight
+# datasets by training episode count rather than splitting evenly by repo:
+# pick_up_ball_v21=7 eps, pick_up_ball_v21_pt2=23 eps, move_blue_ball=6 eps.
+GENERAL_SAMPLE_WEIGHT="${GENERAL_SAMPLE_WEIGHT:-0.5}"
+PICKUP_V21_SAMPLE_WEIGHT="${PICKUP_V21_SAMPLE_WEIGHT:-0.0972222222}"
+PICKUP_V21_PT2_SAMPLE_WEIGHT="${PICKUP_V21_PT2_SAMPLE_WEIGHT:-0.3194444444}"
+MOVE_BLUE_BALL_SAMPLE_WEIGHT="${MOVE_BLUE_BALL_SAMPLE_WEIGHT:-0.0833333333}"
 
 mkdir -p "${SAVE_FOLDER}" "${LOG_DIR}" "${HF_HOME}"
 if [[ ! -f "${HF_HOME}/token" && -f /root/.cache/huggingface/token ]]; then
@@ -57,10 +65,10 @@ cleanup_loop() {
 
 common_args=(
   --mixture pickup_mix_blueball_plus_general500
-  --dataset-spec 'andlyu/so100_so101_original_500eps_camera12@0-158|so100_so101_original_500eps|observation.images.camera1,observation.images.camera2|0.5|SO100/SO101 original manipulation task'
-  --dataset-spec 'andlyu/pick_up_ball_v21@0-6|so101_pick_up_ball_v21|observation.images.front,observation.images.wrist|0.1666666667|single SO-101 follower arm picking up a ball'
-  --dataset-spec 'andlyu/pick_up_ball_v21_pt2@0-22|so101_pick_up_ball_v21|observation.images.front,observation.images.wrist|0.1666666667|single SO-101 follower arm picking up a ball'
-  --dataset-spec 'andlyu/move_blue_ball_training_v21@0-5|so101_move_blue_ball_v21|observation.images.front,observation.images.wrist|0.1666666667|single SO-101 follower arm moving a blue ball'
+  --dataset-spec "andlyu/so100_so101_original_500eps_camera12@0-158|so100_so101_original_500eps|observation.images.camera1,observation.images.camera2|${GENERAL_SAMPLE_WEIGHT}|SO100/SO101 original manipulation task"
+  --dataset-spec "andlyu/pick_up_ball_v21@0-6|so101_pick_up_ball_v21|observation.images.front,observation.images.wrist|${PICKUP_V21_SAMPLE_WEIGHT}|single SO-101 follower arm picking up a ball"
+  --dataset-spec "andlyu/pick_up_ball_v21_pt2@0-22|so101_pick_up_ball_v21|observation.images.front,observation.images.wrist|${PICKUP_V21_PT2_SAMPLE_WEIGHT}|single SO-101 follower arm picking up a ball"
+  --dataset-spec "andlyu/move_blue_ball_training_v21@0-5|so101_move_blue_ball_v21|observation.images.front,observation.images.wrist|${MOVE_BLUE_BALL_SAMPLE_WEIGHT}|single SO-101 follower arm moving a blue ball"
   --validation-dataset-spec 'andlyu/so100_so101_original_500eps_camera12@159-167|so100_so101_original_500eps|observation.images.camera1,observation.images.camera2|1.0|SO100/SO101 original manipulation task'
   --validation-dataset-spec 'andlyu/move_blue_ball_training_v21@6-7|so101_move_blue_ball_v21|observation.images.front,observation.images.wrist|1.0|single SO-101 follower arm moving a blue ball'
   --custom-tag so101_pick_up_ball_v21

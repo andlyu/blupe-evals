@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """SO101 web control surface with policy stop and manual joint intervention.
 
-Runs on the Jetson. It uses the existing camera MJPEG server on :8080 and the
-Jetson-local MolmoAct tunnel on :8202.
+Can read cameras either from MJPEG URLs or directly from local OpenCV camera
+indexes such as opencv://0.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ DEFAULT_POLICY_CAMERA_NAMES = tuple(
     for name in os.environ.get("SO101_POLICY_CAMERAS", "front,side").split(",")
     if name.strip()
 )
-DEFAULT_INSTRUCTION = "Move to blue ball, grab it, and place it in the cardboard cylinder"
+DEFAULT_INSTRUCTION = "Move to light blue ball, grab it, and move it to the tall black cylinder"
 DEFAULT_DURATION_S = 300.0
 DEFAULT_EXEC_STEPS = 30
 DEFAULT_MAX_STEP_DEG = 1.0
@@ -70,6 +70,7 @@ DEFAULT_EVAL_RUN_DURATION_S = 3600.0
 DEFAULT_EVAL_ATTEMPT_DURATION_S = 60.0
 DEFAULT_EVAL_MAX_CONSECUTIVE_FAILURES = 4
 DEFAULT_EVAL_RECORD_FPS = 30.0
+DEFAULT_EVAL_RECORD_START_DELAY_S = float(os.environ.get("SO101_EVAL_RECORD_START_DELAY_S", "10"))
 DEFAULT_EVAL_HOME_TIMEOUT_S = 90.0
 DEFAULT_EVAL_HOME_S = 5.0
 DEFAULT_HOME_POSE_DEG = np.array([0.0, -90.0, 70.0, 0.0, -45.0, 0.0], dtype=np.float32)
@@ -80,6 +81,10 @@ DEFAULT_SUCCESS_FPS = 10.0
 DEFAULT_STATUS_LOG_LIMIT = 60
 MAX_STATUS_LOG_LIMIT = 150
 TELEOP_LEASE_TIMEOUT_S = 30.0
+MJPEG_CAMERA_STALE_TIMEOUT_S = float(os.environ.get("SO101_MJPEG_CAMERA_STALE_TIMEOUT_S", "2.0"))
+DEFAULT_INTERVENTION_HZ = float(os.environ.get("SO101_INTERVENTION_HZ", "30"))
+INTERVENTION_MAX_STEP_DEG = float(os.environ.get("SO101_INTERVENTION_MAX_STEP_DEG", "2.0"))
+INTERVENTION_DURATION_S = float(os.environ.get("SO101_INTERVENTION_DURATION_S", "5.0"))
 SUCCESS_OVERLAP_THRESHOLD = 0.9
 SUCCESS_LEAVE_THRESHOLD = 0.1
 SUCCESS_MIN_OVER_FRAMES = 1
@@ -93,7 +98,7 @@ SUCCESS_CUP_MAX_MASK_AREA_MULT = 4.5
 SUCCESS_CONTAINER_SAM3_URL = os.environ.get("SO101_SUCCESS_SAM3_URL", "http://127.0.0.1:8213/api/detect_image")
 SUCCESS_CONTAINER_SAM3_PROMPT = os.environ.get(
     "SO101_SUCCESS_SAM3_PROMPT",
-    "cardboard cylinder along with the insides",
+    "black cylinder along with the insides",
 )
 SUCCESS_CONTAINER_SAM3_MIN_SCORE = float(os.environ.get("SO101_SUCCESS_SAM3_MIN_SCORE", "0.15"))
 SUCCESS_CONTAINER_SAM3_TIMEOUT_S = float(os.environ.get("SO101_SUCCESS_SAM3_TIMEOUT_S", "15"))
@@ -209,6 +214,148 @@ def read_mjpeg_frame(url: str, timeout_s: float = 5.0) -> np.ndarray:
     if bgr is None:
         raise RuntimeError(f"failed to decode JPEG from {url}")
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def direct_camera_index(url: str) -> int | None:
+    value = str(url or "").strip()
+    for prefix in ("opencv://", "camera://", "device://"):
+        if value.startswith(prefix):
+            raw = value.removeprefix(prefix).strip()
+            return int(raw) if raw.isdigit() else None
+    return int(value) if value.isdigit() else None
+
+
+class DirectCameraSource:
+    def __init__(self, index: int, width: int = 640, height: int = 360, fps: int = 30, quality: int = 80):
+        self.index = int(index)
+        self.quality = int(quality)
+        self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+        self.jpeg: bytes | None = None
+        self.rgb: np.ndarray | None = None
+        self.error = ""
+        self.stop_event = threading.Event()
+        self.cap = cv2.VideoCapture(self.index)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if not self.cap.isOpened():
+            self.error = f"OpenCV camera {self.index} failed to open"
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            ok, bgr = self.cap.read()
+            if not ok or bgr is None:
+                with self.condition:
+                    self.error = f"OpenCV camera {self.index} read failed"
+                    self.condition.notify_all()
+                time.sleep(0.05)
+                continue
+            ok, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
+            if not ok:
+                continue
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            with self.condition:
+                self.jpeg = encoded.tobytes()
+                self.rgb = rgb
+                self.error = ""
+                self.condition.notify_all()
+        self.cap.release()
+
+    def get_jpeg(self, timeout_s: float = 5.0) -> bytes:
+        deadline = time.monotonic() + timeout_s
+        with self.condition:
+            while self.jpeg is None and time.monotonic() < deadline:
+                self.condition.wait(timeout=max(0.0, deadline - time.monotonic()))
+            if self.jpeg is None:
+                raise TimeoutError(self.error or f"no frame from OpenCV camera {self.index}")
+            return bytes(self.jpeg)
+
+    def get_rgb(self, timeout_s: float = 5.0) -> np.ndarray:
+        self.get_jpeg(timeout_s=timeout_s)
+        with self.condition:
+            assert self.rgb is not None
+            return self.rgb.copy()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=1.0)
+
+
+class MjpegCameraSource:
+    def __init__(self, url: str, stale_timeout_s: float = MJPEG_CAMERA_STALE_TIMEOUT_S):
+        self.url = str(url)
+        self.stale_timeout_s = float(stale_timeout_s)
+        self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+        self.jpeg: bytes | None = None
+        self.last_frame_mono: float | None = None
+        self.error = ""
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _set_error(self, message: str) -> None:
+        with self.condition:
+            self.error = message
+            self.condition.notify_all()
+
+    def _set_jpeg(self, jpeg: bytes) -> None:
+        with self.condition:
+            self.jpeg = jpeg
+            self.last_frame_mono = time.monotonic()
+            self.error = ""
+            self.condition.notify_all()
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            buf = bytearray()
+            try:
+                with requests.get(self.url, stream=True, timeout=(3.0, 10.0)) as resp:
+                    resp.raise_for_status()
+                    for chunk in resp.iter_content(chunk_size=4096):
+                        if self.stop_event.is_set():
+                            return
+                        if not chunk:
+                            continue
+                        buf.extend(chunk)
+                        start = buf.find(b"\xff\xd8")
+                        end = buf.find(b"\xff\xd9", start + 2 if start >= 0 else 0)
+                        if start >= 0 and end >= 0:
+                            self._set_jpeg(bytes(buf[start : end + 2]))
+                            del buf[: end + 2]
+                        elif len(buf) > 2_000_000:
+                            del buf[:-4096]
+            except BaseException as exc:
+                self._set_error(str(exc))
+                self.stop_event.wait(0.5)
+
+    def get_jpeg(self, timeout_s: float = 5.0) -> bytes:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        with self.condition:
+            while True:
+                now = time.monotonic()
+                frame_age = None if self.last_frame_mono is None else now - self.last_frame_mono
+                if self.jpeg is not None and frame_age is not None and frame_age <= self.stale_timeout_s:
+                    return bytes(self.jpeg)
+                if now >= deadline:
+                    if self.jpeg is None:
+                        raise TimeoutError(self.error or f"no MJPEG frame from {self.url}")
+                    age_text = "unknown" if frame_age is None else f"{frame_age:.2f}s"
+                    raise TimeoutError(
+                        self.error or f"stale MJPEG frame from {self.url}; age={age_text}"
+                    )
+                self.condition.wait(timeout=min(0.2, max(0.0, deadline - now)))
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        with self.condition:
+            self.condition.notify_all()
+        self.thread.join(timeout=1.0)
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -699,6 +846,8 @@ class SO101Controller:
         self.camera_configs = list(camera_configs or DEFAULT_CAMERA_CONFIGS)
         self.cameras_by_name = {cam.name: cam for cam in self.camera_configs}
         self.cameras_by_id = {cam.id: cam for cam in self.camera_configs}
+        self.direct_cameras: dict[int, DirectCameraSource] = {}
+        self.mjpeg_cameras: dict[str, MjpegCameraSource] = {}
         self.policy_camera_names = tuple(policy_camera_names or DEFAULT_POLICY_CAMERA_NAMES)
         self.success_enabled = success_enabled
         self.success_fps = success_fps
@@ -739,8 +888,20 @@ class SO101Controller:
         self.record_counts: dict[str, int] = {}
         self.record_error = ""
         self.record_capture_mode = "policy_execute"
+        self.record_success_last_sequence = 0
+        self.record_success_thread: threading.Thread | None = None
+        self.record_rollover_active = False
+        self.record_rollover_next_at_mono: float | None = None
+        self.record_rollover_cancel_event = threading.Event()
         self.last_action: list[float] | None = None
         self.last_action_at_mono: float | None = None
+        self.active_policy_config: dict[str, Any] | None = None
+        self.paused_policy_config: dict[str, Any] | None = None
+        self.policy_pause_requested = False
+        self.intervention_stop_event = threading.Event()
+        self.intervention_thread: threading.Thread | None = None
+        self.intervention_request: dict[str, Any] | None = None
+        self.intervention_status: dict[str, Any] = self._new_intervention_status()
         self.eval_stop_event = threading.Event()
         self.eval_thread: threading.Thread | None = None
         self.eval_history: list[dict[str, Any]] = []
@@ -786,16 +947,20 @@ class SO101Controller:
             "started_at": None,
             "resumed_at": None,
             "completed_at": None,
+            "dataset_name": "",
+            "dataset_slug": "",
             "run_duration_s": None,
             "attempt_duration_s": None,
             "no_success_timeout_s": None,
             "attempt": 0,
             "successes": 0,
             "failures": 0,
+            "interventions": 0,
             "consecutive_failures": 0,
             "max_consecutive_failures": DEFAULT_EVAL_MAX_CONSECUTIVE_FAILURES,
             "allow_teleop": True,
             "record_episodes": True,
+            "record_start_delay_s": DEFAULT_EVAL_RECORD_START_DELAY_S,
             "waiting_for_intervention": False,
             "current_attempt": None,
             "last_attempt": None,
@@ -804,6 +969,26 @@ class SO101Controller:
             "recording_dir": None,
             "summary_path": None,
             "stop_reason": "",
+            "error": "",
+        }
+
+    def _new_intervention_status(self) -> dict[str, Any]:
+        return {
+            "active": False,
+            "requested": False,
+            "id": None,
+            "operator": None,
+            "state": "idle",
+            "started_at": None,
+            "completed_at": None,
+            "duration_s": None,
+            "elapsed_s": None,
+            "started_at_mono": None,
+            "hz": DEFAULT_INTERVENTION_HZ,
+            "max_step_deg": INTERVENTION_MAX_STEP_DEG,
+            "target_duration_s": INTERVENTION_DURATION_S,
+            "samples": 0,
+            "reason": "",
             "error": "",
         }
 
@@ -1170,6 +1355,12 @@ class SO101Controller:
             self.record_thread.join(timeout=3.0)
         self.stop_hf_teleop()
         self.disconnect()
+        for source in list(self.direct_cameras.values()):
+            source.stop()
+        self.direct_cameras.clear()
+        for source in list(self.mjpeg_cameras.values()):
+            source.stop()
+        self.mjpeg_cameras.clear()
 
     def _hf_teleop_running(self) -> bool:
         proc = self.hf_teleop_process
@@ -1325,6 +1516,344 @@ class SO101Controller:
             data["returncode"] = None if proc is None else proc.poll()
         return data
 
+    def _intervention_snapshot_locked(self) -> dict[str, Any]:
+        data = dict(self.intervention_status)
+        data["thread_running"] = self.intervention_thread is not None and self.intervention_thread.is_alive()
+        started_at_mono = data.get("started_at_mono")
+        if started_at_mono is not None and (data.get("active") or data.get("requested")):
+            data["elapsed_s"] = round(max(0.0, time.monotonic() - float(started_at_mono)), 1)
+        data.pop("started_at_mono", None)
+        return data
+
+    def _pending_intervention_request(self) -> dict[str, Any] | None:
+        with self.status_lock:
+            return None if self.intervention_request is None else dict(self.intervention_request)
+
+    def _start_pending_intervention_after_motion(self) -> None:
+        if self._eval_running():
+            return
+        request = self._pending_intervention_request()
+        if request is not None:
+            self._start_leader_delta_intervention(request)
+
+    def _resume_paused_policy(self) -> bool:
+        with self.status_lock:
+            config = None if self.paused_policy_config is None else dict(self.paused_policy_config)
+            self.paused_policy_config = None
+            self.policy_pause_requested = False
+        if not config:
+            return False
+        if self._motion_running() or self._intervention_active_or_requested():
+            with self.status_lock:
+                self.paused_policy_config = config
+            self.log("policy resume deferred; arm is still busy")
+            return False
+        duration_s = max(1.0, float(config.get("duration_s", DEFAULT_DURATION_S)))
+        self.log(f"policy resume after intervention remaining={duration_s:.1f}s")
+        self.start_policy(
+            instruction=str(config.get("instruction", DEFAULT_INSTRUCTION)),
+            duration_s=duration_s,
+            exec_steps=int(config.get("exec_steps", DEFAULT_EXEC_STEPS)),
+            max_step_deg=float(config.get("max_step_deg", DEFAULT_MAX_STEP_DEG)),
+            hz=float(config.get("hz", DEFAULT_HZ)),
+            from_eval=False,
+            success_container_reason="policy_resume_after_intervention",
+        )
+        return True
+
+    def _append_eval_event(self, event: dict[str, Any]) -> None:
+        should_write = False
+        with self.status_lock:
+            if self.eval_config:
+                self.eval_history.append(dict(event))
+                should_write = True
+        if should_write:
+            self._write_eval_summary()
+
+    def request_intervention_control(self, operator: str = "operator", reason: str = "manual_intervention") -> dict[str, Any]:
+        operator = (operator or "operator").strip()[:80] or "operator"
+        reason = (reason or "manual_intervention").strip()[:80] or "manual_intervention"
+        now = time.monotonic()
+        wall_time = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        event: dict[str, Any] | None = None
+        start_now = False
+        immediate_policy_handoff = False
+        policy_stage = ""
+        should_pause_policy = False
+        with self.status_lock:
+            if self.intervention_status.get("active") or self.intervention_status.get("requested"):
+                return self._intervention_snapshot_locked()
+            policy_running = self._motion_running() and self.mode == "policy"
+            if not policy_running and not self.eval_status.get("running"):
+                return self._intervention_snapshot_locked()
+            if policy_running and not self.eval_status.get("running"):
+                config = dict(self.active_policy_config or {})
+                duration_s = float(config.get("duration_s", DEFAULT_DURATION_S))
+                if self.started_at is not None:
+                    duration_s = max(1.0, duration_s - max(0.0, now - self.started_at))
+                config.update({"duration_s": duration_s})
+                self.paused_policy_config = config
+                self.policy_pause_requested = True
+                should_pause_policy = True
+                policy_stage = str(self.stage or "")
+                immediate_policy_handoff = policy_stage in {"capture", "query"}
+            request = {
+                "id": uuid.uuid4().hex,
+                "operator": operator,
+                "reason": reason,
+                "requested_at": wall_time,
+                "requested_at_mono": now,
+            }
+            self.intervention_request = request
+            self.intervention_status = self._new_intervention_status()
+            self.intervention_status.update(
+                {
+                    "requested": True,
+                    "id": request["id"],
+                    "operator": operator,
+                    "state": "requested",
+                    "started_at": wall_time,
+                    "started_at_mono": now,
+                    "reason": reason,
+                }
+            )
+            if self.eval_status.get("running"):
+                self.eval_status.update({"state": "intervention_requested", "stop_reason": reason})
+            event = {
+                "type": "intervention_request",
+                "id": request["id"],
+                "operator": operator,
+                "reason": reason,
+                "at": wall_time,
+                "eval_state": self.eval_status.get("state"),
+                "recording_dir": None if self.record_dir is None else str(self.record_dir),
+            }
+            if self.eval_config:
+                self.eval_history.append(dict(event))
+            start_now = not self._eval_running() and not self._motion_running()
+        self.log(f"intervention requested operator={operator!r} reason={reason}")
+        self.stop_policy()
+        if event is not None:
+            self._write_eval_summary()
+        if start_now:
+            self._start_leader_delta_intervention(request)
+        elif should_pause_policy:
+            if immediate_policy_handoff:
+                self._start_leader_delta_intervention(request)
+                self.log(
+                    f"policy pause requested during {policy_stage}; "
+                    "intervention started immediately; stale policy result will be dropped"
+                )
+            else:
+                self.log("policy pause requested; intervention will start after current policy action exits")
+        return self.status().get("intervention", {})
+
+    def stop_intervention_control(self, outcome: str = "complete", resume_policy: bool = True) -> dict[str, Any]:
+        outcome = (outcome or "complete").strip()[:80] or "complete"
+        thread = self.intervention_thread
+        canceled_request: dict[str, Any] | None = None
+        with self.status_lock:
+            if self.intervention_status.get("requested") and not self.intervention_status.get("active"):
+                canceled_request = None if self.intervention_request is None else dict(self.intervention_request)
+                self.intervention_request = None
+                self.intervention_status.update(
+                    {
+                        "requested": False,
+                        "state": "canceled",
+                        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "reason": outcome,
+                    }
+                )
+        if canceled_request is not None:
+            if not resume_policy:
+                self._clear_paused_policy()
+            self.log(f"intervention canceled id={canceled_request.get('id')} outcome={outcome}")
+            self._append_eval_event(
+                {
+                    "type": "intervention_cancel",
+                    "id": canceled_request.get("id"),
+                    "operator": canceled_request.get("operator"),
+                    "outcome": outcome,
+                    "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+            )
+            if resume_policy:
+                self._resume_paused_policy()
+            return self.status().get("intervention", {})
+
+        self.intervention_stop_event.set()
+        if thread is not None:
+            thread.join(timeout=3.0)
+        with self.status_lock:
+            if self.intervention_status.get("active"):
+                self.intervention_status.update({"state": "stopping", "reason": outcome})
+        if resume_policy:
+            self._resume_paused_policy()
+        else:
+            self._clear_paused_policy()
+        return self.status().get("intervention", {})
+
+    def toggle_intervention_control(self, operator: str = "operator") -> dict[str, Any]:
+        with self.status_lock:
+            active = bool(self.intervention_status.get("active") or self.intervention_status.get("requested"))
+        if active:
+            return self.stop_intervention_control(outcome="resume_policy", resume_policy=True)
+        if not self._motion_running():
+            self.log("intervention ignored; MolmoAct is not running")
+            return self.status().get("intervention", {})
+        return self.request_intervention_control(operator=operator, reason="policy_pause")
+
+    def _start_leader_delta_intervention(self, request: dict[str, Any]) -> None:
+        if self.intervention_thread is not None and self.intervention_thread.is_alive():
+            return
+        request = dict(request)
+        intervention_id = str(request.get("id") or uuid.uuid4().hex)
+        operator = str(request.get("operator") or "operator")
+        reason = str(request.get("reason") or "manual_intervention")
+        started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        with self.status_lock:
+            self.intervention_request = None
+            self.intervention_status = self._new_intervention_status()
+            self.intervention_status.update(
+                {
+                    "active": True,
+                    "requested": False,
+                    "id": intervention_id,
+                    "operator": operator,
+                    "state": "active",
+                    "started_at": started_at,
+                    "started_at_mono": time.monotonic(),
+                    "reason": reason,
+                }
+            )
+            self.eval_status.update(
+                {
+                    "state": "intervention_active",
+                    "waiting_for_intervention": True,
+                    "stop_reason": reason,
+                }
+            )
+        restarted_recording_dir = self._restart_recording_for_intervention(
+            intervention_id=intervention_id,
+            operator=operator,
+            reason=reason,
+            started_at=started_at,
+        )
+        self.intervention_stop_event.clear()
+        self.intervention_thread = threading.Thread(
+            target=self._leader_delta_intervention_loop,
+            args=(intervention_id, operator, reason, started_at),
+            daemon=True,
+        )
+        self.intervention_thread.start()
+        self._append_eval_event(
+            {
+                "type": "intervention_start",
+                "id": intervention_id,
+                "operator": operator,
+                "reason": reason,
+                "at": started_at,
+                "recording_dir": None if self.record_dir is None else str(self.record_dir),
+                "restarted_recording_dir": restarted_recording_dir,
+            }
+        )
+        self.log(f"intervention start id={intervention_id} operator={operator!r} reason={reason}")
+
+    def _leader_delta_intervention_loop(self, intervention_id: str, operator: str, reason: str, started_at: str) -> None:
+        self.set_mode("intervention")
+        self.set_stage("leader_delta")
+        start_mono = time.monotonic()
+        hz = max(1.0, float(DEFAULT_INTERVENTION_HZ))
+        period = 1.0 / hz
+        max_step_deg = max(0.0, float(INTERVENTION_MAX_STEP_DEG))
+        target_duration_s = max(0.1, float(INTERVENTION_DURATION_S))
+        samples = 0
+        error = ""
+        try:
+            follower_start = self.read_state()
+            leader_start = self.read_leader_state()
+            cur_cmd = follower_start.copy()
+            with self.status_lock:
+                self.intervention_status.update(
+                    {
+                        "follower_start": [float(x) for x in follower_start],
+                        "leader_start": [float(x) for x in leader_start],
+                        "target_duration_s": target_duration_s,
+                    }
+                )
+            while not self.intervention_stop_event.is_set() and time.monotonic() - start_mono < target_duration_s:
+                loop_t = time.monotonic()
+                leader_now = self.read_leader_state()
+                desired = follower_start + (leader_now - leader_start)
+                if max_step_deg > 0:
+                    target = cur_cmd + np.clip(desired - cur_cmd, -max_step_deg, max_step_deg)
+                else:
+                    target = desired
+                self.send_state(target)
+                cur_cmd = target
+                samples += 1
+                with self.status_lock:
+                    self.steps += 1
+                    self.intervention_status.update(
+                        {
+                            "samples": samples,
+                            "leader": [float(x) for x in leader_now],
+                            "target": [float(x) for x in target],
+                        }
+                    )
+                sleep_s = period - (time.monotonic() - loop_t)
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+        except BaseException as exc:
+            error = str(exc)
+            self.set_error(exc)
+        finally:
+            stopped_by_request = self.intervention_stop_event.is_set()
+            completed_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            duration_s = round(max(0.0, time.monotonic() - start_mono), 3)
+            state = "failed" if error else "complete"
+            with self.status_lock:
+                self.intervention_status.update(
+                    {
+                        "active": False,
+                        "requested": False,
+                        "state": state,
+                        "completed_at": completed_at,
+                        "duration_s": duration_s,
+                        "samples": samples,
+                        "error": error,
+                    }
+                )
+                if self.eval_status.get("state") == "intervention_active":
+                    self.eval_status.update(
+                        {
+                            "state": "intervention_complete",
+                            "waiting_for_intervention": False,
+                            "last_intervention": dict(self.intervention_status),
+                            "stop_reason": "intervention_complete",
+                        }
+                    )
+            self.set_stage("idle")
+            self.set_mode("idle")
+            self._append_eval_event(
+                {
+                    "type": "intervention_end",
+                    "id": intervention_id,
+                    "operator": operator,
+                    "reason": reason,
+                    "outcome": state,
+                    "at": completed_at,
+                    "started_at": started_at,
+                    "duration_s": duration_s,
+                    "samples": samples,
+                    "error": error,
+                    "recording_dir": None if self.record_dir is None else str(self.record_dir),
+                }
+            )
+            self.log(f"intervention {state} id={intervention_id} duration={duration_s}s samples={samples}")
+            if state == "complete" and not stopped_by_request:
+                self._resume_paused_policy()
+
     def read_state(self, retries: int = 4) -> np.ndarray:
         last: BaseException | None = None
         for _ in range(retries):
@@ -1393,6 +1922,10 @@ class SO101Controller:
         log_limit = max(0, min(MAX_STATUS_LOG_LIMIT, int(log_limit)))
         with self.status_lock:
             record_running = self.record_thread is not None and self.record_thread.is_alive()
+            rollover_active = bool(self.record_rollover_active)
+            rollover_remaining_s = None
+            if self.record_rollover_next_at_mono is not None:
+                rollover_remaining_s = round(max(0.0, self.record_rollover_next_at_mono - time.monotonic()), 1)
             success_running = self.success_thread is not None and self.success_thread.is_alive()
             logs = list(self.logs)
             if log_limit:
@@ -1461,7 +1994,10 @@ class SO101Controller:
                 "elapsed": None if self.started_at is None else round(time.monotonic() - self.started_at, 1),
                 "cameras": [self._camera_metadata(cam) for cam in self.camera_configs],
                 "recording": {
-                    "running": record_running,
+                    "running": record_running or rollover_active,
+                    "writer_running": record_running,
+                    "rollover_active": rollover_active,
+                    "rollover_remaining_s": rollover_remaining_s,
                     "dir": None if self.record_dir is None else str(self.record_dir),
                     "cameras": list(self.record_cameras),
                     "camera_configs": [
@@ -1490,6 +2026,7 @@ class SO101Controller:
                     "running": self._hf_teleop_running(),
                 },
                 "teleop": self._teleop_snapshot_locked(),
+                "intervention": self._intervention_snapshot_locked(),
                 "logs": logs,
             }
 
@@ -1499,6 +2036,25 @@ class SO101Controller:
         self.set_stage("stopping")
         self.set_mode("stopping")
         self.log("stop requested")
+
+    def stop_current_motion(self) -> None:
+        with self.status_lock:
+            self.intervention_request = None
+            self.policy_pause_requested = False
+            self.paused_policy_config = None
+            if self.intervention_status.get("requested") and not self.intervention_status.get("active"):
+                self.intervention_status.update(
+                    {
+                        "requested": False,
+                        "state": "canceled",
+                        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "reason": "user_stop",
+                    }
+                )
+        if self._intervention_active_or_requested():
+            self.stop_intervention_control(outcome="user_stop", resume_policy=False)
+        else:
+            self.stop_policy()
 
     def reset_success_tracking(
         self,
@@ -1548,7 +2104,7 @@ class SO101Controller:
             raise ValueError("SAM3 confidence must be between 0 and 1")
         cam = self._camera_from_spec(camera)
 
-        rgb = read_mjpeg_frame(cam.url, timeout_s=5.0)
+        rgb = self.read_camera_frame(cam, timeout_s=5.0)
         ok, encoded = cv2.imencode(
             ".jpg",
             cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
@@ -1628,49 +2184,156 @@ class SO101Controller:
             self.success_condition.notify_all()
 
     def _set_success_status(self, status: dict[str, Any], overlay_rgb: np.ndarray | None) -> None:
+        should_handle_record_success = False
         with self.status_lock:
             self.success_status = status
             if status.get("success_this_frame"):
                 self.logs.append(f"{time.strftime('%H:%M:%S')} {status.get('last_event')}")
+                should_handle_record_success = True
         self._set_success_overlay(overlay_rgb)
+        if should_handle_record_success:
+            self._handle_record_only_success(status)
+
+    def _handle_record_only_success(self, status: dict[str, Any]) -> None:
+        sequence = int(status.get("success_count") or 0)
+        if sequence <= 0:
+            return
+        with self.status_lock:
+            if self.eval_status.get("running"):
+                return
+            if not self._recording_running() or self.record_dir is None:
+                return
+            if sequence <= self.record_success_last_sequence:
+                return
+            if self.record_success_thread is not None and self.record_success_thread.is_alive():
+                return
+            self.record_success_last_sequence = sequence
+            self.record_rollover_active = True
+            self.record_rollover_next_at_mono = None
+            self.record_rollover_cancel_event.clear()
+            recording_dir = self.record_dir
+            started_at_mono = self.record_started_at
+            capture_mode = self.record_capture_mode
+            event = {
+                "type": "success",
+                "sequence": sequence,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "outcome": "success",
+                "reason": "mask_success",
+                "success": status.get("last_success"),
+                "tracker_success_count": sequence,
+                "tracker_state": status.get("state"),
+                "tracker_overlap": status.get("current_overlap"),
+            }
+        self.record_success_thread = threading.Thread(
+            target=self._record_only_success_worker,
+            args=(recording_dir, started_at_mono, capture_mode, sequence, event),
+            daemon=True,
+        )
+        self.record_success_thread.start()
+
+    def _record_only_success_worker(
+        self,
+        recording_dir: Path,
+        started_at_mono: float | None,
+        capture_mode: str,
+        sequence: int,
+        event: dict[str, Any],
+    ) -> None:
+        meta_path = recording_dir / ("session_meta.json" if capture_mode == "continuous" else "episode_meta.json")
+        try:
+            try:
+                meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+            except (OSError, json.JSONDecodeError):
+                meta = {}
+            ended_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            duration_s = 0.0 if started_at_mono is None else max(0.0, time.monotonic() - started_at_mono)
+            final_dir = self._finalize_recorded_episode(
+                recording_dir,
+                outcome="success",
+                reason="mask_success",
+                attempt=sequence,
+                started_at=str(meta.get("created_at") or ""),
+                ended_at=ended_at,
+                duration_s=duration_s,
+                event=event,
+                cancel_rollover=False,
+            )
+            self.log(f"record-only episode finalized success sequence={sequence} out={final_dir or recording_dir}")
+            delay_s = max(0.0, float(self.eval_config.get("record_start_delay_s", DEFAULT_EVAL_RECORD_START_DELAY_S)))
+            deadline = time.monotonic() + delay_s
+            with self.status_lock:
+                self.record_rollover_next_at_mono = deadline
+            while time.monotonic() < deadline:
+                if self.record_rollover_cancel_event.is_set():
+                    self.log(f"record-only episode rollover canceled sequence={sequence}")
+                    return
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            with self.status_lock:
+                if (
+                    self.record_rollover_cancel_event.is_set()
+                    or self.eval_status.get("running")
+                    or self._recording_running()
+                    or not self._motion_running()
+                    or self.mode != "policy"
+                ):
+                    return
+                old_cameras = [
+                    cam.get("name")
+                    for cam in meta.get("cameras", [])
+                    if isinstance(cam, dict) and cam.get("name")
+                ]
+                root_dir = None
+                episodes_root = meta.get("episodes_root")
+                if isinstance(episodes_root, str) and episodes_root.strip():
+                    root_dir = Path(episodes_root)
+                elif recording_dir is not None:
+                    root_dir = recording_dir.parent
+                fps = float(meta.get("fps") or self.record_fps or DEFAULT_RECORD_FPS)
+                duration = float(meta.get("duration_s") or self.record_duration_s or DEFAULT_RECORD_DURATION_S)
+                task = str(meta.get("task") or DEFAULT_INSTRUCTION)
+                next_capture_mode = str(meta.get("capture_mode") or capture_mode or "policy_execute")
+            extra_meta = {
+                "record_start_trigger": "post_success_delay",
+                "record_only_policy_execute": True,
+                "previous_success_recording_dir": final_dir or str(recording_dir),
+                "previous_success_sequence": sequence,
+            }
+            for key in ("dataset_name", "dataset_slug", "episodes_root"):
+                if key in meta:
+                    extra_meta[key] = meta[key]
+            recording = self.start_recording(
+                duration_s=duration,
+                fps=fps,
+                cameras=old_cameras or [cam.name for cam in self.camera_configs],
+                task=task,
+                name_prefix="so101_policy_recording",
+                extra_meta=extra_meta,
+                capture_mode=next_capture_mode,
+                root_dir=root_dir,
+            )
+            self.log(
+                f"record-only next episode armed sequence={sequence} "
+                f"delay={delay_s:.1f}s out={recording['dir']}"
+            )
+        except BaseException as exc:
+            self.log(f"record-only episode rollover failed sequence={sequence}: {exc}")
+        finally:
+            with self.status_lock:
+                self.record_rollover_active = False
+                self.record_rollover_next_at_mono = None
 
     def _success_loop(self) -> None:
         period = 1.0 / self.success_fps if self.success_fps > 0 else 0.0
-        next_process_t = 0.0
-        buf = bytearray()
         success_cam = self.camera_configs[0]
         try:
-            with urllib.request.urlopen(success_cam.url, timeout=5) as resp:
-                while not self.success_stop_event.is_set():
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    buf.extend(chunk)
-                    while not self.success_stop_event.is_set():
-                        start = buf.find(b"\xff\xd8")
-                        if start < 0:
-                            if len(buf) > 1024 * 1024:
-                                del buf[:-2]
-                            break
-                        end = buf.find(b"\xff\xd9", start + 2)
-                        if end < 0:
-                            if start > 0:
-                                del buf[:start]
-                            break
-                        frame = bytes(buf[start : end + 2])
-                        del buf[: end + 2]
-                        now = time.monotonic()
-                        if now < next_process_t:
-                            continue
-                        next_process_t = now + period
-                        jpg = np.frombuffer(frame, dtype=np.uint8)
-                        bgr = cv2.imdecode(jpg, cv2.IMREAD_COLOR)
-                        if bgr is None:
-                            continue
-                        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                        with self.success_tracker_lock:
-                            status, overlay = self.success_tracker.update(rgb)
-                        self._set_success_status(status, overlay)
+            while not self.success_stop_event.is_set():
+                rgb = self.read_camera_frame(success_cam, timeout_s=5.0)
+                with self.success_tracker_lock:
+                    status, overlay = self.success_tracker.update(rgb)
+                self._set_success_status(status, overlay)
+                if period > 0:
+                    time.sleep(period)
         except BaseException as exc:
             with self.status_lock:
                 self.success_error = str(exc)
@@ -1683,11 +2346,33 @@ class SO101Controller:
     def _motion_running(self) -> bool:
         return self.policy_thread is not None and self.policy_thread.is_alive()
 
+    def is_policy_running(self) -> bool:
+        return self._motion_running() and self.mode == "policy"
+
+    def _intervention_running(self) -> bool:
+        return self.intervention_thread is not None and self.intervention_thread.is_alive()
+
+    def _intervention_active_or_requested(self) -> bool:
+        with self.status_lock:
+            return bool(self.intervention_status.get("active") or self.intervention_status.get("requested"))
+
     def _recording_running(self) -> bool:
         return self.record_thread is not None and self.record_thread.is_alive()
 
+    def _clear_completed_intervention_locked(self) -> None:
+        if not self.intervention_status.get("active") and not self.intervention_status.get("requested"):
+            self.intervention_request = None
+            self.intervention_status = self._new_intervention_status()
+
+    def _clear_paused_policy(self) -> None:
+        with self.status_lock:
+            self.paused_policy_config = None
+            self.policy_pause_requested = False
+
     def _recording_trajectory_active(self) -> bool:
         with self.status_lock:
+            if self.intervention_status.get("active"):
+                return True
             if self.record_capture_mode == "continuous":
                 return True
             return self.mode == "policy" and self.stage == "execute"
@@ -1742,6 +2427,56 @@ class SO101Controller:
         selected = [self.cameras_by_name[name] for name in self.policy_camera_names if name in self.cameras_by_name]
         return selected or self.camera_configs[:2]
 
+    def _direct_camera(self, cam: CameraConfig) -> DirectCameraSource | None:
+        index = direct_camera_index(cam.url)
+        if index is None:
+            return None
+        source = self.direct_cameras.get(index)
+        if source is None:
+            source = DirectCameraSource(index)
+            self.direct_cameras[index] = source
+            self.log(f"opened direct camera {cam.name}=opencv://{index}")
+        return source
+
+    def _mjpeg_camera(self, cam: CameraConfig) -> MjpegCameraSource:
+        source = self.mjpeg_cameras.get(cam.url)
+        if source is None:
+            source = MjpegCameraSource(cam.url)
+            self.mjpeg_cameras[cam.url] = source
+            self.log(f"opened mjpeg camera {cam.name}={cam.url}")
+        return source
+
+    def _drop_mjpeg_camera(self, cam: CameraConfig, reason: BaseException) -> None:
+        source = self.mjpeg_cameras.pop(cam.url, None)
+        if source is None:
+            return
+        source.stop()
+        self.log(f"reset mjpeg camera {cam.name}={cam.url}: {reason}")
+
+    def read_camera_jpeg(self, cam: CameraConfig, timeout_s: float = 5.0) -> bytes:
+        deadline = time.monotonic() + max(0.1, timeout_s)
+        last_exc: BaseException | None = None
+        while time.monotonic() < deadline:
+            try:
+                source = self._direct_camera(cam)
+                if source is not None:
+                    return source.get_jpeg(timeout_s=max(0.1, deadline - time.monotonic()))
+                return self._mjpeg_camera(cam).get_jpeg(timeout_s=max(0.1, deadline - time.monotonic()))
+            except BaseException as exc:
+                last_exc = exc
+                if direct_camera_index(cam.url) is None:
+                    self._drop_mjpeg_camera(cam, exc)
+                time.sleep(0.1)
+        assert last_exc is not None
+        raise last_exc
+
+    def read_camera_frame(self, cam: CameraConfig, timeout_s: float = 5.0) -> np.ndarray:
+        jpg = np.frombuffer(self.read_camera_jpeg(cam, timeout_s=timeout_s), dtype=np.uint8)
+        bgr = cv2.imdecode(jpg, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise RuntimeError(f"failed to decode JPEG from {cam.url}")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
     def _wait_motion_done(self, timeout_s: float) -> bool:
         deadline = time.monotonic() + max(0.0, timeout_s)
         while self._motion_running() and time.monotonic() < deadline:
@@ -1759,6 +2494,7 @@ class SO101Controller:
         name_prefix: str = "so101_recording",
         extra_meta: dict[str, Any] | None = None,
         capture_mode: str = "policy_execute",
+        root_dir: Path | str | None = None,
     ) -> dict[str, Any]:
         if self._recording_running():
             raise RuntimeError("recording is already running")
@@ -1777,7 +2513,7 @@ class SO101Controller:
         safe_prefix = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name_prefix).strip("_")
         if not safe_prefix:
             safe_prefix = "so101_recording"
-        out_root = RAW_RECORD_ROOT if capture_mode == "continuous" else RECORD_ROOT
+        out_root = Path(root_dir) if root_dir is not None else RAW_RECORD_ROOT if capture_mode == "continuous" else RECORD_ROOT
         if capture_mode == "continuous" and not safe_prefix.startswith("session"):
             safe_prefix = "session"
         out_dir = out_root / f"{safe_prefix}_{timestamp}"
@@ -1821,8 +2557,11 @@ class SO101Controller:
         (out_dir / meta_file).write_text(json.dumps(recording_meta, indent=2) + "\n")
 
         self.record_stop_event.clear()
+        self.record_rollover_cancel_event.clear()
         camera_names = [cam.name for cam in camera_configs]
         with self.status_lock:
+            self.record_rollover_active = False
+            self.record_rollover_next_at_mono = None
             self.record_started_at = record_start_mono
             self.record_duration_s = float(duration_s)
             self.record_fps = float(fps)
@@ -1830,6 +2569,7 @@ class SO101Controller:
             self.record_cameras = camera_names
             self.record_counts = {name: 0 for name in camera_names}
             self.record_counts["samples"] = 0
+            self.record_counts["intervention_samples"] = 0
             self.record_error = ""
             self.record_capture_mode = capture_mode
 
@@ -1846,9 +2586,130 @@ class SO101Controller:
         return {"dir": str(out_dir), "cameras": camera_names, "capture_mode": capture_mode, "meta_file": meta_file}
 
     def stop_recording(self) -> None:
+        self.record_rollover_cancel_event.set()
+        with self.status_lock:
+            was_rollover = self.record_rollover_active
+            self.record_rollover_active = False
+            self.record_rollover_next_at_mono = None
+        if was_rollover:
+            self.log("recording episode rollover canceled")
         if self._recording_running():
             self.record_stop_event.set()
             self.log("recording stop requested")
+
+    def _mark_recording_restarted_for_intervention(
+        self,
+        old_dir: Path | None,
+        *,
+        intervention_id: str,
+        operator: str,
+        reason: str,
+        new_dir: str | None = None,
+    ) -> None:
+        if old_dir is None:
+            return
+        meta_path = old_dir / "episode_meta.json"
+        try:
+            meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+            meta.update(
+                {
+                    "outcome": "policy_leadin_restarted_for_intervention",
+                    "reason": reason,
+                    "episode_kind": "policy_leadin",
+                    "had_intervention": False,
+                    "control_sources": ["policy"],
+                    "restarted_for_intervention": True,
+                    "intervention_id": intervention_id,
+                    "intervention_operator": operator,
+                    "restarted_recording_dir": new_dir,
+                    "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+            )
+            meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+        except BaseException as exc:
+            self.log(f"intervention restart meta update failed out={old_dir}: {exc}")
+
+    def _restart_recording_for_intervention(
+        self,
+        *,
+        intervention_id: str,
+        operator: str,
+        reason: str,
+        started_at: str,
+    ) -> str | None:
+        with self.status_lock:
+            if not self._recording_running():
+                return None
+            old_dir = self.record_dir
+            old_cameras = list(self.record_cameras)
+            old_fps = float(self.record_fps or DEFAULT_RECORD_FPS)
+            old_duration_s = float(self.record_duration_s or DEFAULT_RECORD_DURATION_S)
+            old_capture_mode = str(self.record_capture_mode or "policy_execute")
+
+        meta: dict[str, Any] = {}
+        if old_dir is not None:
+            meta_path = old_dir / ("session_meta.json" if old_capture_mode == "continuous" else "episode_meta.json")
+            try:
+                meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+            except (OSError, json.JSONDecodeError):
+                meta = {}
+        self.log(f"intervention restarting recording old={old_dir}")
+        self.stop_recording()
+        if self.record_thread is not None:
+            self.record_thread.join(timeout=10.0)
+        if self._recording_running():
+            self.log("intervention recording restart skipped; old recording is still stopping")
+            return None
+
+        self._mark_recording_restarted_for_intervention(
+            old_dir,
+            intervention_id=intervention_id,
+            operator=operator,
+            reason=reason,
+        )
+
+        root_dir = None
+        episodes_root = meta.get("episodes_root")
+        if isinstance(episodes_root, str) and episodes_root.strip():
+            root_dir = Path(episodes_root)
+        elif old_dir is not None:
+            root_dir = old_dir.parent
+
+        extra_meta = {
+            "record_start_trigger": "intervention_restart",
+            "episode_kind": "intervention",
+            "restarted_from_recording": None if old_dir is None else str(old_dir),
+            "discarded_policy_leadin": True,
+            "intervention_id": intervention_id,
+            "intervention_operator": operator,
+            "intervention_reason": reason,
+            "intervention_started_at": started_at,
+            "control_sources_expected": ["leader_delta", "policy"],
+        }
+        for key in ("dataset_name", "dataset_slug", "episodes_root"):
+            if key in meta:
+                extra_meta[key] = meta[key]
+
+        recording = self.start_recording(
+            duration_s=max(old_duration_s, INTERVENTION_DURATION_S + 1.0),
+            fps=old_fps,
+            cameras=old_cameras or [cam.name for cam in self.camera_configs],
+            task=str(meta.get("task") or DEFAULT_INSTRUCTION),
+            name_prefix="so101_intervention_recording",
+            extra_meta=extra_meta,
+            capture_mode=old_capture_mode,
+            root_dir=root_dir,
+        )
+        new_dir = str(recording["dir"])
+        self._mark_recording_restarted_for_intervention(
+            old_dir,
+            intervention_id=intervention_id,
+            operator=operator,
+            reason=reason,
+            new_dir=new_dir,
+        )
+        self.log(f"intervention recording restart new={new_dir}")
+        return new_dir
 
     def _finalize_recorded_episode(
         self,
@@ -1861,30 +2722,60 @@ class SO101Controller:
         ended_at: str,
         duration_s: float,
         event: dict[str, Any] | None = None,
+        cancel_rollover: bool = True,
     ) -> str | None:
         if out_dir is None:
             return None
         if self._recording_running():
-            self.stop_recording()
+            if cancel_rollover:
+                self.stop_recording()
+            else:
+                self.record_stop_event.set()
+                self.log("recording episode rollover stop requested")
         if self.record_thread is not None:
             self.record_thread.join(timeout=10.0)
 
         with self.status_lock:
             counts = dict(self.record_counts)
             error = self.record_error
+        event = event or {}
+        sample_count = int(counts.get("samples") or 0)
+        intervention_samples = int(counts.get("intervention_samples") or 0)
+        had_intervention = bool(
+            intervention_samples
+            or outcome == "intervention"
+            or event.get("type") == "intervention"
+            or event.get("intervention")
+        )
+        if had_intervention and sample_count > intervention_samples:
+            episode_kind = "mixed_intervention"
+        elif had_intervention:
+            episode_kind = "intervention"
+        else:
+            episode_kind = "policy"
+        control_sources = []
+        if sample_count > intervention_samples:
+            control_sources.append("policy")
+        if intervention_samples or had_intervention:
+            control_sources.append("leader_delta")
+        if not control_sources and sample_count:
+            control_sources.append("policy")
 
         result = {
             "format": "blupe_so101_episode_result",
             "format_version": 1,
             "outcome": outcome,
             "reason": reason,
+            "episode_kind": episode_kind,
+            "had_intervention": had_intervention,
+            "control_sources": control_sources,
             "attempt": int(attempt),
             "started_at": started_at,
             "ended_at": ended_at,
             "duration_s": round(max(0.0, duration_s), 3),
             "counts": counts,
             "recording_error": error,
-            "event": event or {},
+            "event": event,
         }
         try:
             meta_path = out_dir / "episode_meta.json"
@@ -1893,6 +2784,9 @@ class SO101Controller:
                 {
                     "outcome": outcome,
                     "reason": reason,
+                    "episode_kind": episode_kind,
+                    "had_intervention": had_intervention,
+                    "control_sources": control_sources,
                     "attempt": int(attempt),
                     "ended_at": ended_at,
                     "result_file": "episode_result.json",
@@ -1977,52 +2871,35 @@ class SO101Controller:
         end_t = record_start_mono + duration_s
         next_save_t = 0.0
         saved = 0
-        buf = bytearray()
         frames_log = out_dir / "frames.jsonl"
         try:
-            with urllib.request.urlopen(cam.url, timeout=5) as resp:
-                while not self.record_stop_event.is_set() and time.monotonic() < end_t:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    buf.extend(chunk)
-                    while not self.record_stop_event.is_set():
-                        start = buf.find(b"\xff\xd8")
-                        if start < 0:
-                            if len(buf) > 1024 * 1024:
-                                del buf[:-2]
-                            break
-                        end = buf.find(b"\xff\xd9", start + 2)
-                        if end < 0:
-                            if start > 0:
-                                del buf[:start]
-                            break
-                        frame = bytes(buf[start : end + 2])
-                        del buf[: end + 2]
-                        now = time.monotonic()
-                        if not self._recording_trajectory_active():
-                            next_save_t = now
-                            continue
-                        if now >= next_save_t:
-                            frame_name = f"frame_{saved:05d}.jpg"
-                            (out_dir / frame_name).write_bytes(frame)
-                            append_jsonl(
-                                frames_log,
-                                {
-                                    "camera": cam.name,
-                                    "frame_idx": saved,
-                                    "frame": frame_name,
-                                    "timestamp_s": round(saved * period, 6),
-                                    "wall_elapsed_s": round(now - record_start_mono, 6),
-                                    "monotonic_s": now,
-                                },
-                            )
-                            saved += 1
-                            next_save_t = now + period
-                            with self.status_lock:
-                                self.record_counts[cam.name] = saved
-                        if time.monotonic() >= end_t:
-                            break
+            while not self.record_stop_event.is_set() and time.monotonic() < end_t:
+                now = time.monotonic()
+                if not self._recording_trajectory_active():
+                    next_save_t = now
+                    time.sleep(0.01)
+                    continue
+                if now < next_save_t:
+                    time.sleep(min(0.02, next_save_t - now))
+                    continue
+                frame = self.read_camera_jpeg(cam, timeout_s=5.0)
+                frame_name = f"frame_{saved:05d}.jpg"
+                (out_dir / frame_name).write_bytes(frame)
+                append_jsonl(
+                    frames_log,
+                    {
+                        "camera": cam.name,
+                        "frame_idx": saved,
+                        "frame": frame_name,
+                        "timestamp_s": round(saved * period, 6),
+                        "wall_elapsed_s": round(now - record_start_mono, 6),
+                        "monotonic_s": now,
+                    },
+                )
+                saved += 1
+                next_save_t = now + period
+                with self.status_lock:
+                    self.record_counts[cam.name] = saved
         except BaseException as exc:
             with self.status_lock:
                 self.record_error = f"{cam.name}: {exc}"
@@ -2073,6 +2950,9 @@ class SO101Controller:
                 )
                 mode = self.mode
                 stage = self.stage
+                intervention = dict(self.intervention_status)
+                intervention_active = bool(intervention.get("active"))
+                control_source = "leader_delta" if intervention_active else "policy"
 
             append_jsonl(
                 samples_path,
@@ -2087,12 +2967,21 @@ class SO101Controller:
                     "action_age_s": action_age_s,
                     "mode": mode,
                     "stage": stage,
+                    "control_source": control_source,
+                    "intervention_active": intervention_active,
+                    "intervention_id": intervention.get("id"),
+                    "intervention_state": intervention.get("state"),
+                    "intervention_operator": intervention.get("operator"),
                     "error": error,
                 },
             )
             sample_idx += 1
             with self.status_lock:
                 self.record_counts["samples"] = sample_idx
+                if intervention_active:
+                    self.record_counts["intervention_samples"] = int(
+                        self.record_counts.get("intervention_samples", 0)
+                    ) + 1
             next_sample_t += period
 
     def start_eval(
@@ -2107,6 +2996,7 @@ class SO101Controller:
         hz: float,
         allow_teleop: bool = True,
         record_episodes: bool = True,
+        dataset_name: str = "",
     ) -> None:
         if self._eval_running():
             raise RuntimeError("continuous eval is already running")
@@ -2123,14 +3013,19 @@ class SO101Controller:
             raise ValueError("eval record fps must be positive")
 
         instruction = instruction.strip() or DEFAULT_INSTRUCTION
+        dataset_name = dataset_name.strip()
+        dataset_slug = _safe_dataset_name(dataset_name, fallback="so101-eval") if dataset_name else ""
         now = time.monotonic()
         self.eval_stop_event.clear()
         config = {
             "instruction": instruction,
+            "dataset_name": dataset_name,
+            "dataset_slug": dataset_slug,
             "run_duration_s": float(run_duration_s),
             "attempt_duration_s": float(attempt_duration_s),
             "max_consecutive_failures": int(max_consecutive_failures),
             "record_fps": float(record_fps),
+            "record_start_delay_s": DEFAULT_EVAL_RECORD_START_DELAY_S,
             "exec_steps": int(exec_steps),
             "max_step_deg": float(max_step_deg),
             "hz": float(hz),
@@ -2152,12 +3047,15 @@ class SO101Controller:
                     "running": True,
                     "state": "starting",
                     "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "dataset_name": dataset_name,
+                    "dataset_slug": dataset_slug,
                     "run_duration_s": float(run_duration_s),
                     "attempt_duration_s": float(attempt_duration_s),
                     "no_success_timeout_s": float(attempt_duration_s),
                     "max_consecutive_failures": int(max_consecutive_failures),
                     "allow_teleop": bool(allow_teleop),
                     "record_episodes": bool(record_episodes),
+                    "record_start_delay_s": DEFAULT_EVAL_RECORD_START_DELAY_S,
                 }
             )
         self.reset_success_tracking(container_reason="eval_start")
@@ -2174,6 +3072,7 @@ class SO101Controller:
                 float(hz),
                 bool(allow_teleop),
                 bool(record_episodes),
+                dataset_name,
                 False,
             ),
             daemon=True,
@@ -2182,7 +3081,7 @@ class SO101Controller:
         self.log(
             f"eval start run={run_duration_s}s no_success_timeout={attempt_duration_s}s "
             f"max_failures={max_consecutive_failures} record_fps={record_fps} "
-            f"allow_teleop={allow_teleop} record_episodes={record_episodes}"
+            f"allow_teleop={allow_teleop} record_episodes={record_episodes} dataset={dataset_name!r}"
         )
 
     def resume_eval(self) -> None:
@@ -2246,6 +3145,7 @@ class SO101Controller:
                 float(config.get("hz", DEFAULT_HZ)),
                 bool(config.get("allow_teleop", True)),
                 bool(config.get("record_episodes", True)),
+                str(config.get("dataset_name", "")),
                 True,
             ),
             daemon=True,
@@ -2518,6 +3418,7 @@ class SO101Controller:
         hz: float,
         allow_teleop: bool = True,
         record_episodes: bool = True,
+        dataset_name: str = "",
         resume: bool = False,
     ) -> None:
         end_t = time.monotonic() + run_duration_s
@@ -2540,13 +3441,21 @@ class SO101Controller:
             with self.status_lock:
                 successes = int(self.eval_status.get("successes") or 0)
                 failures = int(self.eval_status.get("failures") or 0)
+                interventions = int(self.eval_status.get("interventions") or 0)
                 consecutive_failures = int(self.eval_status.get("consecutive_failures") or 0)
                 run_num = int(self.eval_status.get("attempt") or 0)
         else:
             successes = 0
             failures = 0
+            interventions = 0
             consecutive_failures = 0
             run_num = 0
+        record_start_delay_s = max(
+            0.0,
+            float(self.eval_config.get("record_start_delay_s", DEFAULT_EVAL_RECORD_START_DELAY_S)),
+        )
+        dataset_name = (dataset_name or "").strip()
+        dataset_slug = _safe_dataset_name(dataset_name, fallback="so101-eval") if dataset_name else ""
         try:
             if self._recording_running():
                 self.log("eval replacing active recording")
@@ -2556,18 +3465,24 @@ class SO101Controller:
                 if self._recording_running():
                     raise RuntimeError("recording is still stopping; retry eval start")
 
-            summary_dir = RECORD_ROOT / f"so101_eval_{time.strftime('%Y%m%d_%H%M%S')}"
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            summary_dir = RECORD_ROOT / (dataset_slug or f"so101_eval_{timestamp}")
             summary_dir.mkdir(parents=True, exist_ok=True)
             summary_path = summary_dir / "eval_summary.json"
+            if summary_path.exists():
+                summary_path = summary_dir / f"eval_summary_{timestamp}.json"
             with self.status_lock:
                 self.eval_summary_path = summary_path
                 self.eval_status.update(
                     {
                         "state": "running",
+                        "dataset_name": dataset_name,
+                        "dataset_slug": dataset_slug,
                         "recording_dir": None,
                         "summary_path": str(summary_path),
                         "allow_teleop": bool(allow_teleop),
                         "record_episodes": bool(record_episodes),
+                        "record_start_delay_s": record_start_delay_s,
                         "episode_root": str(summary_dir),
                     }
                 )
@@ -2594,30 +3509,83 @@ class SO101Controller:
                     "outcome": "running",
                     "reason": "",
                     "successes": 0,
+                    "recording_pending": bool(record_episodes),
+                    "record_start_delay_s": record_start_delay_s,
                 }
                 attempt_record_dir: Path | None = None
-                if record_episodes:
+                record_start_ready_mono = run_started_mono + record_start_delay_s
+
+                def start_attempt_recording(
+                    *,
+                    trigger: str,
+                    episode_kind: str,
+                    intervention_request: dict[str, Any] | None = None,
+                ) -> None:
+                    nonlocal attempt_record_dir
+                    nonlocal active_record_dir, active_record_run_num
+                    nonlocal active_record_started_at, active_record_started_mono
+                    if not record_episodes or attempt_record_dir is not None:
+                        return
+                    now_mono = time.monotonic()
+                    recording_started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
                     record_duration_s = max(1.0, watchdog_deadline - time.monotonic() + MOLMO_TIMEOUT_S + 15.0)
+                    intervention_meta = {}
+                    if intervention_request is not None:
+                        intervention_meta = {
+                            "intervention_id": intervention_request.get("id"),
+                            "intervention_operator": intervention_request.get("operator"),
+                            "intervention_reason": intervention_request.get("reason"),
+                            "intervention_requested_at": intervention_request.get("requested_at"),
+                        }
                     recording = self.start_recording(
                         record_duration_s,
                         record_fps,
                         [cam.name for cam in self.camera_configs],
                         task=instruction,
-                        name_prefix=f"so101_episode_run{run_num:04d}",
+                        name_prefix=f"so101_{episode_kind}_run{run_num:04d}",
+                        root_dir=summary_dir,
                         extra_meta={
+                            "dataset_name": dataset_name,
+                            "dataset_slug": dataset_slug,
+                            "episodes_root": str(summary_dir),
                             "eval_attempt": run_num,
                             "eval_run": run_num,
                             "eval_started_at": run_started_at,
+                            "record_started_at": recording_started_at,
+                            "record_start_trigger": trigger,
+                            "record_start_delay_s": record_start_delay_s if trigger == "policy_delay" else 0.0,
+                            "record_only_policy_execute": True,
+                            "episode_kind": episode_kind,
+                            "had_intervention": episode_kind != "policy",
+                            "control_sources_expected": ["leader_delta"]
+                            if episode_kind == "intervention"
+                            else ["policy"],
                             "eval_summary_path": str(summary_path),
-                            "expected_outcomes": ["success", "failure"],
+                            "expected_outcomes": ["success", "failure", "intervention"],
+                            **intervention_meta,
                         },
                     )
                     attempt_record_dir = Path(recording["dir"])
                     active_record_dir = attempt_record_dir
                     active_record_run_num = run_num
-                    active_record_started_at = run_started_at
-                    active_record_started_mono = run_started_mono
+                    active_record_started_at = recording_started_at
+                    active_record_started_mono = now_mono
                     run_record["recording_dir"] = recording["dir"]
+                    run_record["recording_pending"] = False
+                    run_record["record_start_trigger"] = trigger
+                    run_record["episode_kind"] = episode_kind
+                    with self.status_lock:
+                        current_attempt = self.eval_status.get("current_attempt")
+                        if isinstance(current_attempt, dict) and int(current_attempt.get("run") or -1) == run_num:
+                            current_attempt.update(dict(run_record))
+                            self.eval_status["current_attempt"] = current_attempt
+                        self.eval_status["recording_dir"] = recording["dir"]
+                    self.log(
+                        f"eval recording start run={run_num} trigger={trigger} "
+                        f"kind={episode_kind} out={recording['dir']}"
+                    )
+                    self._write_eval_summary()
+
                 with self.status_lock:
                     self.eval_attempt_started_at_mono = watchdog_started_mono
                     self.eval_attempt_deadline_mono = watchdog_deadline
@@ -2626,9 +3594,10 @@ class SO101Controller:
                             "state": "policy_running",
                             "attempt": run_num,
                             "current_attempt": dict(run_record),
-                            "recording_dir": None if attempt_record_dir is None else str(attempt_record_dir),
+                            "recording_dir": None,
                             "successes": successes,
                             "failures": failures,
+                            "interventions": interventions,
                             "consecutive_failures": consecutive_failures,
                             "error": "",
                         }
@@ -2655,6 +3624,14 @@ class SO101Controller:
                 last_tracker_success_count = 0
                 while not self.eval_stop_event.is_set():
                     now = time.monotonic()
+                    if (
+                        record_episodes
+                        and attempt_record_dir is None
+                        and now >= record_start_ready_mono
+                        and self.mode == "policy"
+                        and self.stage == "execute"
+                    ):
+                        start_attempt_recording(trigger="policy_delay", episode_kind="policy")
                     success_status = self._current_success_status()
                     tracker_success_count = int(success_status.get("success_count") or 0)
                     if tracker_success_count > last_tracker_success_count:
@@ -2766,9 +3743,57 @@ class SO101Controller:
                     if not self._motion_running():
                         with self.status_lock:
                             err = self.last_error
+                        intervention_request = self._pending_intervention_request()
                         if time.monotonic() >= end_t:
                             run_outcome = "complete"
                             run_reason = "run_duration_complete"
+                            break
+                        if intervention_request is not None:
+                            start_attempt_recording(
+                                trigger="intervention_start",
+                                episode_kind="intervention",
+                                intervention_request=intervention_request,
+                            )
+                            interventions += 1
+                            run_outcome = "intervention"
+                            run_reason = str(intervention_request.get("reason") or "manual_intervention")
+                            intervention_event = {
+                                "type": "intervention",
+                                "attempt": run_num,
+                                "run": run_num,
+                                "id": intervention_request.get("id"),
+                                "operator": intervention_request.get("operator"),
+                                "started_at": run_started_at,
+                                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                                "duration_s": round(time.monotonic() - run_started_mono, 3),
+                                "outcome": "intervention",
+                                "reason": run_reason,
+                                "successes_in_run": segment_successes,
+                                "success_count": tracker_success_count,
+                                "tracker_state": success_status.get("state"),
+                                "tracker_overlap": success_status.get("current_overlap"),
+                                "recording_dir": None if attempt_record_dir is None else str(attempt_record_dir),
+                                **self._tracker_event_context(success_status),
+                            }
+                            run_event = dict(intervention_event)
+                            with self.status_lock:
+                                self.eval_history.append(dict(intervention_event))
+                                self.eval_attempt_started_at_mono = None
+                                self.eval_attempt_deadline_mono = None
+                                self.eval_status.update(
+                                    {
+                                        "state": "intervention_pending",
+                                        "successes": successes,
+                                        "failures": failures,
+                                        "interventions": interventions,
+                                        "consecutive_failures": consecutive_failures,
+                                        "last_attempt": dict(intervention_event),
+                                        "current_attempt": None,
+                                        "stop_reason": run_reason,
+                                    }
+                                )
+                            self.log(f"eval run {run_num} intervention pending id={intervention_request.get('id')}")
+                            self._write_eval_summary()
                             break
                         if err:
                             run_outcome = "failure"
@@ -2896,6 +3921,33 @@ class SO101Controller:
                         )
                     self._write_eval_summary()
 
+                if run_outcome == "intervention":
+                    intervention_request = self._pending_intervention_request()
+                    if intervention_request is not None:
+                        self._start_leader_delta_intervention(intervention_request)
+                    while not self.eval_stop_event.is_set():
+                        with self.status_lock:
+                            intervention_active = bool(
+                                self.intervention_status.get("active") or self.intervention_status.get("requested")
+                            )
+                        if not intervention_active:
+                            break
+                        time.sleep(0.1)
+                    if self.eval_stop_event.is_set():
+                        run_outcome = "stopped"
+                        run_reason = "user_stop"
+                    else:
+                        with self.status_lock:
+                            finished_intervention = dict(self.intervention_status)
+                        run_event = {
+                            **(run_event or {}),
+                            "type": "intervention",
+                            "outcome": "intervention",
+                            "reason": run_reason,
+                            "intervention": finished_intervention,
+                            "recording_dir": None if attempt_record_dir is None else str(attempt_record_dir),
+                        }
+
                 if attempt_record_dir is not None:
                     episode_ended_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
                     final_recording_dir = self._finalize_recorded_episode(
@@ -2903,9 +3955,9 @@ class SO101Controller:
                         outcome=run_outcome if run_outcome != "running" else "stopped",
                         reason=run_reason or stop_reason,
                         attempt=run_num,
-                        started_at=run_started_at,
+                        started_at=active_record_started_at or run_started_at,
                         ended_at=episode_ended_at,
-                        duration_s=time.monotonic() - run_started_mono,
+                        duration_s=time.monotonic() - (active_record_started_mono or run_started_mono),
                         event=run_event,
                     )
                     if final_recording_dir:
@@ -2945,7 +3997,7 @@ class SO101Controller:
                     request_intervention("consecutive_failures")
                     break
 
-                if run_outcome in {"success", "failure"}:
+                if run_outcome in {"success", "failure", "intervention"}:
                     home_ok = self._eval_home()
                     self._write_eval_summary()
                     if not home_ok:
@@ -3006,6 +4058,7 @@ class SO101Controller:
                         "completed_at": completed_at,
                         "successes": successes,
                         "failures": failures,
+                        "interventions": interventions,
                         "consecutive_failures": consecutive_failures,
                         "waiting_for_intervention": waiting_for_intervention,
                         "current_attempt": None,
@@ -3014,7 +4067,10 @@ class SO101Controller:
                 )
             self._write_eval_summary()
             self.eval_stop_event.set()
-            self.log(f"eval {final_state} reason={stop_reason} successes={successes} failures={failures}")
+            self.log(
+                f"eval {final_state} reason={stop_reason} "
+                f"successes={successes} failures={failures} interventions={interventions}"
+            )
 
     def start_policy(
         self,
@@ -3030,12 +4086,23 @@ class SO101Controller:
             raise RuntimeError("continuous eval is running; stop it first")
         if self._motion_running():
             raise RuntimeError("policy is already running")
+        if self._intervention_active_or_requested():
+            raise RuntimeError("end intervention first")
         if not from_eval:
             self._raise_if_teleop_active()
         instruction = instruction.strip() or DEFAULT_INSTRUCTION
         self.stop_event.clear()
         self.start_success_tracking(container_reason=success_container_reason)
         with self.status_lock:
+            self._clear_completed_intervention_locked()
+            self.policy_pause_requested = False
+            self.active_policy_config = {
+                "instruction": instruction,
+                "duration_s": float(duration_s),
+                "exec_steps": int(exec_steps),
+                "max_step_deg": float(max_step_deg),
+                "hz": float(hz),
+            }
             self.steps = 0
             self.chunks = 0
             self.last_error = ""
@@ -3084,7 +4151,7 @@ class SO101Controller:
                 capture_times = []
                 for cam in self._policy_cameras():
                     t_cam = time.monotonic()
-                    images[cam.name] = read_mjpeg_frame(cam.url)
+                    images[cam.name] = self.read_camera_frame(cam, timeout_s=5.0)
                     capture_times.append(time.monotonic() - t_cam)
                     self.log(f"chunk {next_chunk} {cam.name} frame={capture_times[-1]:.2f}s")
                 t0 = time.monotonic()
@@ -3151,17 +4218,25 @@ class SO101Controller:
             else:
                 self.log("policy complete")
             self.stop_success_tracking(join=True)
-            self.set_stage("idle")
-            self.set_mode("idle")
+            with self.status_lock:
+                if not self.policy_pause_requested:
+                    self.active_policy_config = None
+                if self.policy_thread is threading.current_thread():
+                    self.policy_thread = None
+            if not self._intervention_active_or_requested():
+                self.set_stage("idle")
+                self.set_mode("idle")
+            self._start_pending_intervention_after_motion()
+            if not self._intervention_active_or_requested():
+                self._resume_paused_policy()
 
     def start_home(self, max_step_deg: float = HOME_STEP_DEG, hz: float = DEFAULT_HZ, from_eval: bool = False) -> None:
         if self._eval_running() and not from_eval:
             raise RuntimeError("continuous eval is running; stop it first")
         if self._motion_running():
-            self.stop_policy()
-            self.policy_thread.join(timeout=1.0)
-            if self._motion_running():
-                raise RuntimeError("motion is stopping; retry go home in a moment")
+            raise RuntimeError("Go Home only works while idle")
+        if self._intervention_active_or_requested():
+            raise RuntimeError("Go Home only works while idle")
         self.stop_event.clear()
         with self.status_lock:
             self.steps = 0
@@ -3276,7 +4351,11 @@ h1 { margin: 0; font-size: 18px; }
 .button-link { display:inline-flex; align-items:center; color:#fff; text-decoration:none; background:#333; border:1px solid #555; border-radius:5px; padding:8px 10px; }
 main { display: grid; grid-template-columns: minmax(320px, 1.2fr) minmax(320px, .8fr); gap: 14px; padding: 14px; }
 .cams { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
-.cams img { width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: #000; border:1px solid #333; border-radius: 6px; }
+.cam-card { position:relative; min-width:0; }
+.cams img { display:block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: #000; border:1px solid #333; border-radius: 6px; }
+.cam-badge, .cam-source { position:absolute; left:8px; z-index:2; border:1px solid rgba(255,255,255,.28); background:rgba(0,0,0,.76); color:#fff; text-shadow:0 1px 1px #000; }
+.cam-badge { top:8px; border-radius:999px; padding:4px 8px; font-size:13px; font-weight:750; letter-spacing:0; }
+.cam-source { bottom:8px; max-width:calc(100% - 18px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border-radius:5px; padding:3px 6px; font-size:11px; color:#d7e7ff; }
 .panel { border: 1px solid #333; border-radius: 6px; padding: 12px; background: #1b1b1b; }
 .row { display:flex; gap: 8px; align-items:center; flex-wrap: wrap; margin: 8px 0; }
 label { color:#bbb; font-size: 13px; }
@@ -3306,6 +4385,21 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .teleop .warn { color:#ffd166; }
 .teleop .bad { color:#ff8a8a; }
 .teleop-panel { margin-top:12px; }
+.live-record-bar { display:none; align-items:flex-end; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; padding: 9px; background:#151515; border:1px solid #333; border-radius:6px; }
+.live-record-bar label { display:flex; flex-direction:column; gap:4px; min-width: 180px; flex: 1 1 220px; }
+.live-record-bar label.prompt { flex: 3 1 420px; }
+.live-record-bar input { width:100%; box-sizing:border-box; }
+.live-record-bar button { min-height: 36px; white-space: nowrap; }
+.live-record-status { flex: 1 1 260px; min-height: 20px; color:#bbb; font-size: 12px; }
+.live-record-status.ok { color:#70e08a; }
+.live-record-status.warn { color:#ffd166; }
+.live-record-status.bad { color:#ff8a8a; }
+.live-record-status b { color:inherit; }
+.live-success-indicator { display:flex; align-items:center; justify-content:center; min-height: 22px; padding: 6px 10px; border:1px solid #444; border-radius:999px; background:#242424; color:#bbb; font-size:12px; font-weight:700; }
+.live-success-indicator.ok { border-color:#3c8a52; background:rgba(45,107,63,.34); color:#70e08a; }
+.live-success-indicator.hit { border-color:#70e08a; background:#2d6b3f; color:#fff; }
+.live-success-indicator.warn { border-color:#ffd166; background:rgba(255,209,102,.18); color:#ffd166; }
+.live-success-indicator.bad { border-color:#c43b3b; background:rgba(158,47,47,.28); color:#ff8a8a; }
 .live-summary { display:flex; align-items:stretch; justify-content:space-between; gap: 10px; margin-top: 12px; }
 .live-prompt { display:grid; grid-template-columns: 1fr; gap: 8px; margin-bottom: 8px; }
 .live-prompt-item { min-width:0; background:#0b0b0b; border:1px solid #333; border-radius:5px; padding:7px 9px; font-size: 13px; }
@@ -3327,6 +4421,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .event-pill { display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; width: 32px; height: 28px; padding: 0; border-radius: 999px; font-size: 17px; line-height:1; font-weight: 700; white-space: nowrap; }
 .event-pill.success { background: rgba(45, 107, 63, .35); border: 1px solid #3c8a52; }
 .event-pill.failure { background: rgba(158, 47, 47, .35); border: 1px solid #c43b3b; color:#ffb4b4; }
+.event-pill.warn { background: rgba(255, 209, 102, .22); border: 1px solid #ffd166; color:#ffe6a3; }
 .live-events.compact { gap:5px; }
 .live-events.compact .event-pill { width: 27px; height: 24px; font-size: 15px; }
 .live-events.dense { gap:4px; }
@@ -3348,6 +4443,7 @@ body.live-view .status-panel { display:none; }
 body.live-view .cams { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 body.live-view .cams img { height: min(62vh, 680px); max-height: none; }
 body.live-view .visual-pane { min-height: calc(100vh - 74px); }
+body.live-view .live-record-bar, body.page-monitor .live-record-bar { display:flex; }
 body.page-setup .monitor-only { display:none !important; }
 body.page-monitor .setup-only { display:none !important; }
 body.page-monitor main { grid-template-columns: 1fr; }
@@ -3378,24 +4474,45 @@ body.page-monitor #liveToggle { display:none; }
   <div class="header-actions">
     <a class="button-link" href="/episodes" target="_blank">Episodes</a>
     <button id="liveToggle" onclick="toggleLiveView()">Live View</button>
+    <button id="headerStopRecordingButton" class="danger" onclick="stopRecording()" disabled>Stop Recording</button>
     <span id="mode" class="status">...</span>
   </div>
 </header>
 <main>
 	  <section class="visual-pane">
 	    <div class="live-prompt mono" id="livePrompt"></div>
+	    <div class="live-record-bar">
+	      <label class="prompt">Model Prompt <input id="liveInstruction" type="text" value="Move to light blue ball, grab it, and move it to the tall black cylinder"></label>
+	      <label>Dataset Name <input id="evalDatasetName" type="text" value="so101-ball-cup-eval"></label>
+	      <button id="startEvalButton" class="primary" onclick="startEval()">Start Recording</button>
+	      <button id="stopRecordingButton" class="danger" onclick="stopRecording()" disabled>Stop Recording</button>
+	      <span id="liveSuccessIndicator" class="live-success-indicator mono">success 0</span>
+	      <span id="liveRecordStatus" class="live-record-status mono">idle</span>
+	    </div>
 	    <div class="cams">
-	      <img id="cam0" alt="camera 0">
-      <img id="cam1" alt="camera 1">
-      <img id="cam2" alt="camera 2">
+	      <div class="cam-card" data-camera="front">
+	        <img id="camera-front" alt="front camera">
+	        <div class="cam-badge">FRONT</div>
+	        <div class="cam-source mono" id="camera-front-source"></div>
+	      </div>
+	      <div class="cam-card" data-camera="side">
+	        <img id="camera-side" alt="side camera">
+	        <div class="cam-badge">SIDE</div>
+	        <div class="cam-source mono" id="camera-side-source"></div>
+	      </div>
+	      <div class="cam-card" data-camera="wrist">
+	        <img id="camera-wrist" alt="wrist camera">
+	        <div class="cam-badge">WRIST</div>
+	        <div class="cam-source mono" id="camera-wrist-source"></div>
+	      </div>
       <img id="successOverlay" alt="success tracking overlay">
     </div>
-    <div class="live-summary monitor-only">
-      <div class="live-events" id="liveEvents"></div>
-      <div class="monitor-actions">
-        <label><input id="evalWithTeleop" type="checkbox" checked> w teleop</label>
-        <label><input id="evalRecordEpisodes" type="checkbox" checked> record episodes</label>
-        <button id="startEvalButton" class="primary" onclick="startEval()">Start</button>
+	    <div class="live-summary monitor-only">
+	      <div class="live-events" id="liveEvents"></div>
+	      <div class="monitor-actions">
+	        <label><input id="evalWithTeleop" type="checkbox" checked> w teleop</label>
+	        <label><input id="evalRecordEpisodes" type="checkbox" checked> record episodes</label>
+	        <button id="liveInterventionToggleButton" class="danger" onclick="toggleIntervention()">Intervene</button>
         <button class="primary" onclick="resumeEval()">Resume</button>
         <button id="liveStopEvalButton" class="danger" onclick="stopEval()">Stop</button>
         <button onclick="clearEval()">Clear</button>
@@ -3409,6 +4526,7 @@ body.page-monitor #liveToggle { display:none; }
       <div class="teleop mono" id="teleop"></div>
       <div class="row">
         <label>Operator <input id="teleopOperator" type="text" value="operator" style="width:130px"></label>
+        <button id="interventionToggleButton" class="danger" onclick="toggleIntervention()">Intervene</button>
         <button id="claimTeleopButton" class="primary" onclick="claimTeleop()">Claim Teleop</button>
         <button id="releaseTeleopButton" onclick="releaseTeleop()" disabled>Release Teleop</button>
         <button id="releaseResumeButton" class="good" onclick="releaseAndResumeEval()" disabled>Release + Resume Eval</button>
@@ -3438,7 +4556,7 @@ body.page-monitor #liveToggle { display:none; }
   </section>
   <section class="panel control-panel">
     <label class="setup-only">Instruction</label>
-    <textarea id="instruction" class="setup-only">Move to blue ball, grab it, and place it in the cardboard cylinder</textarea>
+    <textarea id="instruction" class="setup-only">Move to light blue ball, grab it, and move it to the tall black cylinder</textarea>
     <div class="row setup-only">
       <label>Duration <input id="duration" type="number" value="300" min="1" max="900" style="width:72px"></label>
       <label>Steps/chunk <input id="execSteps" type="number" value="30" min="1" max="30" style="width:72px"></label>
@@ -3458,7 +4576,7 @@ body.page-monitor #liveToggle { display:none; }
     <div class="sam3-editor setup-only">
       <label>SAM3 Container Prompt</label>
       <div class="row">
-        <input id="sam3Prompt" type="text" value="cardboard cylinder along with the insides">
+        <input id="sam3Prompt" type="text" value="black cylinder along with the insides">
       </div>
       <div class="row">
         <label>Confidence <input id="sam3MinScore" type="number" value="0.15" min="0" max="1" step="0.01" style="width:72px"></label>
@@ -3503,7 +4621,8 @@ let lastStatus = null;
 let teleopLeaseId = sessionStorage.getItem('so101TeleopLeaseId') || '';
 const teleopOperatorKey = 'so101TeleopOperator';
 let datasetPromptDismissedFor = sessionStorage.getItem('so101DatasetPromptDismissedFor') || '';
-const cameraTimers = [];
+let evalStartPending = false;
+let lastLiveSuccessCount = 0;
 
 function setPage(page) {
   const selected = page === 'monitor' ? 'monitor' : 'setup';
@@ -3519,33 +4638,46 @@ window.addEventListener('hashchange', () => {
   setPage(location.hash.replace('#', '') || localStorage.getItem('so101ControlPage') || 'setup');
 });
 
-function startLowLatencyImage(id, path, intervalMs) {
+function startMjpegImage(id, path) {
   const el = document.getElementById(id);
   if (!el) return;
-  let pending = false;
-  let lastOkSrc = '';
-  const tick = () => {
-    if (pending) return;
-    pending = true;
-    const img = new Image();
-    img.onload = () => {
-      lastOkSrc = img.src;
-      el.src = lastOkSrc;
-      pending = false;
-    };
-    img.onerror = () => {
-      pending = false;
-      if (lastOkSrc) el.src = lastOkSrc;
-    };
-    img.src = `${path}?t=${Date.now()}`;
+  let reconnectTimer = null;
+  const connect = () => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    el.src = `${path}?t=${Date.now()}`;
   };
-  tick();
-  cameraTimers.push(setInterval(tick, intervalMs));
+  el.onerror = () => {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(connect, 500);
+  };
+  connect();
 }
 
-startLowLatencyImage('cam0', '/cam0.jpg', 125);
-startLowLatencyImage('cam1', '/cam1.jpg', 125);
-startLowLatencyImage('cam2', '/cam2.jpg', 125);
+startMjpegImage('camera-front', '/camera/front.mjpg');
+startMjpegImage('camera-side', '/camera/side.mjpg');
+startMjpegImage('camera-wrist', '/camera/wrist.mjpg');
+
+function shortCameraUrl(url) {
+  try {
+    const parsed = new URL(url, location.href);
+    return `${parsed.port ? ':' + parsed.port : ''}${parsed.pathname}`;
+  } catch {
+    return String(url || '');
+  }
+}
+function renderCameraLabels(data) {
+  const cameras = Array.isArray(data?.cameras) ? data.cameras : [];
+  for (const cam of cameras) {
+    const name = String(cam.name || '');
+    const source = document.getElementById(`camera-${name}-source`);
+    if (!source) continue;
+    source.textContent = `${name} <- ${shortCameraUrl(cam.url)}`;
+    source.title = cam.url || '';
+  }
+}
 
 async function api(path, body) {
   const opts = body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)};
@@ -3564,6 +4696,8 @@ if (teleopOperatorInput) {
 }
 document.getElementById('sam3Prompt')?.addEventListener('input', () => { sam3PromptDirty = true; });
 document.getElementById('sam3MinScore')?.addEventListener('input', () => { sam3MinScoreDirty = true; });
+document.getElementById('liveInstruction')?.addEventListener('input', () => syncModelPrompt('liveInstruction'));
+document.getElementById('instruction')?.addEventListener('input', () => syncModelPrompt('instruction'));
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
 }
@@ -3640,21 +4774,144 @@ async function applySam3Prompt() {
   setSam3PreviewStatus(`using "${cfg.prompt}" min=${cfg.min_score}`);
   await refresh();
 }
-async function startEval() {
-  await api('/api/eval/start', {
-    instruction: val('instruction'),
-    run_duration_s: Number(val('evalHours')) * 3600,
-    attempt_duration_s: Number(val('evalAttempt')),
-    max_consecutive_failures: Number(val('evalMaxFails')),
-    record_fps: Number(val('evalRecordFps')),
-    exec_steps: Number(val('execSteps')),
-    max_step_deg: Number(val('maxStep')),
-    hz: Number(val('hz')),
-    allow_teleop: !!document.getElementById('evalWithTeleop')?.checked,
-    record_episodes: !!document.getElementById('evalRecordEpisodes')?.checked,
+function modelPromptValue() {
+  return (val('liveInstruction') || val('instruction') || '').trim();
+}
+function syncModelPrompt(sourceId) {
+  const source = document.getElementById(sourceId);
+  if (!source) return;
+  const targetId = sourceId === 'liveInstruction' ? 'instruction' : 'liveInstruction';
+  const target = document.getElementById(targetId);
+  if (target && document.activeElement !== target) target.value = source.value;
+}
+function setLiveRecordStatus(text, cls = '') {
+  const el = document.getElementById('liveRecordStatus');
+  if (!el) return;
+  el.className = `live-record-status mono ${cls}`.trim();
+  el.innerHTML = text ? escapeHtml(text) : 'idle';
+}
+function renderLiveSuccess(data) {
+  const el = document.getElementById('liveSuccessIndicator');
+  if (!el) return;
+  const s = data.success_tracking || {};
+  const count = Number(s.success_count || 0);
+  const increased = count > lastLiveSuccessCount;
+  lastLiveSuccessCount = Math.max(lastLiveSuccessCount, count);
+  let cls = '';
+  let text = `success ${count}`;
+  if (s.error) {
+    cls = 'bad';
+    text = 'success error';
+  } else if (increased || s.success_this_frame) {
+    cls = 'hit';
+    text = `SUCCESS ${count}`;
+  } else if (count > 0) {
+    cls = 'ok';
+    text = `success ${count}`;
+  } else if (s.running || s.state === 'tracking') {
+    cls = 'warn';
+    text = 'tracking success';
+  }
+  el.className = `live-success-indicator mono ${cls}`.trim();
+  el.textContent = text;
+  el.title = s.last_event || s.error || '';
+}
+async function startLivePolicyRecording() {
+  await api('/api/record/start', {
+    duration_s: Math.max(1, Number(val('recordDuration')) || Number(val('evalAttempt')) || 120),
+    fps: Number(val('evalRecordFps')) || Number(val('recordFps')) || 30,
+    cameras: ['front', 'side', 'wrist'],
+    task: modelPromptValue(),
+    name_prefix: 'so101_policy_recording',
+    dataset_name: val('evalDatasetName'),
+    capture_mode: 'policy_execute',
+    extra_meta: {
+      record_start_trigger: 'live_button_existing_policy',
+      record_only_policy_execute: true,
+    },
   });
-  resetSuccessStream();
-  await refresh();
+}
+function liveRecordStatusText(data) {
+  const e = data?.eval || {};
+  const rec = data?.recording || {};
+  if (evalStartPending) return {text: 'starting recording...', cls: 'warn'};
+  if (rec.running) {
+    const counts = rec.counts || {};
+    const sampleText = counts.samples === undefined ? '' : ` samples=${counts.samples}`;
+    return {text: `recording ${rec.elapsed || 0}s${sampleText}`, cls: 'ok'};
+  }
+  if (e.running) {
+    const attempt = e.current_attempt || {};
+    if (attempt.recording_pending) {
+      const delay = Number(attempt.record_start_delay_s || e.record_start_delay_s || 0);
+      const elapsed = Number(e.attempt_elapsed_s || 0);
+      const wait = Math.max(0, delay - elapsed).toFixed(1);
+      return {text: `recording armed; starts in ${wait}s`, cls: 'warn'};
+    }
+    if (e.recording_dir) return {text: `recorded ${String(e.recording_dir).split('/').pop()}`, cls: 'ok'};
+    return {text: `running ${e.state || 'eval'}`, cls: 'warn'};
+  }
+  if (e.error) return {text: `error: ${e.error}`, cls: 'bad'};
+  if (e.stop_reason) return {text: `stopped: ${e.stop_reason}`, cls: ''};
+  if (e.recording_dir) return {text: `last ${String(e.recording_dir).split('/').pop()}`, cls: ''};
+  return {text: 'idle', cls: ''};
+}
+async function startEval() {
+  if (lastStatus?.recording?.running) {
+    await stopRecording();
+    return;
+  }
+  const startButton = document.getElementById('startEvalButton');
+  evalStartPending = true;
+  let startError = '';
+  if (startButton) {
+    startButton.disabled = true;
+    startButton.textContent = 'Starting...';
+  }
+  setLiveRecordStatus('starting recording...', 'warn');
+  try {
+    const policyAlreadyRunning = !!lastStatus && lastStatus.mode === 'policy' && !lastStatus.eval?.running;
+    if (policyAlreadyRunning) {
+      await startLivePolicyRecording();
+    } else {
+      try {
+        await api('/api/eval/start', {
+          instruction: modelPromptValue(),
+          dataset_name: val('evalDatasetName'),
+          run_duration_s: Number(val('evalHours')) * 3600,
+          attempt_duration_s: Number(val('evalAttempt')),
+          max_consecutive_failures: Number(val('evalMaxFails')),
+          record_fps: Number(val('evalRecordFps')),
+          exec_steps: Number(val('execSteps')),
+          max_step_deg: Number(val('maxStep')),
+          hz: Number(val('hz')),
+          allow_teleop: !!document.getElementById('evalWithTeleop')?.checked,
+          record_episodes: !!document.getElementById('evalRecordEpisodes')?.checked,
+        });
+      } catch (e) {
+        if (!String(e.message || '').includes('motion is already running')) throw e;
+        await startLivePolicyRecording();
+      }
+    }
+    resetSuccessStream();
+    await refresh();
+  } catch (e) {
+    startError = e.message;
+    setLiveRecordStatus(`error: ${e.message}`, 'bad');
+    await refresh();
+  } finally {
+    evalStartPending = false;
+    if (startError) {
+      setLiveRecordStatus(`error: ${startError}`, 'bad');
+    } else if (lastStatus) {
+      const status = liveRecordStatusText(lastStatus);
+      setLiveRecordStatus(status.text, status.cls);
+    }
+    if (startButton) {
+      startButton.disabled = !!lastStatus?.eval?.running || !!lastStatus?.recording?.running;
+      startButton.textContent = lastStatus?.eval?.running || lastStatus?.recording?.running ? 'Recording...' : 'Start Recording';
+    }
+  }
 }
 async function resumeEval() { await api('/api/eval/resume', {}); resetSuccessStream(); await refresh(); }
 function setEvalButtonBusy(busy) {
@@ -3722,6 +4979,26 @@ async function releaseAndResumeEval() {
   await releaseTeleop('resume_eval');
   await resumeEval();
 }
+async function startIntervention() {
+  const data = await api('/api/intervention/start', {
+    operator: val('teleopOperator') || 'operator',
+    reason: 'manual_intervention',
+  });
+  await refresh();
+  return data;
+}
+async function stopIntervention() {
+  const data = await api('/api/intervention/stop', {outcome: 'complete'});
+  await refresh();
+  return data;
+}
+async function toggleIntervention() {
+  const i = lastStatus?.intervention || {};
+  if (i.active || i.requested) {
+    return stopIntervention();
+  }
+  return startIntervention();
+}
 async function nudge(delta) {
   await api('/api/nudge', {joint: val('joint'), delta, lease_id: teleopLeaseId});
   await refresh();
@@ -3746,7 +5023,22 @@ async function startRecording() {
   });
   await refresh();
 }
-async function stopRecording() { await api('/api/record/stop', {}); await refresh(); }
+async function stopRecording() {
+  const buttons = [document.getElementById('stopRecordingButton'), document.getElementById('headerStopRecordingButton')].filter(Boolean);
+  for (const button of buttons) {
+    button.disabled = true;
+    button.textContent = 'Stopping...';
+  }
+  setLiveRecordStatus('stopping recording...', 'warn');
+  try {
+    await api('/api/record/stop', {});
+    await refresh();
+  } catch (e) {
+    setLiveRecordStatus(`error: ${e.message}`, 'bad');
+  } finally {
+    for (const button of buttons) button.textContent = 'Stop Recording';
+  }
+}
 function renderState(data) {
   const el = document.getElementById('state');
   const joints = data.joints || [];
@@ -3815,19 +5107,45 @@ function renderEval(data) {
   const remaining = e.remaining_s === null || e.remaining_s === undefined ? '' : `${e.remaining_s}s left`;
   const noSuccessRemaining = e.attempt_remaining_s === null || e.attempt_remaining_s === undefined ? '' : `${e.attempt_remaining_s}s`;
   document.getElementById('evalStatus').textContent = `${running} ${e.state || ''} ${remaining}`;
+  const liveRecordStatus = liveRecordStatusText(data);
+  setLiveRecordStatus(liveRecordStatus.text, liveRecordStatus.cls);
   const teleopOption = document.getElementById('evalWithTeleop');
   if (teleopOption && e.config && e.config.allow_teleop !== undefined && !e.running) teleopOption.checked = !!e.config.allow_teleop;
   const recordOption = document.getElementById('evalRecordEpisodes');
   if (recordOption && e.config && e.config.record_episodes !== undefined && !e.running) recordOption.checked = !!e.config.record_episodes;
+  const datasetInput = document.getElementById('evalDatasetName');
+  if (datasetInput && e.config?.dataset_name && !e.running && document.activeElement !== datasetInput) {
+    datasetInput.value = e.config.dataset_name;
+  }
+  const startButton = document.getElementById('startEvalButton');
+  if (startButton) {
+    const rec = data.recording || {};
+    startButton.disabled = !!e.running && !rec.running;
+    startButton.textContent = rec.running ? 'Stop Recording' : e.running ? 'Recording...' : 'Start Recording';
+    startButton.className = rec.running ? 'danger' : 'primary';
+  }
+  for (const stopButton of [document.getElementById('stopRecordingButton'), document.getElementById('headerStopRecordingButton')]) {
+    if (!stopButton) continue;
+    const rec = data.recording || {};
+    stopButton.disabled = !rec.running;
+    stopButton.textContent = rec.running ? 'Stop Recording' : 'Stop Recording';
+  }
+  const livePromptInput = document.getElementById('liveInstruction');
+  if (livePromptInput && e.config?.instruction && !e.running && document.activeElement !== livePromptInput) {
+    livePromptInput.value = e.config.instruction;
+    syncModelPrompt('liveInstruction');
+  }
   el.innerHTML = [
     `<div>state</div><div class="${cls}"><b>${e.state || 'idle'}</b></div>`,
     `<div>policy run</div><div>${e.attempt || 0}</div>`,
     `<div>episode timer</div><div>${noSuccessRemaining}</div>`,
     `<div>success / fail</div><div>${e.successes || 0} / ${e.failures || 0}</div>`,
+    `<div>interventions</div><div>${e.interventions || 0}</div>`,
     `<div>fail streak</div><div>${e.consecutive_failures || 0} / ${e.max_consecutive_failures || 0}</div>`,
     `<div>last</div><div>${last}</div>`,
     `<div>w teleop</div><div>${e.config?.allow_teleop === false ? 'off' : 'on'}</div>`,
     `<div>record episodes</div><div>${e.config?.record_episodes === false ? 'off' : 'on'}</div>`,
+    `<div>dataset</div><div>${e.config?.dataset_name || e.dataset_name || ''}</div>`,
     `<div>recording</div><div>${e.recording_dir || ''}</div>`,
     `<div>summary</div><div>${e.summary_path || ''}</div>`,
     `<div>reason</div><div>${e.stop_reason || e.error || ''}</div>`,
@@ -3837,6 +5155,7 @@ function renderTeleop(data) {
   const el = document.getElementById('teleop');
   const t = data.teleop || {};
   const e = data.eval || {};
+  const i = data.intervention || {};
   const lease = t.lease || {};
   const heldHere = !!teleopLeaseId && !!lease.lease_id && lease.lease_id === teleopLeaseId && !t.stale;
   if (teleopLeaseId && (!t.active || (lease.lease_id && lease.lease_id !== teleopLeaseId) || t.stale)) {
@@ -3857,12 +5176,23 @@ function renderTeleop(data) {
   if (claimButton) claimButton.disabled = heldHere || (!t.available && !t.stale);
   if (releaseButton) releaseButton.disabled = !heldHere;
   if (releaseResumeButton) releaseResumeButton.disabled = !canReleaseResume;
+  const activeIntervention = !!(i.active || i.requested);
+  for (const interventionButton of [document.getElementById('interventionToggleButton'), document.getElementById('liveInterventionToggleButton')]) {
+    if (!interventionButton) continue;
+    interventionButton.textContent = activeIntervention ? 'Resume MolmoAct' : 'Intervene';
+    interventionButton.className = activeIntervention ? 'good' : 'danger';
+    interventionButton.disabled = !!heldHere;
+  }
   document.querySelectorAll('.teleop-command').forEach(button => { button.disabled = !heldHere; });
   if (el) {
     el.innerHTML = [
       `<div>state</div><div class="${cls}"><b>${status}</b></div>`,
-      `<div>intervention</div><div>${t.intervention_ready ? 'ready' : 'manual'}</div>`,
-      `<div>operator</div><div>${lease.operator || '-'}</div>`,
+      `<div>intervention</div><div>${i.state || (t.intervention_ready ? 'ready' : 'manual')}</div>`,
+      `<div>source</div><div>${i.active ? 'leader_delta' : '-'}</div>`,
+      `<div>elapsed</div><div>${i.elapsed_s === null || i.elapsed_s === undefined ? '-' : i.elapsed_s + 's'}</div>`,
+      `<div>samples</div><div>${i.samples || 0}</div>`,
+      `<div>id</div><div>${i.id ? String(i.id).slice(0, 8) : '-'}</div>`,
+      `<div>operator</div><div>${i.operator || lease.operator || '-'}</div>`,
       `<div>heartbeat</div><div>${age}</div>`,
       `<div>reason</div><div>${escapeHtml(reason || '-')}</div>`,
       `<div>resume</div><div>${canReleaseResume ? 'ready after release' : e.can_resume ? 'ready' : '-'}</div>`,
@@ -3871,14 +5201,15 @@ function renderTeleop(data) {
 }
 function renderLiveEvents(data) {
   const el = document.getElementById('liveEvents');
-  const history = ((data.eval || {}).history || []).filter(ev => ev && (ev.type === 'success' || ev.type === 'failure')).slice(-80);
+  const history = ((data.eval || {}).history || []).filter(ev => ev && (ev.type === 'success' || ev.type === 'failure' || ev.type === 'intervention')).slice(-80);
   el.classList.toggle('compact', history.length > 12);
   el.classList.toggle('dense', history.length > 28);
   el.classList.toggle('tiny', history.length > 48);
   el.innerHTML = history.map(ev => {
+    const intervention = ev.type === 'intervention';
     const ok = ev.type === 'success' || ev.outcome === 'success';
-    const label = ok ? '✓' : '×';
-    const cls = ok ? 'success' : 'failure';
+    const label = intervention ? 'I' : ok ? '✓' : '×';
+    const cls = intervention ? 'warn' : ok ? 'success' : 'failure';
     const stamp = ev.at || ev.ended_at || '';
     const title = `${stamp} run ${ev.run || ev.attempt || ''} ${ev.reason || ev.outcome || ''}`;
     return `<span class="event-pill ${cls}" title="${escapeHtml(title)}">${label}</span>`;
@@ -3888,10 +5219,11 @@ function renderLivePrompt(data) {
   const el = document.getElementById('livePrompt');
   if (!el) return;
   const e = data.eval || {};
-  const instructionInput = document.getElementById('instruction');
-  const taskPrompt = e.config?.instruction || instructionInput?.value || '';
+  const taskPrompt = e.config?.instruction || modelPromptValue();
+  const datasetName = e.config?.dataset_name || e.dataset_name || val('evalDatasetName');
   el.innerHTML = [
     `<div class="live-prompt-item"><span>task prompt</span><b title="${escapeHtml(taskPrompt)}">${escapeHtml(taskPrompt || '-')}</b></div>`,
+    `<div class="live-prompt-item"><span>dataset</span><b title="${escapeHtml(datasetName)}">${escapeHtml(datasetName || '-')}</b></div>`,
   ].join('');
 }
 function clampPercent(value) {
@@ -3942,8 +5274,12 @@ function throughputCi(successes, elapsedMin) {
 function renderLiveStats(data) {
   const el = document.getElementById('liveStats');
   const e = data.eval || {};
+  const i = data.intervention || {};
+  const rec = data.recording || {};
+  const recCounts = rec.counts || {};
   const successes = Number(e.successes || 0);
   const failures = Number(e.failures || 0);
+  const interventions = Number(e.interventions || 0);
   const total = successes + failures;
   const successRate = total ? `${Math.round((successes / total) * 100)}%` : '-';
   const successRateCi = wilsonPercentCi(successes, total);
@@ -3956,11 +5292,18 @@ function renderLiveStats(data) {
   const elapsed = e.elapsed_s === null || e.elapsed_s === undefined ? '-' : `${e.elapsed_s}s`;
   const remaining = e.remaining_s === null || e.remaining_s === undefined ? '-' : `${e.remaining_s}s`;
   const last = e.last_attempt ? `${e.last_attempt.outcome || ''} ${e.last_attempt.reason || ''}`.trim() : '-';
+  const interventionActive = !!(i.active || i.requested);
+  const interventionElapsed = i.elapsed_s === null || i.elapsed_s === undefined ? '-' : `${i.elapsed_s}s`;
+  const interventionSource = i.active ? 'leader_delta' : i.requested ? 'pending' : 'policy';
+  const interventionSamples = Number(recCounts.intervention_samples || 0);
+  const interventionLabel = i.state || 'idle';
   el.innerHTML = [
     `<div class="live-stat ok"><span>success rate</span><b>${successRate}</b></div>`,
     `<div class="live-stat ok"><span>confidence interval</span><b>${successRateCiText}</b>${errorBar(successRateCi)}</div>`,
     `<div class="live-stat ok"><span>throughput</span><b>${throughput}</b><em>95% CI ${throughputCiText}</em></div>`,
     `<div class="live-stat"><span>success / fail</span><b>${successes} / ${failures}</b></div>`,
+    `<div class="live-stat ${interventionActive ? 'warn' : ''}"><span>intervention</span><b>${escapeHtml(interventionLabel)}</b><em>${interventionSource} ${interventionElapsed}</em></div>`,
+    `<div class="live-stat ${interventions || interventionSamples ? 'warn' : ''}"><span>intervention rows</span><b>${interventionSamples}</b><em>episodes ${interventions}</em></div>`,
     `<div class="live-stat ${e.consecutive_failures ? 'bad' : ''}"><span>fail streak</span><b>${e.consecutive_failures || 0}/${e.max_consecutive_failures || 0}</b></div>`,
     `<div class="live-stat warn"><span>episode timer</span><b>${noSuccessRemaining}</b></div>`,
     `<div class="live-stat"><span>policy run</span><b>${e.attempt || 0}</b></div>`,
@@ -4027,7 +5370,18 @@ function renderDatasetPrompt(data) {
 }
 function updateLiveView(data) {
   const e = data.eval || {};
-  const autoActive = !!e.running || data.mode === 'policy';
+  const rec = data.recording || {};
+  const intervention = data.intervention || {};
+  const autoActive = (
+    !!e.running
+    || data.mode === 'policy'
+    || data.mode === 'intervention'
+    || data.mode === 'stopping'
+    || !!rec.running
+    || !!intervention.active
+    || !!intervention.requested
+    || !!intervention.thread_running
+  );
   if (!autoActive && !liveViewPinned) liveViewSuppressed = false;
   const active = !liveViewSuppressed && (liveViewPinned || autoActive);
   document.body.classList.toggle('live-view', active);
@@ -4045,17 +5399,21 @@ async function refresh() {
     const data = await api('/api/status?log_limit=60');
     lastStatus = data;
     const query = data.last_query_s === null || data.last_query_s === undefined ? '' : ` query=${data.last_query_s}s`;
-    document.getElementById('mode').textContent = `${data.mode}/${data.stage} ${data.connected ? 'connected' : 'disconnected'} steps=${data.steps} chunks=${data.chunks}${query}`;
+    const control = data.intervention?.active ? ' control=leader_delta' : '';
+    document.getElementById('mode').textContent = `${data.mode}/${data.stage} ${data.connected ? 'connected' : 'disconnected'} steps=${data.steps} chunks=${data.chunks}${query}${control}`;
     const rec = data.recording || {};
     const recCounts = rec.counts ? Object.entries(rec.counts).map(([k, v]) => `${k}=${v}`).join(' ') : '';
     const recDir = rec.dir ? ` ${rec.dir}` : '';
     const recErr = rec.error ? ` error=${rec.error}` : '';
+    const recIntervention = rec.counts?.intervention_samples ? ` intervention_rows=${rec.counts.intervention_samples}` : '';
     document.getElementById('recordStatus').textContent = rec.running
-      ? `recording ${rec.elapsed || 0}s ${recCounts}${recDir}${recErr}`
-      : rec.dir ? `idle ${recCounts}${recDir}${recErr}` : '';
+      ? `recording ${rec.elapsed || 0}s ${recCounts}${recIntervention}${recDir}${recErr}`
+      : rec.dir ? `idle ${recCounts}${recIntervention}${recDir}${recErr}` : '';
     renderSuccess(data);
     renderEval(data);
+    renderLiveSuccess(data);
     renderTeleop(data);
+    renderCameraLabels(data);
     renderLivePrompt(data);
     renderLiveEvents(data);
     renderLiveStats(data);
@@ -4079,6 +5437,27 @@ async function refresh() {
     refreshInFlight = false;
   }
 }
+function isTypingTarget(el) {
+  if (!el) return false;
+  const tag = String(el.tagName || '').toLowerCase();
+  return tag === 'input' || tag === 'textarea' || tag === 'select' || !!el.isContentEditable;
+}
+document.addEventListener('keydown', async (event) => {
+  if (event.code !== 'Space' || isTypingTarget(event.target)) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  if (event.repeat) return;
+  try {
+    await toggleIntervention();
+  } catch (e) {
+    document.getElementById('mode').textContent = e.message;
+  }
+}, true);
+document.addEventListener('keyup', (event) => {
+  if (event.code !== 'Space' || isTypingTarget(event.target)) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}, true);
 setPage(location.hash.replace('#', '') || localStorage.getItem('so101ControlPage') || 'setup');
 setInterval(refresh, 1500);
 setInterval(heartbeatTeleop, 10000);
@@ -5201,7 +6580,7 @@ def _recording_dirs() -> list[Path]:
     for root in (RAW_RECORD_ROOT, RECORD_ROOT):
         if not root.exists():
             continue
-        dirs.extend(path for path in root.iterdir() if path.is_dir() and _recording_meta_path(path) is not None)
+        dirs.extend(path for path in root.rglob("*") if path.is_dir() and _recording_meta_path(path) is not None)
     return sorted(dirs, key=lambda path: path.stat().st_mtime, reverse=True)
 
 
@@ -5273,6 +6652,9 @@ def _safe_episode_dir(name: str) -> Path:
         if not dirs:
             raise FileNotFoundError("no recordings")
         return dirs[0]
+    for path in dirs:
+        if path.name == name:
+            return path
     if not name or "/" in name or "\\" in name or name.startswith("."):
         raise ValueError("invalid episode name")
     for root in (RAW_RECORD_ROOT, RECORD_ROOT):
@@ -5535,22 +6917,22 @@ def _success_mjpeg_stream(handler: BaseHTTPRequestHandler, controller: SO101Cont
         return
 
 
-def _camera_mjpeg_proxy(handler: BaseHTTPRequestHandler, cam: CameraConfig) -> None:
+def _camera_mjpeg_proxy(handler: BaseHTTPRequestHandler, controller: SO101Controller, cam: CameraConfig) -> None:
     try:
-        with requests.get(cam.url, stream=True, timeout=(3.0, 30.0)) as resp:
-            resp.raise_for_status()
-            handler.send_response(200)
-            handler.send_header(
-                "Content-Type",
-                resp.headers.get("Content-Type", "multipart/x-mixed-replace; boundary=frame"),
-            )
-            handler.send_header("Cache-Control", "no-store")
-            handler.end_headers()
-            for chunk in resp.iter_content(chunk_size=16384):
-                if not chunk:
-                    continue
-                handler.wfile.write(chunk)
-                handler.wfile.flush()
+        handler.send_response(200)
+        handler.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        period = 1.0 / 30.0
+        while True:
+            jpeg = controller.read_camera_jpeg(cam, timeout_s=5.0)
+            handler.wfile.write(b"--frame\r\n")
+            handler.wfile.write(b"Content-Type: image/jpeg\r\n")
+            handler.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii"))
+            handler.wfile.write(jpeg)
+            handler.wfile.write(b"\r\n")
+            handler.wfile.flush()
+            time.sleep(period)
     except (BrokenPipeError, ConnectionResetError):
         return
     except Exception as exc:
@@ -5560,9 +6942,9 @@ def _camera_mjpeg_proxy(handler: BaseHTTPRequestHandler, cam: CameraConfig) -> N
             return
 
 
-def _camera_jpeg_snapshot(handler: BaseHTTPRequestHandler, cam: CameraConfig) -> None:
+def _camera_jpeg_snapshot(handler: BaseHTTPRequestHandler, controller: SO101Controller, cam: CameraConfig) -> None:
     try:
-        jpeg = read_mjpeg_jpeg(cam.url, timeout_s=2.0)
+        jpeg = controller.read_camera_jpeg(cam, timeout_s=5.0)
         handler.send_response(200)
         handler.send_header("Content-Type", "image/jpeg")
         handler.send_header("Cache-Control", "no-store, max-age=0")
@@ -5652,25 +7034,25 @@ def make_handler(controller: SO101Controller):
             elif parsed.path.startswith("/camera/") and parsed.path.endswith(".mjpg"):
                 name = parsed.path.removeprefix("/camera/").removesuffix(".mjpg")
                 try:
-                    _camera_mjpeg_proxy(self, controller._camera_from_spec(name))
+                    _camera_mjpeg_proxy(self, controller, controller._camera_from_spec(name))
                 except ValueError as exc:
                     _json_response(self, 404, {"error": str(exc)})
             elif parsed.path.startswith("/camera/") and parsed.path.endswith(".jpg"):
                 name = parsed.path.removeprefix("/camera/").removesuffix(".jpg")
                 try:
-                    _camera_jpeg_snapshot(self, controller._camera_from_spec(name))
+                    _camera_jpeg_snapshot(self, controller, controller._camera_from_spec(name))
                 except ValueError as exc:
                     _json_response(self, 404, {"error": str(exc)})
             elif parsed.path.startswith("/cam") and parsed.path.endswith(".mjpg"):
                 name = parsed.path.strip("/").removesuffix(".mjpg")
                 try:
-                    _camera_mjpeg_proxy(self, controller._camera_from_spec(name))
+                    _camera_mjpeg_proxy(self, controller, controller._camera_from_spec(name))
                 except ValueError as exc:
                     _json_response(self, 404, {"error": str(exc)})
             elif parsed.path.startswith("/cam") and parsed.path.endswith(".jpg"):
                 name = parsed.path.strip("/").removesuffix(".jpg")
                 try:
-                    _camera_jpeg_snapshot(self, controller._camera_from_spec(name))
+                    _camera_jpeg_snapshot(self, controller, controller._camera_from_spec(name))
                 except ValueError as exc:
                     _json_response(self, 404, {"error": str(exc)})
             else:
@@ -5700,6 +7082,7 @@ def make_handler(controller: SO101Controller):
                         hz=float(data.get("hz", DEFAULT_HZ)),
                         allow_teleop=bool(data.get("allow_teleop", True)),
                         record_episodes=bool(data.get("record_episodes", True)),
+                        dataset_name=str(data.get("dataset_name", "")),
                     )
                     _json_response(self, 200, {"ok": True, "eval": controller.status().get("eval")})
                 elif parsed.path == "/api/eval/resume":
@@ -5723,6 +7106,21 @@ def make_handler(controller: SO101Controller):
                         outcome=str(data.get("outcome", "complete")),
                     )
                     _json_response(self, 200, {"ok": True, "teleop": status})
+                elif parsed.path == "/api/intervention/start":
+                    status = controller.request_intervention_control(
+                        operator=str(data.get("operator", "operator")),
+                        reason=str(data.get("reason", "manual_intervention")),
+                    )
+                    _json_response(self, 200, {"ok": True, "intervention": status})
+                elif parsed.path == "/api/intervention/stop":
+                    status = controller.stop_intervention_control(
+                        outcome=str(data.get("outcome", "complete")),
+                        resume_policy=bool(data.get("resume_policy", True)),
+                    )
+                    _json_response(self, 200, {"ok": True, "intervention": status})
+                elif parsed.path == "/api/intervention/toggle":
+                    status = controller.toggle_intervention_control(operator=str(data.get("operator", "operator")))
+                    _json_response(self, 200, {"ok": True, "intervention": status})
                 elif parsed.path == "/api/hf_teleop/start":
                     status = controller.start_hf_teleop(
                         duration_s=float(data.get("duration_s", 10.0)),
@@ -5745,7 +7143,7 @@ def make_handler(controller: SO101Controller):
                     if controller._eval_running():
                         controller.stop_eval()
                     else:
-                        controller.stop_policy()
+                        controller.stop_current_motion()
                     _json_response(self, 200, {"ok": True})
                 elif parsed.path == "/api/home":
                     controller.start_home(
@@ -5776,14 +7174,26 @@ def make_handler(controller: SO101Controller):
                     )
                     _json_response(self, 200, {"ok": True, "state": state})
                 elif parsed.path == "/api/record/start":
+                    dataset_name = str(data.get("dataset_name", "")).strip()
+                    dataset_slug = _safe_dataset_name(dataset_name, fallback="so101-recording") if dataset_name else ""
+                    extra_meta = dict(data.get("extra_meta")) if isinstance(data.get("extra_meta"), dict) else {}
+                    if dataset_name:
+                        extra_meta.update(
+                            {
+                                "dataset_name": dataset_name,
+                                "dataset_slug": dataset_slug,
+                                "episodes_root": str(RECORD_ROOT / dataset_slug),
+                            }
+                        )
                     result = controller.start_recording(
                         duration_s=float(data.get("duration_s", DEFAULT_RECORD_DURATION_S)),
                         fps=float(data.get("fps", DEFAULT_RECORD_FPS)),
                         cameras=list(data.get("cameras", [])),
                         task=str(data.get("task", DEFAULT_INSTRUCTION)),
                         name_prefix=str(data.get("name_prefix", "so101_recording")),
-                        extra_meta=data.get("extra_meta") if isinstance(data.get("extra_meta"), dict) else None,
+                        extra_meta=extra_meta or None,
                         capture_mode=str(data.get("capture_mode", "policy_execute")),
+                        root_dir=RECORD_ROOT / dataset_slug if dataset_slug else None,
                     )
                     _json_response(self, 200, {"ok": True, **result})
                 elif parsed.path == "/api/record/stop":
