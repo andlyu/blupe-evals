@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Register the blue-ball dataset and launch MolmoAct2 experiments LoRA training."""
+"""Register LeRobot datasets and launch MolmoAct2 experiments LoRA training."""
 
 from __future__ import annotations
 
@@ -806,9 +806,15 @@ def main() -> int:
         default=os.environ.get("MOLMOACT2_NORM_STATS_TAG", ""),
         help="Use this checkpoint norm tag's state/action stats for every dataset tag.",
     )
-    parser.add_argument("--mixture", default="move_blue_ball")
-    parser.add_argument("--dataset-repo-id", default=os.environ.get("DATASET_REPO_ID", "andlyu/move_blue_ball_training"))
-    parser.add_argument("--dataset-tag", default=os.environ.get("DATASET_TAG", "so101_move_blue_ball"))
+    parser.add_argument("--mixture", default="so101_intervention")
+    parser.add_argument(
+        "--dataset-repo-id",
+        default=os.environ.get("DATASET_REPO_ID", "andlyu/so101-ball-cup-intervene-edited_v21"),
+    )
+    parser.add_argument(
+        "--dataset-tag",
+        default=os.environ.get("DATASET_TAG", "so101_ball_cup_intervene_edited_v21"),
+    )
     parser.add_argument(
         "--camera-keys",
         default=os.environ.get("CAMERA_KEYS", "observation.images.front,observation.images.wrist"),
@@ -847,8 +853,28 @@ def main() -> int:
         default=[],
         help="Training tag to count as custom/new data in W&B data_mix metrics. Repeatable.",
     )
-    parser.add_argument("--run-name", default=os.environ.get("RUN_NAME", "molmoact2-so101-move-blue-ball-lora"))
-    parser.add_argument("--save-folder", default=os.environ.get("SAVE_FOLDER", "/workspace/outputs/molmoact2-so101-move-blue-ball-lora"))
+    parser.add_argument("--run-name", default=os.environ.get("RUN_NAME", "molmoact2-so101-intervention-lora"))
+    parser.add_argument(
+        "--save-folder",
+        default=os.environ.get("SAVE_FOLDER", "/workspace/outputs/molmoact2-so101-intervention-lora"),
+    )
+    parser.add_argument(
+        "--load-path",
+        default=os.environ.get("LOAD_PATH", ""),
+        help="Optional trainer checkpoint directory to load before continuing training.",
+    )
+    parser.add_argument(
+        "--reset-optimizer-state",
+        action="store_true",
+        default=os.environ.get("RESET_OPTIMIZER_STATE", "0") == "1",
+        help="Load model weights from --load-path without loading optimizer state.",
+    )
+    parser.add_argument(
+        "--reset-trainer-state",
+        action="store_true",
+        default=os.environ.get("RESET_TRAINER_STATE", "0") == "1",
+        help="Load model weights from --load-path without loading trainer step/RNG/dataloader state.",
+    )
     parser.add_argument("--max-duration", type=int, default=int(os.environ.get("MAX_DURATION", "1000")))
     parser.add_argument("--device-batch-size", type=int, default=int(os.environ.get("DEVICE_BATCH_SIZE", "1")))
     parser.add_argument("--global-batch-size", type=int, default=int(os.environ.get("GLOBAL_BATCH_SIZE", "8")))
@@ -856,6 +882,7 @@ def main() -> int:
     parser.add_argument("--data-timeout", type=int, default=int(os.environ.get("DATA_TIMEOUT", "-1")))
     parser.add_argument("--save-interval", type=int, default=int(os.environ.get("SAVE_INTERVAL", "0")))
     parser.add_argument("--save-keep", type=int, default=int(os.environ.get("SAVE_KEEP", "20")))
+    parser.add_argument("--learning-rate", default=os.environ.get("LEARNING_RATE", "2e-4"))
     parser.add_argument("--lora-rank", type=int, default=int(os.environ.get("LORA_RANK", "64")))
     parser.add_argument("--log-interval", type=int, default=int(os.environ.get("LOG_INTERVAL", "1")))
     parser.add_argument("--save-merged-lora", action="store_true")
@@ -920,10 +947,11 @@ def main() -> int:
         "--lora_enable=true",
         f"--lora_rank={args.lora_rank}",
         f"--save_merged_lora_checkpoint={str(args.save_merged_lora).lower()}",
-        "--llm_learning_rate=5e-5",
-        "--vit_learning_rate=5e-5",
-        "--connector_learning_rate=5e-5",
-        "--action_expert_learning_rate=5e-5",
+        f"--optimizer.learning_rate={args.learning_rate}",
+        "--llm_learning_rate=1e-4",
+        "--vit_learning_rate=1e-4",
+        "--connector_learning_rate=1e-4",
+        "--action_expert_learning_rate=1e-4",
         "--num_flow_timesteps=8",
         "--mask_action_dim_padding=true",
         "--random_camera_order=none",
@@ -931,6 +959,12 @@ def main() -> int:
         "--use_annotated_task=false",
         "--sample_annotated_task=false",
     ]
+    if args.load_path:
+        train_argv.append(f"--load_path={args.load_path}")
+        if args.reset_optimizer_state:
+            train_argv.append("--reset_optimizer_state=true")
+        if args.reset_trainer_state:
+            train_argv.append("--reset_trainer_state=true")
 
     print(" ".join(train_argv), flush=True)
     print("data_mix=" + json.dumps(data_mix_metrics, sort_keys=True), flush=True)

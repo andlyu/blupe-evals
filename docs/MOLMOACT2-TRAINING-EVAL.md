@@ -126,6 +126,72 @@ cd /workspace/molmoact2/experiments
 Keep checkpoint outputs outside this repo, or under ignored artifact storage on the training
 machine. Do not commit checkpoints.
 
+## Current Intervention-Mix A100 Launch
+
+The current A100 training entrypoint is repo-owned and should be the source of truth for
+re-running this line of experiments:
+
+```bash
+scripts/run_a100_molmoact2_pickup_general500_10k.sh
+```
+
+It uses `scripts/run_molmoact2_experiments_lora.py` to register the LeRobot mixture at runtime.
+The current mix is:
+
+```text
+general train: andlyu/so100_so101_original_500eps_camera12@0-164
+general val:   andlyu/so100_so101_original_500eps_camera12@165-168
+
+custom train:  andlyu/so101-ball-cup-intervene-edited_v21@0-12
+custom val:    andlyu/so101-ball-cup-intervene-edited_v21@13-16
+
+custom train:  andlyu/so101-ball-cup-intervene-edited_2_v21@0-12
+custom val:    andlyu/so101-ball-cup-intervene-edited_2_v21@13-16
+
+custom train:  andlyu/so101-ball-cup-intervene-edited_3_v21@0-14
+custom val:    andlyu/so101-ball-cup-intervene-edited_3_v21@15-18
+```
+
+Sampling is 50% general and 50% intervention data. The intervention half is split evenly
+across the three intervention datasets. All datasets use the base SO100/SO101 normalization tag:
+
+```text
+so100_so101_molmoact2
+```
+
+Current optimizer/batch defaults:
+
+```text
+global batch size: 16
+device batch size: 1
+main optimizer LR: 2e-4
+component LRs:     1e-4
+lora rank:         64
+```
+
+To initialize from the earlier `step1000` weights but train as a fresh run, load the checkpoint
+while resetting optimizer and trainer state:
+
+```bash
+cd /workspace/blupe-evals
+GLOBAL_BATCH_SIZE=16 \
+RESET_OPTIMIZER_STATE=1 \
+RESET_TRAINER_STATE=1 \
+LOAD_PATH=/backup/outputs/molmoact2-so101-intervene2-plus-general169-val3x4-s10k-base-norm-earlyval10/step1000 \
+bash scripts/run_a100_molmoact2_pickup_general500_10k.sh
+```
+
+The fresh run writes to:
+
+```text
+/backup/outputs/molmoact2-so101-intervene3-plus-general169-val4x4-s10k-base-norm-step1000-fresh
+```
+
+If the next run should be "same as last run but add dataset X", add a new `--dataset-spec`
+and matching `--validation-dataset-spec` in `scripts/run_a100_molmoact2_pickup_general500_10k.sh`,
+then rebalance the custom sample weights so the custom total remains 0.5 unless intentionally
+changing the general/custom ratio.
+
 ## Remote Policy Eval
 
 For hardware evals, keep MolmoAct2 on the A100 and let the Jetson call it over HTTP.
@@ -161,10 +227,12 @@ Then start the SO101 UI against that forwarded policy URL:
 cd ~/blupe-evals
 export SO101_POLICY_URL=http://127.0.0.1:8202
 export SO101_POLICY_CAMERAS=front,wrist
-scripts/start_jetson_so101_remote_policy.sh
+scripts/launch_so101_eval_ui.sh
 ```
 
-Then open LeLab from the Mac and use the Evals tab. The task instruction can stay:
+The launcher starts the camera relay and `http://localhost:8092/#setup` quickly. It does not
+wait for the A100 model to finish loading; policy readiness is checked when the operator starts
+MolmoAct. Then open LeLab from the Mac and use the Evals tab. The task instruction can stay:
 
 ```text
 Move to light blue ball, grab it, and move it to the tall black cylinder

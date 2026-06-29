@@ -21,6 +21,46 @@ from scripts.run_molmoact2_experiments_lora import (
     _set_default_env,
 )
 
+SOURCE = Path("scripts/run_molmoact2_experiments_lora.py").read_text()
+LAUNCH_SOURCE = Path("scripts/run_a100_molmoact2_pickup_general500_10k.sh").read_text()
+
+
+def test_training_args_use_valid_optimizer_learning_rate_key():
+    assert 'f"--optimizer.learning_rate={args.learning_rate}"' in SOURCE
+    assert 'f"--learning_rate={args.learning_rate}"' not in SOURCE
+
+
+def test_training_args_support_explicit_checkpoint_load_path():
+    assert 'parser.add_argument(\n        "--load-path",' in SOURCE
+    assert 'train_argv.append(f"--load_path={args.load_path}")' in SOURCE
+    assert 'parser.add_argument(\n        "--reset-optimizer-state",' in SOURCE
+    assert 'parser.add_argument(\n        "--reset-trainer-state",' in SOURCE
+    assert 'train_argv.append("--reset_optimizer_state=true")' in SOURCE
+    assert 'train_argv.append("--reset_trainer_state=true")' in SOURCE
+
+
+def test_wrapper_defaults_do_not_point_at_old_blue_ball_dataset():
+    assert "move_blue_ball" not in SOURCE
+    assert "so101-ball-cup-intervene-edited_v21" in SOURCE
+
+
+def test_a100_launch_uses_three_intervention_datasets_with_valid_val_slices():
+    assert "andlyu/so101-ball-cup-intervene-edited_v21@0-12" in LAUNCH_SOURCE
+    assert "andlyu/so101-ball-cup-intervene-edited_2_v21@0-12" in LAUNCH_SOURCE
+    assert "andlyu/so101-ball-cup-intervene-edited_3_v21@0-14" in LAUNCH_SOURCE
+    assert "andlyu/so101-ball-cup-intervene-edited_v21@13-16" in LAUNCH_SOURCE
+    assert "andlyu/so101-ball-cup-intervene-edited_2_v21@13-16" in LAUNCH_SOURCE
+    assert "andlyu/so101-ball-cup-intervene-edited_3_v21@15-18" in LAUNCH_SOURCE
+    assert "so101_ball_cup_intervene_edited_2_v21" in LAUNCH_SOURCE
+    assert "so101_ball_cup_intervene_edited_3_v21" in LAUNCH_SOURCE
+    assert 'INTERVENE_SAMPLE_WEIGHT="${INTERVENE_SAMPLE_WEIGHT:-0.1666666667}"' in LAUNCH_SOURCE
+    assert 'INTERVENE_2_SAMPLE_WEIGHT="${INTERVENE_2_SAMPLE_WEIGHT:-0.1666666667}"' in LAUNCH_SOURCE
+    assert 'INTERVENE_3_SAMPLE_WEIGHT="${INTERVENE_3_SAMPLE_WEIGHT:-0.1666666667}"' in LAUNCH_SOURCE
+    assert 'common_args+=(--load-path "${LOAD_PATH}")' in LAUNCH_SOURCE
+    assert 'common_args+=(--reset-optimizer-state)' in LAUNCH_SOURCE
+    assert 'common_args+=(--reset-trainer-state)' in LAUNCH_SOURCE
+    assert "step1000-fresh" in LAUNCH_SOURCE
+
 
 def test_set_default_env_adds_single_process_torch_distributed_defaults(monkeypatch):
     for key in [
