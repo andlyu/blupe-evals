@@ -117,7 +117,7 @@ SUCCESS_CUP_MAX_MASK_AREA_MULT = 4.5
 SUCCESS_CONTAINER_SAM3_URL = os.environ.get("SO101_SUCCESS_SAM3_URL", "http://127.0.0.1:8213/api/detect_image")
 SUCCESS_CONTAINER_SAM3_PROMPT = os.environ.get(
     "SO101_SUCCESS_SAM3_PROMPT",
-    "black container",
+    "black cylinder along with insides",
 )
 SUCCESS_CONTAINER_SAM3_MIN_SCORE = float(os.environ.get("SO101_SUCCESS_SAM3_MIN_SCORE", "0.05"))
 SUCCESS_CONTAINER_SAM3_TIMEOUT_S = float(os.environ.get("SO101_SUCCESS_SAM3_TIMEOUT_S", "15"))
@@ -5465,7 +5465,7 @@ body.page-monitor #liveToggle { display:none; }
 	        <img id="liveSuccessOverlay" alt="success tracking masks">
 	        <div class="cam-badge">MASKS</div>
 	        <div class="mask-toolbar">
-	          <button id="liveSam3RerunButton" onclick="rerunSam3Masks()">Rerun SAM3</button>
+	          <button id="liveSam3RerunButton" onclick="rerunSam3Masks('front')">Rerun SAM3</button>
 	        </div>
 	      </div>
     </div>
@@ -5536,7 +5536,7 @@ body.page-monitor #liveToggle { display:none; }
     <div class="sam3-editor setup-only">
       <label>SAM3 Container Prompt</label>
       <div class="row">
-        <input id="sam3Prompt" type="text" value="black container">
+        <input id="sam3Prompt" type="text" value="black cylinder along with insides">
       </div>
       <div class="row">
         <label>Confidence <input id="sam3MinScore" type="number" value="0.05" min="0" max="1" step="0.01" style="width:72px"></label>
@@ -5761,13 +5761,14 @@ async function previewSam3() {
     setSam3PreviewStatus(e.message);
   }
 }
-async function rerunSam3Masks() {
+async function rerunSam3Masks(cameraOverride = '') {
   const cfg = sam3EditorConfig();
+  const camera = cameraOverride || cfg.camera;
   setSam3PreviewStatus('rerunning SAM3 masks');
-  setLiveRecordStatus('rerunning SAM3 masks', 'warn');
+  setLiveRecordStatus(`rerunning SAM3 masks (${camera})`, 'warn');
   try {
     const data = await api('/api/success/rerun_sam3', {
-      camera: cfg.camera,
+      camera,
       prompt: cfg.prompt,
       min_score: cfg.min_score,
     });

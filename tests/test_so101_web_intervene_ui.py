@@ -32,8 +32,8 @@ def test_sam3_preview_route_has_policy_running_guard_method() -> None:
     assert "if controller.is_policy_running() or controller._eval_running():" in SOURCE
 
 
-def test_sam3_prompt_defaults_to_black_container() -> None:
-    assert "black container" in SOURCE
+def test_sam3_prompt_defaults_to_black_cylinder_with_insides() -> None:
+    assert "black cylinder along with insides" in SOURCE
 
 
 def test_eval_recording_starts_after_delay_and_only_during_policy_execute() -> None:
@@ -98,7 +98,10 @@ def test_live_view_start_recording_uses_visible_prompt_and_dataset_name() -> Non
     assert 'id="liveSuccessIndicator"' in SOURCE
     assert 'id="liveSuccessOverlay"' in SOURCE
     assert 'id="liveSam3RerunButton"' in SOURCE
-    assert 'onclick="rerunSam3Masks()">Rerun SAM3</button>' in SOURCE
+    assert 'onclick="rerunSam3Masks(\'front\')">Rerun SAM3</button>' in SOURCE
+    assert "async function rerunSam3Masks(cameraOverride = '')" in SOURCE
+    assert "const camera = cameraOverride || cfg.camera;" in SOURCE
+    assert "setLiveRecordStatus(`rerunning SAM3 masks (${camera})`, 'warn');" in SOURCE
     assert "sam3RerunButton.disabled = data.mode === 'stopping';" in SOURCE
     assert 'Rerun SAM3 is disabled while stopping' in SOURCE
     assert 'Rerun SAM3 only works while idle' not in SOURCE

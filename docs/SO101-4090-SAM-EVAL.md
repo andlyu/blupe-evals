@@ -13,7 +13,7 @@ vision and policy inference to a Vast 4090.
 The success tracker uses SAM3 once to seed the cup/cylinder mask and the first
 ball mask. It then sends the ball seed to SAM2 and asks SAM2 to update the ball
 mask every `SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES` frames. Current defaults are
-`tall black cylinder` for the cup/cylinder at minimum score `0.05`, and
+`black cylinder along with insides` for the cup/cylinder at minimum score `0.05`, and
 `blue rubber ball` for the ball at minimum score `0.25`.
 
 ## 4090 Setup
@@ -88,7 +88,7 @@ SO101_CAMERA_SPECS="front=http://127.0.0.1:8089/2 side=http://127.0.0.1:8089/1 w
 SO101_POLICY_URL=http://127.0.0.1:8202 \
 SO101_POLICY_CAMERAS=front,wrist \
 SO101_SUCCESS_SAM3_URL=http://127.0.0.1:8213/api/detect_image \
-SO101_SUCCESS_SAM3_PROMPT="tall black cylinder" \
+SO101_SUCCESS_SAM3_PROMPT="black cylinder along with insides" \
 SO101_SUCCESS_SAM3_MIN_SCORE=0.05 \
 SO101_SUCCESS_BALL_SAM3_PROMPT="blue rubber ball" \
 SO101_SUCCESS_BALL_SAM3_MIN_SCORE=0.25 \
