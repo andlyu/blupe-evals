@@ -99,6 +99,10 @@ def test_live_view_start_recording_uses_visible_prompt_and_dataset_name() -> Non
     assert 'id="liveSuccessOverlay"' in SOURCE
     assert 'id="liveSam3RerunButton"' in SOURCE
     assert 'onclick="rerunSam3Masks()">Rerun SAM3</button>' in SOURCE
+    assert "sam3RerunButton.disabled = data.mode === 'stopping';" in SOURCE
+    assert 'Rerun SAM3 is disabled while stopping' in SOURCE
+    assert 'Rerun SAM3 only works while idle' not in SOURCE
+    assert 'id="sam3MinScore" type="number" value="0.05"' in SOURCE
     assert "body.live-view .cams { grid-template-columns: repeat(4" in SOURCE
     assert "body.page-monitor .cams { grid-template-columns: repeat(4" in SOURCE
     assert "getElementById('successOverlay')" not in SOURCE

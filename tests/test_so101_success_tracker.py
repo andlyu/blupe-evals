@@ -85,9 +85,11 @@ def test_success_tracker_recalculate_container_runs_one_new_sam3_seed() -> None:
 def test_success_tracker_defaults_to_blue_rubber_ball_prompt_and_lower_threshold() -> None:
     module = _load_so101_web_intervene()
 
+    assert module.SUCCESS_CONTAINER_SAM3_MIN_SCORE == 0.05
     assert module.SUCCESS_BALL_SAM3_PROMPT == "blue rubber ball"
     assert module.SUCCESS_BALL_SAM3_MIN_SCORE == 0.25
     assert module.SUCCESS_BALL_SAM2_EVERY_N_FRAMES == 10
+    assert module.SUCCESS_CUP_MIN_MASK_AREA == 500
 
 
 def test_success_tracker_uses_sam3_ball_masks_when_sam2_disabled() -> None:

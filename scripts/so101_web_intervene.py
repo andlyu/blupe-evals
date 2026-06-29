@@ -112,14 +112,14 @@ SUCCESS_MAX_BALL_AREA = 12000
 SUCCESS_BLUE_LOWER_HSV = np.array([85, 45, 35], dtype=np.uint8)
 SUCCESS_BLUE_UPPER_HSV = np.array([140, 255, 255], dtype=np.uint8)
 SUCCESS_CUP_SEARCH_PAD_PX = 72
-SUCCESS_CUP_MIN_MASK_AREA = 1500
+SUCCESS_CUP_MIN_MASK_AREA = int(os.environ.get("SO101_SUCCESS_CUP_MIN_MASK_AREA", "500"))
 SUCCESS_CUP_MAX_MASK_AREA_MULT = 4.5
 SUCCESS_CONTAINER_SAM3_URL = os.environ.get("SO101_SUCCESS_SAM3_URL", "http://127.0.0.1:8213/api/detect_image")
 SUCCESS_CONTAINER_SAM3_PROMPT = os.environ.get(
     "SO101_SUCCESS_SAM3_PROMPT",
     "black container",
 )
-SUCCESS_CONTAINER_SAM3_MIN_SCORE = float(os.environ.get("SO101_SUCCESS_SAM3_MIN_SCORE", "0.15"))
+SUCCESS_CONTAINER_SAM3_MIN_SCORE = float(os.environ.get("SO101_SUCCESS_SAM3_MIN_SCORE", "0.05"))
 SUCCESS_CONTAINER_SAM3_TIMEOUT_S = float(os.environ.get("SO101_SUCCESS_SAM3_TIMEOUT_S", "15"))
 SUCCESS_STRICT_SAM3_CUP = os.environ.get("SO101_SUCCESS_STRICT_SAM3_CUP", "1").strip().lower() not in {
     "0",
@@ -2675,8 +2675,8 @@ class SO101Controller:
         return dict(status)
 
     def rerun_success_sam3(self, camera: Any = "front", prompt: str | None = None, min_score: float | None = None) -> dict[str, Any]:
-        if self._motion_running() or self._eval_running():
-            raise RuntimeError("Rerun SAM3 only works while idle; stop MolmoAct/eval first")
+        if self.mode == "stopping":
+            raise RuntimeError("Rerun SAM3 is disabled while stopping")
         cam = self._camera_from_spec(camera)
         rgb = self.read_camera_frame(cam, timeout_s=5.0)
         with self.success_tracker_lock:
@@ -5539,7 +5539,7 @@ body.page-monitor #liveToggle { display:none; }
         <input id="sam3Prompt" type="text" value="black container">
       </div>
       <div class="row">
-        <label>Confidence <input id="sam3MinScore" type="number" value="0.15" min="0" max="1" step="0.01" style="width:72px"></label>
+        <label>Confidence <input id="sam3MinScore" type="number" value="0.05" min="0" max="1" step="0.01" style="width:72px"></label>
         <label>Camera <select id="sam3Camera"><option value="front">Front</option><option value="side">Side</option><option value="wrist">Wrist</option></select></label>
         <button id="sam3PreviewButton" onclick="previewSam3()">Preview SAM3</button>
         <button id="sam3RerunButton" onclick="rerunSam3Masks()">Rerun SAM3</button>
@@ -6503,7 +6503,7 @@ async function refresh() {
     }
     for (const sam3RerunButton of [document.getElementById('sam3RerunButton'), document.getElementById('liveSam3RerunButton')]) {
       if (sam3RerunButton) {
-        sam3RerunButton.disabled = data.mode === 'policy' || data.mode === 'stopping' || !!data.eval?.running;
+        sam3RerunButton.disabled = data.mode === 'stopping';
       }
     }
     renderState(data);
