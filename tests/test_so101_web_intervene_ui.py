@@ -109,6 +109,16 @@ def test_live_view_start_recording_uses_visible_prompt_and_dataset_name() -> Non
     assert "body.live-view .cams { grid-template-columns: repeat(4" in SOURCE
     assert "body.page-monitor .cams { grid-template-columns: repeat(4" in SOURCE
     assert "getElementById('successOverlay')" not in SOURCE
+
+
+def test_stop_state_does_not_force_live_view() -> None:
+    auto_active_start = SOURCE.index("const autoActive = (")
+    auto_active_end = SOURCE.index("  );", auto_active_start)
+    auto_active_block = SOURCE[auto_active_start:auto_active_end]
+
+    assert "data.mode === 'policy'" in auto_active_block
+    assert "data.mode === 'intervention'" in auto_active_block
+    assert "data.mode === 'stopping'" not in auto_active_block
     assert 'class="monitor-actions"' not in SOURCE
     assert 'id="evalWithTeleop"' not in SOURCE
     assert 'id="evalRecordEpisodes"' not in SOURCE

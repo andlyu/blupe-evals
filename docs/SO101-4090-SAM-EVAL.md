@@ -10,6 +10,36 @@ vision and policy inference to a Vast 4090.
 - SAM2 stateful video tracker: `127.0.0.1:8214`
 - Local SO101 eval UI: `http://127.0.0.1:8092/#setup`
 
+## Two-Command Workflow
+
+Start everything:
+
+```bash
+scripts/start_so101_eval_stack.sh
+```
+
+Verify everything is reachable:
+
+```bash
+scripts/check_so101_eval_stack.sh
+```
+
+Stop everything:
+
+```bash
+scripts/stop_so101_eval_stack.sh
+```
+
+The start script verifies or launches the GPU MolmoAct2/SAM3/SAM2 services, opens
+local SSH tunnels for `8202`, `8213`, and `8214`, then starts the local camera relay
+and eval UI. The stop script first asks the UI to stop recording/eval/policy motion,
+then stops the UI, camera relay, tunnels, and remote GPU services.
+SAM3 readiness defaults to `/`, because some deployed SAM3 service copies predate
+the newer `/health` route.
+
+When the Vast SSH target changes, copy `config/so101_eval_stack.env.example` to
+`config/so101_eval_stack.local.env` and update `SO101_GPU_HOST` / `SO101_GPU_PORT`.
+
 The success tracker uses SAM3 once to seed the cup/cylinder mask and the first
 ball mask. It then sends the ball seed to SAM2 and asks SAM2 to update the ball
 mask every `SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES` frames. Current defaults are

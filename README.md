@@ -20,11 +20,17 @@ eval ──joints──► serve (robot-side safety: clamp · hold · torque-off
 | …do this | read |
 |---|---|
 | **Connect my arm** (a supported model: YAM, SO-101) | [docs/integrate-your-hardware.md](docs/integrate-your-hardware.md) |
+| **Run the current SO101 + MolmoAct + SAM eval stack** | [docs/SO101-EVAL-STACK-OVERVIEW.md](docs/SO101-EVAL-STACK-OVERVIEW.md) |
 | **Add a new arm model** (a new embodiment, sim assets + driver) | [docs/add-an-embodiment.md](docs/add-an-embodiment.md) |
 | Run evals and get a report | below: *The eval loop* |
 | Operate the fleet / onboard a customer | fleet UI (`relay.py serve`): Add arm, Add customer, link/unlink |
 | Fix a known papercut fast | `.claude/skills/small-errors/SKILL.md` |
 | Understand the live deployment | [docs/SESSION-HANDOFF.md](docs/SESSION-HANDOFF.md) |
+
+Current SO101 eval stack:
+`scripts/start_so101_eval_stack.sh` starts UI/cameras/GPU tunnels/policy/SAM,
+`scripts/check_so101_eval_stack.sh` verifies the endpoints, and
+`scripts/stop_so101_eval_stack.sh` stops them.
 
 ## Quickstart (operator computer, sim — no robot needed)
 

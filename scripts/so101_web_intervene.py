@@ -6475,7 +6475,6 @@ function updateLiveView(data) {
     !!e.running
     || data.mode === 'policy'
     || data.mode === 'intervention'
-    || data.mode === 'stopping'
     || !!rec.running
     || !!intervention.active
     || !!intervention.requested
