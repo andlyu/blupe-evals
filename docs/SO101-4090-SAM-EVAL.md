@@ -7,7 +7,7 @@ vision and policy inference to a Vast 4090.
 
 - MolmoAct2 policy HTTP server: `127.0.0.1:8202`
 - SAM3 image prompt server: `127.0.0.1:8213`
-- SAM2 stateful video tracker: `127.0.0.1:8214`
+- SAM2 tracker: `127.0.0.1:8214`
 - Local SO101 eval UI: `http://127.0.0.1:8092/#setup`
 
 ## Two-Command Workflow
@@ -44,7 +44,10 @@ The success tracker uses SAM3 to seed the cup/cylinder mask and to refresh the
 ball mask periodically. The stack default refreshes the ball with SAM3 every
 `SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=100` success-tracker frames, about every
 10 seconds at the default 10 Hz success loop, then uses SAM2 as the bridge
-between SAM3 refreshes. SAM2 requests run in the background every
+between SAM3 refreshes. The stack defaults to the low-latency SAM2 image
+tracker (`SO101_SAM2_TRACKER=image`) for live masks; set
+`SO101_SAM2_TRACKER=video` only for slower stateful video tracking tests. SAM2
+requests run in the background every
 `SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2` success-tracker frames, about 5 Hz at
 the default 10 Hz success loop, while `/api/success.mjpg` keeps drawing fresh
 camera frames with the latest completed mask. Current defaults are `black
@@ -82,14 +85,14 @@ Image.new("RGB", (640, 360), "black").save("/tmp/sam3-frames/seed.jpg")
 PY
 ```
 
-Launch SAM3 and SAM2:
+Launch SAM3 and SAM2 manually if needed:
 
 ```bash
 screen -L -dmS sam_4090_8213_8214 bash -lc '
 cd /workspace/blupe-evals
 source /venv/main/bin/activate
 python scripts/sam3_prompt_ui.py --frames-dir /tmp/sam3-frames --host 127.0.0.1 --port 8213 --backend auto &
-python scripts/sam2_video_track_ui.py --host 127.0.0.1 --port 8214 --device cuda --model-id facebook/sam2-hiera-tiny
+python scripts/sam2_track_ui.py --host 127.0.0.1 --port 8214 --device cuda --model-id facebook/sam2-hiera-tiny
 '
 ```
 
@@ -128,6 +131,7 @@ SO101_SUCCESS_SAM3_MIN_SCORE=0.25 \
 SO101_SUCCESS_BALL_SAM3_PROMPT="blue rubber ball" \
 SO101_SUCCESS_BALL_SAM3_MIN_SCORE=0.25 \
 SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=100 \
+SO101_SAM2_TRACKER=image \
 SO101_SUCCESS_BALL_SAM2_AUTO=1 \
 SO101_SUCCESS_BALL_SAM2_URL=http://127.0.0.1:8214/api/track_image \
 SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2 \

@@ -1111,6 +1111,8 @@ class LiveCupSuccessTracker:
             self._set_ball_sam2_status("accepted", f"area={area}{score_suffix}{frame_suffix}{elapsed_suffix}")
             if mode == "sam2_video" or str(top.get("source", "")).startswith("sam2_video"):
                 return mask_bool, f"sam2:video{score_suffix}"
+            if mode == "sam2_image" or str(top.get("source", "")).startswith("sam2_image"):
+                return mask_bool, f"sam2:image{score_suffix}"
             return mask_bool, f"sam2:box{score_suffix}"
         except Exception as exc:
             self._set_ball_sam2_status("request_failed", str(exc))

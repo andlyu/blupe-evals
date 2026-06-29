@@ -110,6 +110,7 @@ cd "${REMOTE_ROOT}/blupe-evals" 2>/dev/null || true
 pkill -f 'scripts/molmoact2_policy_runner.py' >/dev/null 2>&1 || true
 pkill -f 'scripts/sam3_prompt_ui.py' >/dev/null 2>&1 || true
 pkill -f 'scripts/sam2_video_track_ui.py' >/dev/null 2>&1 || true
+pkill -f 'scripts/sam2_track_ui.py' >/dev/null 2>&1 || true
 REMOTE
 }
 

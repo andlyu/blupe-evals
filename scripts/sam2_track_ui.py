@@ -267,6 +267,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "model": self.session.checkpoint or self.session.model_id,
                     "device": str(self.session.device),
+                    "mode": "sam2_image",
                 },
             )
             return
@@ -309,6 +310,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             response = {
                 "tracked": bool(top.get("tracked")),
+                "mode": "sam2_image",
                 "elapsed_s": round(time.monotonic() - started, 4),
                 "seed_box_xyxy": seed_box,
                 "prompt_source": "mask_box" if mask_box is not None else "box",

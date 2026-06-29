@@ -63,6 +63,12 @@ def test_fast_defaults_use_tiny_model_and_downscale() -> None:
     assert sam2_track_ui.DEFAULT_RESIZE_MAX_SIDE == 384
 
 
+def test_fast_tracker_source_declares_image_mode() -> None:
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "sam2_track_ui.py").read_text()
+
+    assert '"mode": "sam2_image"' in source
+
+
 def test_resize_image_and_box_scales_and_clips_mask_back() -> None:
     sam2_track_ui = _load_sam2_track_ui()
     from PIL import Image

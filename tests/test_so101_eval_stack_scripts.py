@@ -25,7 +25,7 @@ def test_so101_eval_stack_has_two_command_entrypoint() -> None:
 def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
     assert "remote MolmoAct2 policy server on :8202" in START_SCRIPT
     assert "remote SAM3 prompt server on :8213" in START_SCRIPT
-    assert "remote SAM2 video tracker on :8214" in START_SCRIPT
+    assert "remote SAM2 tracker on :8214" in START_SCRIPT
     assert "local SSH tunnels for :8202/:8213/:8214" in START_SCRIPT
     assert 'POLICY_PORT="${SO101_POLICY_PORT:-8202}"' in START_SCRIPT
     assert 'SAM3_PORT="${SO101_SAM3_PORT:-8213}"' in START_SCRIPT
@@ -34,7 +34,11 @@ def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
     assert 'UI_PORT="${SO101_WEB_PORT:-8092}"' in START_SCRIPT
     assert 'scripts/molmoact2_policy_runner.py' in START_SCRIPT
     assert 'scripts/sam3_prompt_ui.py' in START_SCRIPT
-    assert 'scripts/sam2_video_track_ui.py' in START_SCRIPT
+    assert 'SAM2_TRACKER="${SO101_SAM2_TRACKER:-image}"' in START_SCRIPT
+    assert 'SAM2_SCRIPT="scripts/sam2_track_ui.py"' in START_SCRIPT
+    assert 'SAM2_EXPECTED_MODE="sam2_image"' in START_SCRIPT
+    assert 'SAM2_SCRIPT="scripts/sam2_video_track_ui.py"' in START_SCRIPT
+    assert 'SAM2_EXPECTED_MODE="sam2_video"' in START_SCRIPT
     assert 'REMOTE_POLICY_PATH="${MOLMOACT2_POLICY_PATH:-__none__}"' in START_SCRIPT
     assert 'if [ "$POLICY_PATH" = "__none__" ]; then' in START_SCRIPT
     assert 'MOLMOACT2_IMAGE_KEYS_B64="$(printf \'%s\' "$MOLMOACT2_IMAGE_KEYS" | base64 | tr -d \'\\n\')"' in START_SCRIPT
@@ -67,6 +71,7 @@ def test_stop_script_stops_motion_local_processes_tunnels_and_remote_services() 
     assert 'pkill -f \'scripts/molmoact2_policy_runner.py\'' in STOP_SCRIPT
     assert 'pkill -f \'scripts/sam3_prompt_ui.py\'' in STOP_SCRIPT
     assert 'pkill -f \'scripts/sam2_video_track_ui.py\'' in STOP_SCRIPT
+    assert 'pkill -f \'scripts/sam2_track_ui.py\'' in STOP_SCRIPT
     assert 'SO101_STOP_VAST_INSTANCE' in STOP_SCRIPT
     assert 'vastai stop instance "$VAST_INSTANCE_ID"' in STOP_SCRIPT
 
@@ -89,6 +94,7 @@ def test_stack_env_example_documents_mutable_vast_config() -> None:
     assert "MOLMOACT2_CHECKPOINT_PATH=allenai/MolmoAct2-SO100_101" in ENV_EXAMPLE
     assert "MOLMOACT2_NORM_TAG=so100_so101_molmoact2" in ENV_EXAMPLE
     assert "SO101_SAM3_READY_PATH=/" in ENV_EXAMPLE
+    assert "SO101_SAM2_TRACKER=image" in ENV_EXAMPLE
     assert "SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=100" in ENV_EXAMPLE
     assert "SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2" in ENV_EXAMPLE
     assert "SO101_STOP_REMOTE_SERVICES=1" in ENV_EXAMPLE

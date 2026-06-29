@@ -6,7 +6,7 @@ set -euo pipefail
 # Starts or verifies:
 #   - remote MolmoAct2 policy server on :8202
 #   - remote SAM3 prompt server on :8213
-#   - remote SAM2 video tracker on :8214
+#   - remote SAM2 tracker on :8214
 #   - local SSH tunnels for :8202/:8213/:8214
 #   - local camera relay on :8089
 #   - local eval UI on :8092
@@ -59,6 +59,7 @@ MOLMOACT2_EXPERIMENTS_DIR="${MOLMOACT2_EXPERIMENTS_DIR:-${REMOTE_ROOT}/molmoact2
 SAM3_BACKEND="${SO101_SAM3_BACKEND:-transformers}"
 SAM3_FRAMES_DIR="${SO101_SAM3_FRAMES_DIR:-${REMOTE_ROOT}/sam3-frames}"
 SAM3_READY_PATH="${SO101_SAM3_READY_PATH:-/}"
+SAM2_TRACKER="${SO101_SAM2_TRACKER:-image}"
 SAM2_MODEL_ID="${SO101_SAM2_MODEL_ID:-facebook/sam2-hiera-tiny}"
 
 UI_PORT="${SO101_WEB_PORT:-8092}"
@@ -165,6 +166,7 @@ start_remote_gpu_services() {
     "$SAM3_BACKEND" \
     "$SAM3_FRAMES_DIR" \
     "$SAM3_READY_PATH" \
+    "$SAM2_TRACKER" \
     "$SAM2_MODEL_ID" <<'REMOTE'
 set -euo pipefail
 
@@ -189,7 +191,8 @@ EXPERIMENTS_DIR="${15}"
 SAM3_BACKEND="${16}"
 SAM3_FRAMES_DIR="${17}"
 SAM3_READY_PATH="${18}"
-SAM2_MODEL_ID="${19}"
+SAM2_TRACKER="${19}"
+SAM2_MODEL_ID="${20}"
 IMAGE_KEYS="$(printf '%s' "$IMAGE_KEYS_B64" | base64 -d)"
 
 mkdir -p "$LOG_DIR" "$SAM3_FRAMES_DIR"
@@ -230,9 +233,26 @@ if ! curl -fsS --max-time 2 "http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}" >/
   echo $! >"${LOG_DIR}/sam3_${SAM3_PORT}.pid"
 fi
 
-if ! curl -fsS --max-time 2 "http://127.0.0.1:${SAM2_PORT}/health" >/dev/null 2>&1; then
+case "$SAM2_TRACKER" in
+  image)
+    SAM2_SCRIPT="scripts/sam2_track_ui.py"
+    SAM2_EXPECTED_MODE="sam2_image"
+    ;;
+  video)
+    SAM2_SCRIPT="scripts/sam2_video_track_ui.py"
+    SAM2_EXPECTED_MODE="sam2_video"
+    ;;
+  *)
+    echo "Unknown SO101_SAM2_TRACKER=${SAM2_TRACKER}; expected image or video" >&2
+    exit 1
+    ;;
+esac
+
+SAM2_HEALTH="$(curl -fsS --max-time 2 "http://127.0.0.1:${SAM2_PORT}/health" 2>/dev/null || true)"
+if ! printf '%s' "$SAM2_HEALTH" | grep -q "\"mode\":\"${SAM2_EXPECTED_MODE}\""; then
   pkill -f 'scripts/sam2_video_track_ui.py' >/dev/null 2>&1 || true
-  nohup "$PYTHON" scripts/sam2_video_track_ui.py \
+  pkill -f 'scripts/sam2_track_ui.py' >/dev/null 2>&1 || true
+  nohup "$PYTHON" "$SAM2_SCRIPT" \
     --host 127.0.0.1 \
     --port "$SAM2_PORT" \
     --device cuda \
