@@ -520,14 +520,20 @@ class LiveCupSuccessTracker:
         )
 
     def invalidate_container_mask(self, reason: str = "manual") -> None:
+        preserve_previous = reason not in {"manual_sam3_rerun"}
         if (
-            self.cup_mask is not None
+            preserve_previous
+            and self.cup_mask is not None
             and self.cup_mask.any()
             and str(self.cup_mask_source).startswith("sam3:")
         ):
             self.previous_cup_mask = self.cup_mask.copy()
             self.previous_cup_mask_source = str(self.cup_mask_source)
             self.previous_cup_mask_area = int(self.cup_mask.sum())
+        elif not preserve_previous:
+            self.previous_cup_mask = None
+            self.previous_cup_mask_source = ""
+            self.previous_cup_mask_area = 0
         self.cup_mask = None
         self.cup_mask_source = f"pending:{reason}"
         self.cup_mask_area = 0
@@ -726,6 +732,17 @@ class LiveCupSuccessTracker:
             self._set_sam3_mask_status("request_failed", str(exc))
             return None
 
+    def _previous_cup_mask_fallback(self, shape: tuple[int, int]) -> tuple[np.ndarray, str] | None:
+        if self.cup_mask_sam3_status != "episode_iou_too_low":
+            return None
+        if self.previous_cup_mask is None or not self.previous_cup_mask.any():
+            return None
+        if self.previous_cup_mask.shape != shape:
+            return None
+        previous_source = self.previous_cup_mask_source or "sam3:previous"
+        self._set_sam3_mask_status("episode_iou_fallback_previous", self.cup_mask_sam3_error)
+        return self.previous_cup_mask.copy(), f"sam3:previous_fallback {previous_source}"
+
     def _cup_mask_from_candidate(
         self,
         candidate: np.ndarray,
@@ -776,6 +793,9 @@ class LiveCupSuccessTracker:
         sam3_result = self._calculate_sam3_cup_mask(rgb, default_area)
         if sam3_result is not None:
             return sam3_result
+        previous_result = self._previous_cup_mask_fallback(rgb.shape[:2])
+        if previous_result is not None:
+            return previous_result
         if SUCCESS_STRICT_SAM3_CUP:
             empty = np.zeros(rgb.shape[:2], dtype=bool)
             source = f"sam3_failed:{self.cup_mask_sam3_status}"

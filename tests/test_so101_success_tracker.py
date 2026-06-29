@@ -51,6 +51,41 @@ def _frame() -> np.ndarray:
     return image
 
 
+def _mask_payload(module, mask: np.ndarray, score: float = 0.9) -> dict:
+    ok, encoded = cv2.imencode(".png", mask.astype(np.uint8) * 255)
+    assert ok
+    box = module.LiveCupSuccessTracker._mask_box(mask > 0)
+    return {
+        "top_mask": {
+            "score": score,
+            "area_px": int((mask > 0).sum()),
+            "box_xyxy": box,
+            "mask_png_b64": module.base64.b64encode(encoded.tobytes()).decode("ascii"),
+        }
+    }
+
+
+def _install_fake_sam3(monkeypatch, module, cup_mask_ref: dict[str, np.ndarray]) -> None:
+    ball_mask = np.zeros((360, 640), dtype=np.uint8)
+    ball_mask[130:155, 270:295] = 255
+
+    def fake_post(url, json, timeout):
+        del url, timeout
+        prompt = (json.get("prompts") or [""])[0]
+        mask = ball_mask if "ball" in prompt else cup_mask_ref["mask"]
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return _mask_payload(module, mask, score=0.9)
+
+        return Response()
+
+    monkeypatch.setattr(module.requests, "post", fake_post)
+
+
 def test_success_tracker_uses_one_sam3_seed_across_frames() -> None:
     tracker = CountingSam3Tracker().tracker
 
@@ -80,6 +115,57 @@ def test_success_tracker_recalculate_container_runs_one_new_sam3_seed() -> None:
         tracker.update(_frame())
 
     assert tracker.sam3_calls == 2
+
+
+def test_success_tracker_auto_iou_failure_keeps_previous_cup_mask(monkeypatch) -> None:
+    module = _load_so101_web_intervene()
+    first_cup = np.zeros((360, 640), dtype=np.uint8)
+    first_cup[100:180, 240:320] = 255
+    moved_cup = np.zeros((360, 640), dtype=np.uint8)
+    moved_cup[210:290, 420:500] = 255
+    cup_mask_ref = {"mask": first_cup}
+    _install_fake_sam3(monkeypatch, module, cup_mask_ref)
+
+    tracker = module.LiveCupSuccessTracker()
+    tracker.ball_sam2_url = ""
+    tracker.update(_frame())
+    assert tracker.status()["container_mask_sam3_status"] == "accepted"
+    assert tracker.status()["container_mask_box_xyxy"] == [240, 100, 319, 179]
+
+    cup_mask_ref["mask"] = moved_cup
+    tracker.reset(recalculate_container=True, container_reason="policy_start")
+    tracker.update(_frame())
+
+    status = tracker.status()
+    assert status["container_mask_sam3_status"] == "episode_iou_fallback_previous"
+    assert status["container_mask_source"].startswith("sam3:previous_fallback")
+    assert status["container_mask_box_xyxy"] == [240, 100, 319, 179]
+    assert status["container_mask_area"] == int((first_cup > 0).sum())
+
+
+def test_success_tracker_manual_rerun_ignores_previous_cup_iou(monkeypatch) -> None:
+    module = _load_so101_web_intervene()
+    first_cup = np.zeros((360, 640), dtype=np.uint8)
+    first_cup[100:180, 240:320] = 255
+    moved_cup = np.zeros((360, 640), dtype=np.uint8)
+    moved_cup[210:290, 420:500] = 255
+    cup_mask_ref = {"mask": first_cup}
+    _install_fake_sam3(monkeypatch, module, cup_mask_ref)
+
+    tracker = module.LiveCupSuccessTracker()
+    tracker.ball_sam2_url = ""
+    tracker.update(_frame())
+
+    cup_mask_ref["mask"] = moved_cup
+    tracker.reset(recalculate_container=True, container_reason="manual_sam3_rerun")
+    tracker.update(_frame())
+
+    status = tracker.status()
+    assert status["container_mask_sam3_status"] == "accepted"
+    assert status["container_mask_source"].startswith("sam3:")
+    assert "previous_fallback" not in status["container_mask_source"]
+    assert status["container_mask_box_xyxy"] == [420, 210, 499, 289]
+    assert status["container_mask_area"] == int((moved_cup > 0).sum())
 
 
 def test_success_tracker_defaults_to_blue_rubber_ball_prompt_and_lower_threshold() -> None:
