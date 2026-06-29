@@ -119,7 +119,7 @@ SUCCESS_CONTAINER_SAM3_PROMPT = os.environ.get(
     "SO101_SUCCESS_SAM3_PROMPT",
     "black cylinder along with insides",
 )
-SUCCESS_CONTAINER_SAM3_MIN_SCORE = float(os.environ.get("SO101_SUCCESS_SAM3_MIN_SCORE", "0.05"))
+SUCCESS_CONTAINER_SAM3_MIN_SCORE = float(os.environ.get("SO101_SUCCESS_SAM3_MIN_SCORE", "0.25"))
 SUCCESS_CONTAINER_SAM3_TIMEOUT_S = float(os.environ.get("SO101_SUCCESS_SAM3_TIMEOUT_S", "15"))
 SUCCESS_STRICT_SAM3_CUP = os.environ.get("SO101_SUCCESS_STRICT_SAM3_CUP", "1").strip().lower() not in {
     "0",
@@ -5559,7 +5559,7 @@ body.page-monitor #liveToggle { display:none; }
         <input id="sam3Prompt" type="text" value="black cylinder along with insides">
       </div>
       <div class="row">
-        <label>Confidence <input id="sam3MinScore" type="number" value="0.05" min="0" max="1" step="0.01" style="width:72px"></label>
+        <label>Confidence <input id="sam3MinScore" type="number" value="0.25" min="0" max="1" step="0.01" style="width:72px"></label>
         <label>Camera <select id="sam3Camera"><option value="front">Front</option><option value="side">Side</option><option value="wrist">Wrist</option></select></label>
         <button id="sam3PreviewButton" onclick="previewSam3()">Preview SAM3</button>
         <button id="sam3RerunButton" onclick="rerunSam3Masks()">Rerun SAM3</button>

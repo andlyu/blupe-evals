@@ -171,7 +171,7 @@ def test_success_tracker_manual_rerun_ignores_previous_cup_iou(monkeypatch) -> N
 def test_success_tracker_defaults_to_blue_rubber_ball_prompt_and_lower_threshold() -> None:
     module = _load_so101_web_intervene()
 
-    assert module.SUCCESS_CONTAINER_SAM3_MIN_SCORE == 0.05
+    assert module.SUCCESS_CONTAINER_SAM3_MIN_SCORE == 0.25
     assert module.SUCCESS_BALL_SAM3_PROMPT == "blue rubber ball"
     assert module.SUCCESS_BALL_SAM3_MIN_SCORE == 0.25
     assert module.SUCCESS_BALL_SAM2_EVERY_N_FRAMES == 10
