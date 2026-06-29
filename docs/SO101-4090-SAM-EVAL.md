@@ -40,11 +40,12 @@ the newer `/health` route.
 When the Vast SSH target changes, copy `config/so101_eval_stack.env.example` to
 `config/so101_eval_stack.local.env` and update `SO101_GPU_HOST` / `SO101_GPU_PORT`.
 
-The success tracker uses SAM3 once to seed the cup/cylinder mask and the first
-ball mask. It then sends the ball seed to SAM2 and asks SAM2 to update the ball
-mask every `SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES` frames. Current defaults are
-`black cylinder along with insides` for the cup/cylinder at minimum score `0.25`, and
-`blue rubber ball` for the ball at minimum score `0.25`.
+The success tracker uses SAM3 to seed the cup/cylinder mask and to refresh the
+ball mask periodically. The stack default refreshes the ball with SAM3 every
+`SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=3` success-tracker frames, then uses
+SAM2 as the bridge between SAM3 refreshes. Current defaults are `black cylinder
+along with insides` for the cup/cylinder at minimum score `0.25`, and `blue
+rubber ball` for the ball at minimum score `0.25`.
 
 ## 4090 Setup
 
@@ -122,6 +123,7 @@ SO101_SUCCESS_SAM3_PROMPT="black cylinder along with insides" \
 SO101_SUCCESS_SAM3_MIN_SCORE=0.25 \
 SO101_SUCCESS_BALL_SAM3_PROMPT="blue rubber ball" \
 SO101_SUCCESS_BALL_SAM3_MIN_SCORE=0.25 \
+SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=3 \
 SO101_SUCCESS_BALL_SAM2_AUTO=1 \
 SO101_SUCCESS_BALL_SAM2_URL=http://127.0.0.1:8214/api/track_image \
 SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=10 \

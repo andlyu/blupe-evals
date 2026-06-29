@@ -130,6 +130,7 @@ SUCCESS_STRICT_SAM3_CUP = os.environ.get("SO101_SUCCESS_STRICT_SAM3_CUP", "1").s
 SUCCESS_CUP_MIN_EPISODE_IOU = float(os.environ.get("SO101_SUCCESS_CUP_MIN_EPISODE_IOU", "0.5"))
 SUCCESS_BALL_SAM3_PROMPT = os.environ.get("SO101_SUCCESS_BALL_SAM3_PROMPT", "blue rubber ball")
 SUCCESS_BALL_SAM3_MIN_SCORE = float(os.environ.get("SO101_SUCCESS_BALL_SAM3_MIN_SCORE", "0.25"))
+SUCCESS_BALL_SAM3_EVERY_N_FRAMES = max(0, int(os.environ.get("SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES", "0")))
 SUCCESS_BALL_SAM2_URL = os.environ.get("SO101_SUCCESS_BALL_SAM2_URL", "").strip()
 SUCCESS_BALL_SAM2_TIMEOUT_S = float(os.environ.get("SO101_SUCCESS_BALL_SAM2_TIMEOUT_S", "3"))
 SUCCESS_BALL_SAM2_RESIZE_MAX_SIDE = int(os.environ.get("SO101_SUCCESS_BALL_SAM2_RESIZE_MAX_SIDE", "384"))
@@ -478,6 +479,8 @@ class LiveCupSuccessTracker:
         self.ball_mask_sam3_raw_score: float | None = None
         self.ball_mask_sam3_raw_area: int | None = None
         self.ball_mask_sam3_box_xyxy: list[float] | None = None
+        self.ball_mask_sam3_every_n_frames = SUCCESS_BALL_SAM3_EVERY_N_FRAMES
+        self.ball_mask_sam3_last_request_frame: int | None = None
         self.ball_mask_sam2_status = "disabled" if not self.ball_sam2_url else "not_run"
         self.ball_mask_sam2_error = ""
         self.ball_mask_sam2_raw_score: float | None = None
@@ -560,6 +563,7 @@ class LiveCupSuccessTracker:
         self.ball_mask_sam3_raw_score = None
         self.ball_mask_sam3_raw_area = None
         self.ball_mask_sam3_box_xyxy = None
+        self.ball_mask_sam3_last_request_frame = None
         self.ball_mask_sam2_status = "disabled" if not self.ball_sam2_url else f"pending:{reason}"
         self.ball_mask_sam2_error = ""
         self.ball_mask_sam2_raw_score = None
@@ -874,6 +878,7 @@ class LiveCupSuccessTracker:
         if not self.ball_sam3_url or not self.ball_sam3_prompt:
             self._set_ball_sam3_status("disabled")
             return None
+        self.ball_mask_sam3_last_request_frame = self.frame_idx
         self._set_ball_sam3_status("requesting")
         self.ball_mask_sam3_raw_score = None
         self.ball_mask_sam3_raw_area = None
@@ -1078,6 +1083,32 @@ class LiveCupSuccessTracker:
         self._set_ball_sam2_status("seed_ready" if self.ball_sam2_url else "disabled")
         return self.ball_mask
 
+    def _should_refresh_ball_with_sam3(self) -> bool:
+        cadence = int(self.ball_mask_sam3_every_n_frames)
+        if cadence <= 0:
+            return False
+        if self.ball_mask_sam3_last_request_frame is None:
+            return True
+        return self.frame_idx - self.ball_mask_sam3_last_request_frame >= cadence
+
+    def _refresh_ball_with_sam3(self, rgb: np.ndarray) -> np.ndarray | None:
+        result = self._calculate_sam3_ball_mask(rgb)
+        if result is None:
+            return None
+        tracked, source = result
+        self.ball_mask = tracked
+        self.ball_mask_source = source
+        self.ball_mask_box_xyxy = self._mask_box(tracked)
+        self.ball_mask_calculated_at_frame = self.frame_idx
+        self.ball_track_missing_frames = 0
+        if self.ball_sam2_url:
+            self._set_ball_sam2_status("sam3_live_refresh")
+        self.last_event = (
+            f"ball SAM3 live refresh frame={self.frame_idx} "
+            f"source={self.ball_mask_source} area={int(tracked.sum())}"
+        )
+        return tracked
+
     def _ball_mask(self, rgb: np.ndarray) -> np.ndarray:
         if not self.ball_sam2_url:
             self._set_ball_sam2_status("disabled")
@@ -1085,6 +1116,11 @@ class LiveCupSuccessTracker:
 
         if self.ball_mask is None or self.ball_mask.shape != rgb.shape[:2] or not self.ball_mask.any():
             return self._seed_ball_mask(rgb)
+
+        if self._should_refresh_ball_with_sam3():
+            refreshed = self._refresh_ball_with_sam3(rgb)
+            if refreshed is not None:
+                return refreshed
 
         if (
             str(self.ball_mask_source).startswith("sam2:")
@@ -1266,6 +1302,8 @@ class LiveCupSuccessTracker:
             "ball_mask_sam3_raw_score": self.ball_mask_sam3_raw_score,
             "ball_mask_sam3_raw_area": self.ball_mask_sam3_raw_area,
             "ball_mask_sam3_box_xyxy": self.ball_mask_sam3_box_xyxy,
+            "ball_mask_sam3_every_n_frames": self.ball_mask_sam3_every_n_frames,
+            "ball_mask_sam3_last_request_frame": self.ball_mask_sam3_last_request_frame,
             "ball_mask_sam2_status": self.ball_mask_sam2_status,
             "ball_mask_sam2_error": self.ball_mask_sam2_error,
             "ball_mask_sam2_raw_score": self.ball_mask_sam2_raw_score,
@@ -4836,21 +4874,22 @@ class SO101Controller:
                 if run_outcome == "stopped":
                     stop_reason = "user_stop"
                     break
-                if waiting_for_intervention:
-                    break
                 if run_outcome == "complete":
                     break
 
-                if run_outcome == "failure" and consecutive_failures >= max_consecutive_failures:
-                    request_intervention("consecutive_failures")
-                    break
-
-                if run_outcome in {"success", "failure", "intervention"}:
+                if run_outcome in {"failure", "intervention"}:
                     home_ok = self._eval_home()
                     self._write_eval_summary()
                     if not home_ok:
                         request_intervention("home_failed")
                         break
+
+                if waiting_for_intervention:
+                    break
+
+                if run_outcome == "failure" and consecutive_failures >= max_consecutive_failures:
+                    request_intervention("consecutive_failures")
+                    break
 
             if self.eval_stop_event.is_set() and stop_reason == "complete":
                 stop_reason = "user_stop"
@@ -5388,9 +5427,10 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .errorbar-point { position:absolute; top:-3px; bottom:-3px; width:2px; background:#fff; box-shadow:0 0 0 1px rgba(0,0,0,.55); }
 .errorbar.empty { opacity:.35; }
 .event-pill { display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; width: 32px; height: 28px; padding: 0; border-radius: 999px; font-size: 17px; line-height:1; font-weight: 700; white-space: nowrap; }
-.event-pill.success { background: rgba(45, 107, 63, .35); border: 1px solid #3c8a52; }
+.event-pill.success { background: rgba(45, 107, 63, .35); border: 1px solid #3c8a52; color:#dcffe4; }
 .event-pill.failure { background: rgba(158, 47, 47, .35); border: 1px solid #c43b3b; color:#ffb4b4; }
 .event-pill.warn { background: rgba(255, 209, 102, .22); border: 1px solid #ffd166; color:#ffe6a3; }
+.live-events-empty { color:#777; font-size:12px; padding:4px; }
 .live-events.compact { gap:5px; }
 .live-events.compact .event-pill { width: 27px; height: 24px; font-size: 15px; }
 .live-events.dense { gap:4px; }
@@ -5414,6 +5454,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 body.live-view main { grid-template-columns: 1fr; }
 body.live-view.page-setup .control-panel { display:none; }
 body.live-view .status-panel { display:none; }
+body.live-view .teleop-panel, body.page-monitor .teleop-panel { display:none !important; }
 body.live-view .cams { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 body.live-view .cams img { height: min(62vh, 680px); max-height: none; }
 body.live-view .visual-pane { min-height: calc(100vh - 74px); }
@@ -5458,8 +5499,9 @@ body.page-monitor #liveToggle { display:none; }
 	    <div class="live-record-bar monitor-only">
 	      <label class="prompt">Model Prompt <input id="liveInstruction" type="text" value="Move to light blue ball, grab it, and move it to the tall black cylinder"></label>
 	      <label>Dataset Name <input id="evalDatasetName" type="text" value="so101-ball-cup-eval"></label>
+	      <label>Episode Timeout <input id="evalAttempt" type="number" value="60" min="5" max="600" step="1"></label>
 	      <label class="checkbox intervention-only-option"><input id="evalInterventionsOnly" type="checkbox"> Intervention episodes only</label>
-	      <button id="startEvalButton" class="primary" onclick="startEval()">Start Recording</button>
+	      <button id="startEvalButton" class="primary" onclick="startEval()">Start Eval</button>
 	      <button id="startTeleopRecordingButton" class="primary" onclick="startLiveTeleopRecording()">Record Teleop</button>
 	      <button id="stopRecordingButton" class="danger" onclick="stopRecording()" disabled>Stop Recording</button>
 	      <span id="liveSuccessIndicator" class="live-success-indicator mono">success 0</span>
@@ -5570,9 +5612,10 @@ body.page-monitor #liveToggle { display:none; }
     </div>
     <div class="hidden" aria-hidden="true">
       <input id="evalHours" type="number" value="1" min="0.05" max="8" step="0.05">
-      <input id="evalAttempt" type="number" value="60" min="5" max="600" step="1">
       <input id="evalMaxFails" type="number" value="4" min="1" max="10" step="1">
       <input id="evalRecordFps" type="number" value="30" min="0.5" max="30" step="0.5">
+      <input id="evalWithTeleop" type="checkbox" checked>
+      <input id="evalRecordEpisodes" type="checkbox" checked>
     </div>
     <div class="eval mono hidden" id="eval"></div>
     <hr class="hidden" style="border-color:#333">
@@ -5691,6 +5734,19 @@ async function api(path, body) {
   const json = await res.json();
   if (!res.ok) throw new Error(json.error || res.statusText);
   return json;
+}
+function sleepMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+async function waitForMotionIdle(timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const data = await api('/api/status?log_limit=1');
+    lastStatus = data;
+    if (!data.running && !['policy', 'home', 'stopping'].includes(data.mode)) return data;
+    await sleepMs(250);
+  }
+  throw new Error('motion did not stop before eval start');
 }
 function val(id) { return document.getElementById(id).value; }
 function checked(id, fallback = false) {
@@ -5940,31 +5996,26 @@ async function startEval() {
     const policyAlreadyRunning = !!lastStatus && lastStatus.mode === 'policy' && !lastStatus.eval?.running;
     const onlyInterventions = checked('evalInterventionsOnly', false);
     if (policyAlreadyRunning && !onlyInterventions) {
-      await startLivePolicyRecording();
-    } else {
-      try {
-        await api('/api/eval/start', {
-          instruction: modelPromptValue(),
-          dataset_name: val('evalDatasetName'),
-          run_duration_s: Number(val('evalHours')) * 3600,
-          attempt_duration_s: Number(val('evalAttempt')),
-          max_consecutive_failures: Number(val('evalMaxFails')),
-          record_fps: Number(val('evalRecordFps')),
-          exec_steps: Number(val('execSteps')),
-          max_step_deg: Number(val('maxStep')),
-          hz: Number(val('hz')),
-          realtime_chunking: checked('realtimeChunking', false),
-          realtime_query_fraction: Number(val('realtimeQueryFraction')),
-          allow_teleop: !!document.getElementById('evalWithTeleop')?.checked,
-          record_episodes: !!document.getElementById('evalRecordEpisodes')?.checked,
-          record_interventions_only: onlyInterventions,
-        });
-      } catch (e) {
-        if (!String(e.message || '').includes('motion is already running')) throw e;
-        if (onlyInterventions) throw e;
-        await startLivePolicyRecording();
-      }
+      setLiveRecordStatus('stopping current MolmoAct before eval...', 'warn');
+      await api('/api/stop', {});
+      await waitForMotionIdle();
     }
+    await api('/api/eval/start', {
+      instruction: modelPromptValue(),
+      dataset_name: val('evalDatasetName'),
+      run_duration_s: Number(val('evalHours')) * 3600,
+      attempt_duration_s: Number(val('evalAttempt')),
+      max_consecutive_failures: Number(val('evalMaxFails')),
+      record_fps: Number(val('evalRecordFps')),
+      exec_steps: Number(val('execSteps')),
+      max_step_deg: Number(val('maxStep')),
+      hz: Number(val('hz')),
+      realtime_chunking: checked('realtimeChunking', false),
+      realtime_query_fraction: Number(val('realtimeQueryFraction')),
+      allow_teleop: checked('evalWithTeleop', true),
+      record_episodes: checked('evalRecordEpisodes', true),
+      record_interventions_only: onlyInterventions,
+    });
     resetSuccessStream();
     await refresh();
   } catch (e) {
@@ -5981,7 +6032,7 @@ async function startEval() {
     }
     if (startButton) {
       startButton.disabled = !!lastStatus?.eval?.running || !!lastStatus?.recording?.running;
-      startButton.textContent = lastStatus?.eval?.running || lastStatus?.recording?.running ? 'Recording...' : 'Start Recording';
+      startButton.textContent = lastStatus?.eval?.running ? 'Eval Running' : lastStatus?.recording?.running ? 'Recording...' : 'Start Eval';
     }
   }
 }
@@ -6212,9 +6263,9 @@ function renderEval(data) {
   const startButton = document.getElementById('startEvalButton');
   if (startButton) {
     const rec = data.recording || {};
-    startButton.disabled = !!e.running && !rec.running;
-    startButton.textContent = rec.running ? 'Stop Recording' : e.running ? 'Recording...' : 'Start Recording';
-    startButton.className = rec.running ? 'danger' : 'primary';
+    startButton.disabled = !!e.running || !!rec.running;
+    startButton.textContent = e.running ? 'Eval Running' : rec.running ? 'Recording...' : 'Start Eval';
+    startButton.className = 'primary';
   }
   const teleopRecordButton = document.getElementById('startTeleopRecordingButton');
   if (teleopRecordButton) {
@@ -6226,7 +6277,7 @@ function renderEval(data) {
     if (!stopButton) continue;
     const rec = data.recording || {};
     stopButton.disabled = !(rec.running || e.running);
-    stopButton.textContent = rec.running ? 'Stop Recording' : 'Stop Recording';
+    stopButton.textContent = e.running ? 'Stop Eval' : 'Stop Recording';
   }
   const livePromptInput = document.getElementById('liveInstruction');
   if (livePromptInput && e.config?.instruction && !e.running && document.activeElement !== livePromptInput) {
@@ -6300,17 +6351,24 @@ function renderTeleop(data) {
 }
 function renderLiveEvents(data) {
   const el = document.getElementById('liveEvents');
-  const history = ((data.eval || {}).history || []).filter(ev => ev && (ev.type === 'success' || ev.type === 'failure' || ev.type === 'intervention')).slice(-80);
+  if (!el) return;
+  const history = liveOutcomeEvents(data).slice(-80);
   el.classList.toggle('compact', history.length > 12);
   el.classList.toggle('dense', history.length > 28);
   el.classList.toggle('tiny', history.length > 48);
+  if (!history.length) {
+    el.innerHTML = '<span class="live-events-empty">waiting for episode outcomes</span>';
+    return;
+  }
   el.innerHTML = history.map(ev => {
     const intervention = ev.type === 'intervention';
     const ok = ev.type === 'success' || ev.outcome === 'success';
     const label = intervention ? 'I' : ok ? '✓' : '×';
     const cls = intervention ? 'warn' : ok ? 'success' : 'failure';
     const stamp = ev.at || ev.ended_at || '';
-    const title = `${stamp} run ${ev.run || ev.attempt || ''} ${ev.reason || ev.outcome || ''}`;
+    const seconds = ev.elapsed_s ?? ev.duration_s;
+    const duration = seconds === undefined || seconds === null ? '' : ` ${formatDuration(seconds)}`;
+    const title = `${stamp} run ${ev.run || ev.attempt || ''} ${ev.reason || ev.outcome || ''}${duration}`;
     return `<span class="event-pill ${cls}" title="${escapeHtml(title)}">${label}</span>`;
   }).join('');
 }
@@ -6327,6 +6385,39 @@ function renderLivePrompt(data) {
 }
 function clampPercent(value) {
   return Math.max(0, Math.min(100, value));
+}
+function formatDuration(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return '-';
+  const total = Math.max(0, Math.round(Number(seconds)));
+  const minutes = Math.floor(total / 60);
+  const secs = total % 60;
+  return minutes ? `${minutes}m ${String(secs).padStart(2, '0')}s` : `${secs}s`;
+}
+function liveOutcomeEvents(data) {
+  return ((data?.eval || {}).history || [])
+    .filter(ev => ev && (ev.type === 'success' || ev.type === 'failure' || ev.type === 'intervention'));
+}
+function liveOutcomeCounts(data) {
+  const e = data?.eval || {};
+  const events = liveOutcomeEvents(data);
+  const eventSuccesses = events.filter(ev => ev.type === 'success' || ev.outcome === 'success').length;
+  const eventFailures = events.filter(ev => ev.type === 'failure' || ev.outcome === 'failure').length;
+  return {
+    successes: Number(e.successes || 0) || eventSuccesses,
+    failures: Number(e.failures || 0) || eventFailures,
+    interventions: Number(e.interventions || 0) || events.filter(ev => ev.type === 'intervention').length,
+  };
+}
+function evalAttemptDuration(data) {
+  const e = data?.eval || {};
+  const configured = Number(
+    e.attempt_duration_s
+    || e.no_success_timeout_s
+    || e.config?.attempt_duration_s
+    || val('evalAttempt')
+    || 60
+  );
+  return configured > 0 ? configured : 60;
 }
 function errorBar(ci) {
   if (!ci) return `<div class="errorbar empty"></div><em>95% CI -</em>`;
@@ -6372,13 +6463,15 @@ function throughputCi(successes, elapsedMin) {
 }
 function renderLiveStats(data) {
   const el = document.getElementById('liveStats');
+  if (!el) return;
   const e = data.eval || {};
   const i = data.intervention || {};
   const rec = data.recording || {};
   const recCounts = rec.counts || {};
-  const successes = Number(e.successes || 0);
-  const failures = Number(e.failures || 0);
-  const interventions = Number(e.interventions || 0);
+  const counts = liveOutcomeCounts(data);
+  const successes = counts.successes;
+  const failures = counts.failures;
+  const interventions = counts.interventions;
   const total = successes + failures;
   const successRate = total ? `${Math.round((successes / total) * 100)}%` : '-';
   const successRateCi = wilsonPercentCi(successes, total);
@@ -6387,9 +6480,25 @@ function renderLiveStats(data) {
   const throughput = elapsedMin > 0 ? `${(successes / elapsedMin).toFixed(2)}/min` : '-';
   const throughputCiResult = throughputCi(successes, elapsedMin);
   const throughputCiText = throughputCiResult ? throughputCiResult.text : '-';
-  const noSuccessRemaining = e.attempt_remaining_s === null || e.attempt_remaining_s === undefined ? '-' : `${e.attempt_remaining_s}s`;
-  const elapsed = e.elapsed_s === null || e.elapsed_s === undefined ? '-' : `${e.elapsed_s}s`;
-  const remaining = e.remaining_s === null || e.remaining_s === undefined ? '-' : `${e.remaining_s}s`;
+  const attemptDuration = evalAttemptDuration(data);
+  const plainPolicyActive = !e.running && !!data.running && data.mode === 'policy';
+  let attemptElapsed = e.attempt_elapsed_s === null || e.attempt_elapsed_s === undefined ? null : Number(e.attempt_elapsed_s);
+  let attemptRemaining = e.attempt_remaining_s === null || e.attempt_remaining_s === undefined ? null : Number(e.attempt_remaining_s);
+  let episodeNote = 'per attempt';
+  let resetNote = 'if no success';
+  if (plainPolicyActive) {
+    const policyElapsed = Math.max(0, Number(data.elapsed || 0));
+    attemptElapsed = Math.min(policyElapsed, attemptDuration);
+    attemptRemaining = Math.max(0, attemptDuration - policyElapsed);
+    episodeNote = 'plain policy';
+    resetNote = 'eval loop not armed';
+  }
+  const episodeTime = attemptElapsed === null ? `- / ${formatDuration(attemptDuration)}` : `${formatDuration(attemptElapsed)} / ${formatDuration(attemptDuration)}`;
+  const resetIn = e.running && attemptRemaining !== null ? formatDuration(attemptRemaining) : `at ${formatDuration(attemptDuration)}`;
+  const resetText = plainPolicyActive && attemptRemaining !== null ? formatDuration(attemptRemaining) : resetIn;
+  const resetUrgent = attemptRemaining !== null && attemptRemaining <= 10 && (e.running || plainPolicyActive);
+  const elapsed = e.elapsed_s === null || e.elapsed_s === undefined ? '-' : formatDuration(e.elapsed_s);
+  const remaining = e.remaining_s === null || e.remaining_s === undefined ? '-' : formatDuration(e.remaining_s);
   const last = e.last_attempt ? `${e.last_attempt.outcome || ''} ${e.last_attempt.reason || ''}`.trim() : '-';
   const interventionActive = !!(i.active || i.requested);
   const interventionElapsed = i.elapsed_s === null || i.elapsed_s === undefined ? '-' : `${i.elapsed_s}s`;
@@ -6401,10 +6510,11 @@ function renderLiveStats(data) {
     `<div class="live-stat ok"><span>confidence interval</span><b>${successRateCiText}</b>${errorBar(successRateCi)}</div>`,
     `<div class="live-stat ok"><span>throughput</span><b>${throughput}</b><em>95% CI ${throughputCiText}</em></div>`,
     `<div class="live-stat"><span>success / fail</span><b>${successes} / ${failures}</b></div>`,
+    `<div class="live-stat warn"><span>episode time</span><b>${episodeTime}</b><em>${episodeNote}</em></div>`,
+    `<div class="live-stat ${resetUrgent ? 'bad' : 'warn'}"><span>home reset</span><b>${resetText}</b><em>${resetNote}</em></div>`,
     `<div class="live-stat ${interventionActive ? 'warn' : ''}"><span>intervention</span><b>${escapeHtml(interventionLabel)}</b><em>${interventionSource} ${interventionElapsed}</em></div>`,
     `<div class="live-stat ${interventions || interventionSamples ? 'warn' : ''}"><span>intervention rows</span><b>${interventionSamples}</b><em>episodes ${interventions}</em></div>`,
     `<div class="live-stat ${e.consecutive_failures ? 'bad' : ''}"><span>fail streak</span><b>${e.consecutive_failures || 0}/${e.max_consecutive_failures || 0}</b></div>`,
-    `<div class="live-stat warn"><span>episode timer</span><b>${noSuccessRemaining}</b></div>`,
     `<div class="live-stat"><span>policy run</span><b>${e.attempt || 0}</b></div>`,
     `<div class="live-stat"><span>elapsed</span><b>${elapsed}</b></div>`,
     `<div class="live-stat"><span>remaining</span><b>${remaining}</b></div>`,

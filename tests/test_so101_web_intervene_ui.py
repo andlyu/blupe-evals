@@ -120,13 +120,13 @@ def test_stop_state_does_not_force_live_view() -> None:
     assert "data.mode === 'intervention'" in auto_active_block
     assert "data.mode === 'stopping'" not in auto_active_block
     assert 'class="monitor-actions"' not in SOURCE
-    assert 'id="evalWithTeleop"' not in SOURCE
-    assert 'id="evalRecordEpisodes"' not in SOURCE
+    assert '<input id="evalWithTeleop" type="checkbox" checked>' in SOURCE
+    assert '<input id="evalRecordEpisodes" type="checkbox" checked>' in SOURCE
     assert 'id="liveInterventionToggleButton"' not in SOURCE
     assert 'id="liveStopEvalButton"' not in SOURCE
     assert 'id="liveClearEvalButton"' not in SOURCE
     assert "Teleop Intervention" not in SOURCE
-    assert 'onclick="startEval()">Start Recording</button>' in SOURCE
+    assert 'onclick="startEval()">Start Eval</button>' in SOURCE
     assert 'id="stopRecordingButton"' in SOURCE
     assert 'id="headerStopRecordingButton"' in SOURCE
     assert 'onclick="stopRecording()" disabled>Stop Recording</button>' in SOURCE
@@ -145,8 +145,9 @@ def test_stop_state_does_not_force_live_view() -> None:
     assert "cameras: ['front', 'wrist', 'side']" in SOURCE
     assert "const policyAlreadyRunning = !!lastStatus && lastStatus.mode === 'policy' && !lastStatus.eval?.running" in SOURCE
     assert "await api('/api/record/start'" in SOURCE
-    assert "if (!String(e.message || '').includes('motion is already running')) throw e;" in SOURCE
-    assert "await startLivePolicyRecording();" in SOURCE
+    assert "setLiveRecordStatus('stopping current MolmoAct before eval...', 'warn');" in SOURCE
+    assert "await api('/api/stop', {});" in SOURCE
+    assert "await waitForMotionIdle();" in SOURCE
     assert "record_start_trigger: 'live_button_existing_policy'" in SOURCE
     assert "e.config?.dataset_name || e.dataset_name || val('evalDatasetName')" in SOURCE
     assert "setLiveRecordStatus('starting recording...', 'warn')" in SOURCE
@@ -172,8 +173,8 @@ def test_live_view_has_record_teleop_button_for_continuous_capture() -> None:
     assert "setLiveRecordStatus(`error: ${startError}`, 'bad')" in SOURCE
     assert "recording armed; starts in ${wait}s" in SOURCE
     assert "controller.stop_recording(stop_policy=True)" in SOURCE
-    assert "startButton.textContent = rec.running ? 'Stop Recording' : e.running ? 'Recording...' : 'Start Recording';" in SOURCE
-    assert "startButton.className = rec.running ? 'danger' : 'primary';" in SOURCE
+    assert "startButton.textContent = e.running ? 'Eval Running' : rec.running ? 'Recording...' : 'Start Eval';" in SOURCE
+    assert "startButton.className = 'primary';" in SOURCE
     assert "|| data.mode === 'intervention'" in SOURCE
     assert "|| data.mode === 'stopping'" in SOURCE
     assert "|| !!rec.running" in SOURCE

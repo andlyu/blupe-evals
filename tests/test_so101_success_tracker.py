@@ -174,6 +174,7 @@ def test_success_tracker_defaults_to_blue_rubber_ball_prompt_and_lower_threshold
     assert module.SUCCESS_CONTAINER_SAM3_MIN_SCORE == 0.25
     assert module.SUCCESS_BALL_SAM3_PROMPT == "blue rubber ball"
     assert module.SUCCESS_BALL_SAM3_MIN_SCORE == 0.25
+    assert module.SUCCESS_BALL_SAM3_EVERY_N_FRAMES == 0
     assert module.SUCCESS_BALL_SAM2_EVERY_N_FRAMES == 10
     assert module.SUCCESS_CUP_MIN_MASK_AREA == 500
 
@@ -261,3 +262,50 @@ def test_success_tracker_uses_sam2_after_sam3_ball_seed(monkeypatch) -> None:
     assert status["ball_mask_source"].startswith("sam2:video")
     assert status["ball_mask_sam2_status"] == "accepted"
     assert status["ball_mask_sam2_raw_score"] == 0.77
+
+
+def test_success_tracker_periodically_refreshes_ball_with_sam3_when_sam2_enabled() -> None:
+    module = _load_so101_web_intervene()
+
+    class Tracker(module.LiveCupSuccessTracker):
+        def __init__(self):
+            self.sam3_ball_calls = 0
+            self.sam2_calls = 0
+            super().__init__()
+            self.ball_sam2_url = "http://sam2.test/api/track_image"
+            self.ball_mask_sam3_every_n_frames = 2
+
+        def _calculate_sam3_cup_mask(self, rgb, default_area):
+            mask = np.zeros(rgb.shape[:2], dtype=bool)
+            mask[100:180, 240:320] = True
+            self.cup_mask_score = 1.0
+            self._set_sam3_mask_status("accepted", "test")
+            return mask, "sam3:test cup"
+
+        def _calculate_sam3_ball_mask(self, rgb):
+            self.sam3_ball_calls += 1
+            self.ball_mask_sam3_last_request_frame = self.frame_idx
+            mask = np.zeros(rgb.shape[:2], dtype=bool)
+            offset = 10 * (self.sam3_ball_calls - 1)
+            mask[130:155, 270 + offset : 295 + offset] = True
+            self.ball_mask_score = 0.9
+            self._set_ball_sam3_status("accepted", "test")
+            return mask, f"sam3:blue rubber ball call={self.sam3_ball_calls}"
+
+        def _calculate_sam2_ball_mask(self, rgb):
+            self.sam2_calls += 1
+            self._set_ball_sam2_status("accepted", "test")
+            return self.ball_mask.copy(), "sam2:video test"
+
+    tracker = Tracker()
+
+    for _ in range(5):
+        tracker.update(_frame())
+
+    status = tracker.status()
+    assert tracker.sam3_ball_calls == 3
+    assert tracker.sam2_calls == 2
+    assert status["ball_mask_source"] == "sam3:blue rubber ball call=3"
+    assert status["ball_mask_sam3_every_n_frames"] == 2
+    assert status["ball_mask_sam3_last_request_frame"] == 5
+    assert status["ball_mask_box_xyxy"] == [290, 130, 314, 154]

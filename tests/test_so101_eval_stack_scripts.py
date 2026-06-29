@@ -37,6 +37,9 @@ def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
     assert 'scripts/sam2_video_track_ui.py' in START_SCRIPT
     assert 'REMOTE_POLICY_PATH="${MOLMOACT2_POLICY_PATH:-__none__}"' in START_SCRIPT
     assert 'if [ "$POLICY_PATH" = "__none__" ]; then' in START_SCRIPT
+    assert 'MOLMOACT2_IMAGE_KEYS_B64="$(printf \'%s\' "$MOLMOACT2_IMAGE_KEYS" | base64 | tr -d \'\\n\')"' in START_SCRIPT
+    assert '"$MOLMOACT2_IMAGE_KEYS_B64" \\' in START_SCRIPT
+    assert 'IMAGE_KEYS="$(printf \'%s\' "$IMAGE_KEYS_B64" | base64 -d)"' in START_SCRIPT
     assert 'SAM3_READY_PATH="${SO101_SAM3_READY_PATH:-/}"' in START_SCRIPT
     assert '"http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}"' in START_SCRIPT
     assert "ssh \"${SSH_OPTS[@]}\"" in START_SCRIPT
@@ -50,6 +53,7 @@ def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
     assert '"$REPO_ROOT/scripts/launch_so101_eval_ui.sh"' in START_SCRIPT
     assert 'SO101_SUCCESS_SAM3_MIN_SCORE="${SO101_SUCCESS_SAM3_MIN_SCORE:-0.25}"' in START_SCRIPT
     assert 'SO101_SUCCESS_BALL_SAM3_PROMPT="${SO101_SUCCESS_BALL_SAM3_PROMPT:-blue rubber ball}"' in START_SCRIPT
+    assert 'SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES="${SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES:-3}"' in START_SCRIPT
 
 
 def test_stop_script_stops_motion_local_processes_tunnels_and_remote_services() -> None:
@@ -84,6 +88,7 @@ def test_stack_env_example_documents_mutable_vast_config() -> None:
     assert "MOLMOACT2_CHECKPOINT_PATH=allenai/MolmoAct2-SO100_101" in ENV_EXAMPLE
     assert "MOLMOACT2_NORM_TAG=so100_so101_molmoact2" in ENV_EXAMPLE
     assert "SO101_SAM3_READY_PATH=/" in ENV_EXAMPLE
+    assert "SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=3" in ENV_EXAMPLE
     assert "SO101_STOP_REMOTE_SERVICES=1" in ENV_EXAMPLE
 
 
