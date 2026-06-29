@@ -90,7 +90,7 @@ and update `SO101_GPU_HOST` / `SO101_GPU_PORT`.
 2. The eval UI captures front/wrist frames and current robot state.
 3. The UI sends those to MolmoAct2 over `/act`.
 4. The UI executes returned joint actions on the follower arm.
-5. SAM3 seeds cup masks and periodically refreshes ball masks; SAM2 bridges between SAM3 ball refreshes.
+5. SAM3 seeds cup masks and periodically refreshes ball masks; SAM2 refreshes ball masks asynchronously so the live video keeps drawing with the latest completed mask.
 6. Recordings are written locally, then compacted/exported to a dataset.
 7. Converted v2.1 datasets are used for MolmoAct2 LoRA training.
 

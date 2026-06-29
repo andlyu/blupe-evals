@@ -189,11 +189,13 @@ class Sam2VideoLiveSession:
 
     def _frame_to_model_tensor(self, image: Image.Image):
         import torch
-        from sam2.utils.misc import _load_img_as_tensor
 
-        frame_path = self._tmp_root / "latest.jpg"
-        image.save(frame_path, quality=95)
-        tensor, video_height, video_width = _load_img_as_tensor(str(frame_path), self.predictor.image_size)
+        video_width, video_height = image.size
+        resized = image.convert("RGB").resize(
+            (int(self.predictor.image_size), int(self.predictor.image_size)),
+            Image.Resampling.BILINEAR,
+        )
+        tensor = torch.from_numpy(np.asarray(resized, dtype=np.float32) / 255.0).permute(2, 0, 1)
         if self.frame_shape is not None and self.frame_shape != (video_height, video_width):
             raise ValueError(
                 f"frame shape changed from {self.frame_shape} to {(video_height, video_width)}"
@@ -217,7 +219,7 @@ class Sam2VideoLiveSession:
         elif hasattr(images, "images"):
             images.images.append(tensor)
             if hasattr(images, "img_paths"):
-                images.img_paths.append(str(self._tmp_root / "latest.jpg"))
+                images.img_paths.append(f"live-frame-{self.frame_idx + 1}.jpg")
         else:
             images.append(tensor)
         self.inference_state["num_frames"] += 1

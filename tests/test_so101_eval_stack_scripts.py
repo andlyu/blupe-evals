@@ -54,6 +54,7 @@ def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
     assert 'SO101_SUCCESS_SAM3_MIN_SCORE="${SO101_SUCCESS_SAM3_MIN_SCORE:-0.25}"' in START_SCRIPT
     assert 'SO101_SUCCESS_BALL_SAM3_PROMPT="${SO101_SUCCESS_BALL_SAM3_PROMPT:-blue rubber ball}"' in START_SCRIPT
     assert 'SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES="${SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES:-3}"' in START_SCRIPT
+    assert 'SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES="${SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES:-2}"' in START_SCRIPT
 
 
 def test_stop_script_stops_motion_local_processes_tunnels_and_remote_services() -> None:
@@ -89,6 +90,7 @@ def test_stack_env_example_documents_mutable_vast_config() -> None:
     assert "MOLMOACT2_NORM_TAG=so100_so101_molmoact2" in ENV_EXAMPLE
     assert "SO101_SAM3_READY_PATH=/" in ENV_EXAMPLE
     assert "SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=3" in ENV_EXAMPLE
+    assert "SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2" in ENV_EXAMPLE
     assert "SO101_STOP_REMOTE_SERVICES=1" in ENV_EXAMPLE
 
 

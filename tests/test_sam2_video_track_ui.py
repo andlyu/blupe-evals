@@ -49,3 +49,11 @@ def test_video_tracker_defaults_to_tiny_model() -> None:
     sam2_video_track_ui = _load_sam2_video_track_ui()
 
     assert sam2_video_track_ui.DEFAULT_MODEL_ID == "facebook/sam2-hiera-tiny"
+
+
+def test_video_tracker_appends_live_frames_without_temp_jpeg_roundtrip() -> None:
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "sam2_video_track_ui.py").read_text()
+
+    assert "live-frame-" in source
+    assert "latest.jpg" not in source
+    assert "_load_img_as_tensor" not in source
