@@ -19,9 +19,10 @@ import time
 import urllib.request
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
 import cv2
@@ -54,12 +55,30 @@ DEFAULT_POLICY_CAMERA_NAMES = tuple(
     for name in os.environ.get("SO101_POLICY_CAMERAS", "front,side").split(",")
     if name.strip()
 )
+DEFAULT_RECORD_CAMERA_NAMES = tuple(
+    name.strip()
+    for name in os.environ.get("SO101_RECORD_CAMERAS", "front,wrist,side").split(",")
+    if name.strip()
+)
+REQUIRED_RECORD_CAMERA_NAMES = tuple(
+    name.strip()
+    for name in os.environ.get("SO101_REQUIRED_RECORD_CAMERAS", "front,wrist").split(",")
+    if name.strip()
+)
 DEFAULT_INSTRUCTION = "Move to light blue ball, grab it, and move it to the tall black cylinder"
 DEFAULT_DURATION_S = 300.0
 DEFAULT_EXEC_STEPS = 30
 DEFAULT_MAX_STEP_DEG = 1.0
 POLICY_HARD_MAX_STEP_DEG = float(os.environ.get("SO101_POLICY_HARD_MAX_STEP_DEG", "2.0"))
-DEFAULT_HZ = 30.0
+DEFAULT_REALTIME_CHUNKING = os.environ.get("SO101_POLICY_REALTIME_CHUNKING", "0").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+REALTIME_QUERY_FRACTION = float(os.environ.get("SO101_POLICY_REALTIME_QUERY_FRACTION", "0.5"))
+REALTIME_QUERY_WAIT_LOG_THRESHOLD_S = 0.05
+DEFAULT_HZ = float(os.environ.get("SO101_POLICY_HZ", "30"))
 MOLMO_TIMEOUT_S = 75.0
 RECORD_ROOT = REPO_ROOT / "episodes"
 RAW_RECORD_ROOT = REPO_ROOT / "recordings"
@@ -98,10 +117,31 @@ SUCCESS_CUP_MAX_MASK_AREA_MULT = 4.5
 SUCCESS_CONTAINER_SAM3_URL = os.environ.get("SO101_SUCCESS_SAM3_URL", "http://127.0.0.1:8213/api/detect_image")
 SUCCESS_CONTAINER_SAM3_PROMPT = os.environ.get(
     "SO101_SUCCESS_SAM3_PROMPT",
-    "black cylinder along with the insides",
+    "black container",
 )
 SUCCESS_CONTAINER_SAM3_MIN_SCORE = float(os.environ.get("SO101_SUCCESS_SAM3_MIN_SCORE", "0.15"))
 SUCCESS_CONTAINER_SAM3_TIMEOUT_S = float(os.environ.get("SO101_SUCCESS_SAM3_TIMEOUT_S", "15"))
+SUCCESS_STRICT_SAM3_CUP = os.environ.get("SO101_SUCCESS_STRICT_SAM3_CUP", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+SUCCESS_CUP_MIN_EPISODE_IOU = float(os.environ.get("SO101_SUCCESS_CUP_MIN_EPISODE_IOU", "0.5"))
+SUCCESS_BALL_SAM3_PROMPT = os.environ.get("SO101_SUCCESS_BALL_SAM3_PROMPT", "blue rubber ball")
+SUCCESS_BALL_SAM3_MIN_SCORE = float(os.environ.get("SO101_SUCCESS_BALL_SAM3_MIN_SCORE", "0.25"))
+SUCCESS_BALL_SAM2_URL = os.environ.get("SO101_SUCCESS_BALL_SAM2_URL", "").strip()
+SUCCESS_BALL_SAM2_TIMEOUT_S = float(os.environ.get("SO101_SUCCESS_BALL_SAM2_TIMEOUT_S", "3"))
+SUCCESS_BALL_SAM2_RESIZE_MAX_SIDE = int(os.environ.get("SO101_SUCCESS_BALL_SAM2_RESIZE_MAX_SIDE", "384"))
+SUCCESS_BALL_SAM2_MULTIMASK_OUTPUT = os.environ.get("SO101_SUCCESS_BALL_SAM2_MULTIMASK_OUTPUT", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+SUCCESS_BALL_SAM2_EVERY_N_FRAMES = max(1, int(os.environ.get("SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES", "10")))
+SUCCESS_BALL_TRACK_SEARCH_PAD_PX = int(os.environ.get("SO101_SUCCESS_BALL_TRACK_SEARCH_PAD_PX", "80"))
+SUCCESS_BALL_TRACK_MAX_MISSING_FRAMES = int(os.environ.get("SO101_SUCCESS_BALL_TRACK_MAX_MISSING_FRAMES", "8"))
 DEFAULT_CUP_POLYGON = np.array(
     [
         [464, 288],
@@ -121,6 +161,16 @@ DEFAULT_CUP_POLYGON = np.array(
 
 
 DEFAULT_CAMERA_CONFIGS = default_camera_configs(SEMANTIC_CAMERA_NAMES)
+
+
+@dataclass
+class PolicyChunkQuery:
+    chunk_index: int
+    done: threading.Event
+    started_at: float
+    thread: threading.Thread | None = None
+    result: dict[str, Any] | None = None
+    error: BaseException | None = None
 
 
 POLICY_TO_ROBOT_JOINT_SIGNS = load_joint_array_env(
@@ -147,6 +197,16 @@ def policy_step_limit(requested_max_step_deg: float) -> tuple[float, bool]:
     if hard_cap <= 0:
         return requested, False
     return min(requested, hard_cap), requested > hard_cap
+
+
+def realtime_query_fraction(value: float | int | str | None) -> float:
+    try:
+        fraction = float(REALTIME_QUERY_FRACTION if value is None else value)
+    except (TypeError, ValueError):
+        fraction = REALTIME_QUERY_FRACTION
+    if not np.isfinite(fraction):
+        fraction = REALTIME_QUERY_FRACTION
+    return max(0.05, min(0.95, fraction))
 
 
 def robot_state_to_policy_state(state: np.ndarray) -> np.ndarray:
@@ -380,6 +440,12 @@ class LiveCupSuccessTracker:
         self.container_sam3_prompt = SUCCESS_CONTAINER_SAM3_PROMPT
         self.container_sam3_min_score = SUCCESS_CONTAINER_SAM3_MIN_SCORE
         self.container_sam3_timeout_s = SUCCESS_CONTAINER_SAM3_TIMEOUT_S
+        self.ball_sam3_url = SUCCESS_CONTAINER_SAM3_URL
+        self.ball_sam3_prompt = SUCCESS_BALL_SAM3_PROMPT
+        self.ball_sam3_min_score = SUCCESS_BALL_SAM3_MIN_SCORE
+        self.ball_sam3_timeout_s = SUCCESS_CONTAINER_SAM3_TIMEOUT_S
+        self.ball_sam2_url = SUCCESS_BALL_SAM2_URL
+        self.ball_sam2_timeout_s = SUCCESS_BALL_SAM2_TIMEOUT_S
         self.cup_mask: np.ndarray | None = None
         self.cup_mask_source = "pending"
         self.cup_mask_generation = 0
@@ -394,6 +460,31 @@ class LiveCupSuccessTracker:
         self.cup_mask_sam3_raw_score: float | None = None
         self.cup_mask_sam3_raw_area: int | None = None
         self.cup_mask_sam3_box_xyxy: list[float] | None = None
+        self.previous_cup_mask: np.ndarray | None = None
+        self.previous_cup_mask_source = ""
+        self.previous_cup_mask_area = 0
+        self.cup_mask_episode_iou: float | None = None
+        self.cup_mask_episode_iou_threshold = SUCCESS_CUP_MIN_EPISODE_IOU
+        self.ball_mask: np.ndarray | None = None
+        self.ball_mask_source = "pending"
+        self.ball_mask_generation = 0
+        self.ball_mask_box_xyxy: list[int] | None = None
+        self.ball_mask_calculated_at_frame: int | None = None
+        self.ball_mask_prompt = self.ball_sam3_prompt
+        self.ball_mask_score: float | None = None
+        self.ball_mask_min_score = self.ball_sam3_min_score
+        self.ball_mask_sam3_status = "not_run"
+        self.ball_mask_sam3_error = ""
+        self.ball_mask_sam3_raw_score: float | None = None
+        self.ball_mask_sam3_raw_area: int | None = None
+        self.ball_mask_sam3_box_xyxy: list[float] | None = None
+        self.ball_mask_sam2_status = "disabled" if not self.ball_sam2_url else "not_run"
+        self.ball_mask_sam2_error = ""
+        self.ball_mask_sam2_raw_score: float | None = None
+        self.ball_mask_sam2_raw_area: int | None = None
+        self.ball_mask_sam2_box_xyxy: list[float] | None = None
+        self.ball_track_hsv_median: np.ndarray | None = None
+        self.ball_track_missing_frames = 0
         self.reset()
 
     def configure_sam3(self, prompt: str | None = None, min_score: float | None = None) -> None:
@@ -422,14 +513,28 @@ class LiveCupSuccessTracker:
         self.last_event = "reset"
         if recalculate_container:
             self.invalidate_container_mask(container_reason)
+        self.invalidate_ball_mask(container_reason)
+        self.last_event = (
+            f"episode masks pending cup_gen={self.cup_mask_generation} "
+            f"ball_gen={self.ball_mask_generation}"
+        )
 
     def invalidate_container_mask(self, reason: str = "manual") -> None:
+        if (
+            self.cup_mask is not None
+            and self.cup_mask.any()
+            and str(self.cup_mask_source).startswith("sam3:")
+        ):
+            self.previous_cup_mask = self.cup_mask.copy()
+            self.previous_cup_mask_source = str(self.cup_mask_source)
+            self.previous_cup_mask_area = int(self.cup_mask.sum())
         self.cup_mask = None
         self.cup_mask_source = f"pending:{reason}"
         self.cup_mask_area = 0
         self.cup_mask_box_xyxy = None
         self.cup_mask_calculated_at_frame = None
         self.cup_mask_score = None
+        self.cup_mask_episode_iou = None
         self.cup_mask_sam3_status = f"pending:{reason}"
         self.cup_mask_sam3_error = ""
         self.cup_mask_sam3_raw_score = None
@@ -437,6 +542,27 @@ class LiveCupSuccessTracker:
         self.cup_mask_sam3_box_xyxy = None
         self.cup_mask_generation += 1
         self.last_event = f"container mask pending gen={self.cup_mask_generation}"
+
+    def invalidate_ball_mask(self, reason: str = "manual") -> None:
+        self.ball_mask = None
+        self.ball_mask_source = f"pending:{reason}"
+        self.ball_mask_box_xyxy = None
+        self.ball_mask_calculated_at_frame = None
+        self.ball_mask_score = None
+        self.ball_mask_sam3_status = f"pending:{reason}"
+        self.ball_mask_sam3_error = ""
+        self.ball_mask_sam3_raw_score = None
+        self.ball_mask_sam3_raw_area = None
+        self.ball_mask_sam3_box_xyxy = None
+        self.ball_mask_sam2_status = "disabled" if not self.ball_sam2_url else f"pending:{reason}"
+        self.ball_mask_sam2_error = ""
+        self.ball_mask_sam2_raw_score = None
+        self.ball_mask_sam2_raw_area = None
+        self.ball_mask_sam2_box_xyxy = None
+        self.ball_track_hsv_median = None
+        self.ball_track_missing_frames = 0
+        self.ball_mask_generation += 1
+        self.last_event = f"ball mask pending gen={self.ball_mask_generation}"
 
     def _default_cup_mask_for(self, shape: tuple[int, int, int]) -> np.ndarray:
         height, width = shape[:2]
@@ -451,9 +577,50 @@ class LiveCupSuccessTracker:
             return None
         return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
 
+    @staticmethod
+    def _mask_iou(a: np.ndarray, b: np.ndarray) -> float | None:
+        if a.shape != b.shape:
+            return None
+        a_bool = a.astype(bool)
+        b_bool = b.astype(bool)
+        union = int(np.logical_or(a_bool, b_bool).sum())
+        if union <= 0:
+            return None
+        return float(np.logical_and(a_bool, b_bool).sum() / union)
+
+    @staticmethod
+    def _mask_to_png_b64(mask: np.ndarray) -> str | None:
+        ok, encoded = cv2.imencode(".png", mask.astype(np.uint8) * 255)
+        if not ok:
+            return None
+        return base64.b64encode(encoded.tobytes()).decode("ascii")
+
+    @staticmethod
+    def _mask_from_png_b64(mask_b64: str, shape: tuple[int, int]) -> np.ndarray | None:
+        if "," in mask_b64:
+            mask_b64 = mask_b64.split(",", 1)[1]
+        try:
+            mask_bytes = base64.b64decode(mask_b64)
+        except Exception:
+            return None
+        mask_u8 = cv2.imdecode(np.frombuffer(mask_bytes, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        if mask_u8 is None:
+            return None
+        if mask_u8.shape != shape:
+            mask_u8 = cv2.resize(mask_u8, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+        return mask_u8 > 0
+
     def _set_sam3_mask_status(self, status: str, error: str = "") -> None:
         self.cup_mask_sam3_status = status
         self.cup_mask_sam3_error = error
+
+    def _set_ball_sam3_status(self, status: str, error: str = "") -> None:
+        self.ball_mask_sam3_status = status
+        self.ball_mask_sam3_error = error
+
+    def _set_ball_sam2_status(self, status: str, error: str = "") -> None:
+        self.ball_mask_sam2_status = status
+        self.ball_mask_sam2_error = error
 
     def _calculate_sam3_cup_mask(self, rgb: np.ndarray, default_area: int) -> tuple[np.ndarray, str] | None:
         if not self.container_sam3_url or not self.container_sam3_prompt:
@@ -534,6 +701,21 @@ class LiveCupSuccessTracker:
                     f"area={area} max={max_area} score={score:.3f}",
                 )
                 return None
+            if self.previous_cup_mask is not None and self.previous_cup_mask.any():
+                iou = self._mask_iou(mask_bool, self.previous_cup_mask)
+                self.cup_mask_episode_iou = iou
+                if iou is None:
+                    self._set_sam3_mask_status(
+                        "episode_iou_unavailable",
+                        f"previous_shape={self.previous_cup_mask.shape} current_shape={mask_bool.shape}",
+                    )
+                    return None
+                if iou < self.cup_mask_episode_iou_threshold:
+                    self._set_sam3_mask_status(
+                        "episode_iou_too_low",
+                        f"iou={iou:.3f} min={self.cup_mask_episode_iou_threshold:.3f} score={score:.3f}",
+                    )
+                    return None
 
             prompt = str(top.get("prompt") or self.container_sam3_prompt)
             self.cup_mask_prompt = prompt
@@ -594,6 +776,10 @@ class LiveCupSuccessTracker:
         sam3_result = self._calculate_sam3_cup_mask(rgb, default_area)
         if sam3_result is not None:
             return sam3_result
+        if SUCCESS_STRICT_SAM3_CUP:
+            empty = np.zeros(rgb.shape[:2], dtype=bool)
+            source = f"sam3_failed:{self.cup_mask_sam3_status}"
+            return empty, source
 
         height, width = rgb.shape[:2]
         x, y, w, h = cv2.boundingRect(self.cup_polygon.reshape(-1, 1, 2))
@@ -664,23 +850,245 @@ class LiveCupSuccessTracker:
             )
         return self.cup_mask
 
-    def _ball_mask(self, rgb: np.ndarray) -> np.ndarray:
+    def _calculate_sam3_ball_mask(self, rgb: np.ndarray) -> tuple[np.ndarray, str] | None:
+        if not self.ball_sam3_url or not self.ball_sam3_prompt:
+            self._set_ball_sam3_status("disabled")
+            return None
+        self._set_ball_sam3_status("requesting")
+        self.ball_mask_sam3_raw_score = None
+        self.ball_mask_sam3_raw_area = None
+        self.ball_mask_sam3_box_xyxy = None
+
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+        )
+        if not ok:
+            self._set_ball_sam3_status("encode_failed")
+            return None
+
+        payload = {
+            "image_b64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+            "prompts": [self.ball_sam3_prompt],
+            "max_masks": 1,
+            "min_score": self.ball_sam3_min_score,
+            "alpha": 0.65,
+        }
+        try:
+            resp = requests.post(
+                self.ball_sam3_url,
+                json=payload,
+                timeout=self.ball_sam3_timeout_s,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            top = data.get("top_mask") or {}
+            if not top:
+                self._set_ball_sam3_status("no_top_mask")
+                return None
+            score = float(top.get("score", 0.0))
+            self.ball_mask_sam3_raw_score = score
+            box = top.get("box_xyxy")
+            if isinstance(box, list):
+                self.ball_mask_sam3_box_xyxy = [float(x) for x in box]
+            if score < self.ball_sam3_min_score:
+                self._set_ball_sam3_status(
+                    "low_score",
+                    f"score={score:.3f} min={self.ball_sam3_min_score:.3f}",
+                )
+                return None
+
+            mask_b64 = top.get("mask_png_b64")
+            if not mask_b64:
+                self._set_ball_sam3_status("no_mask_payload", f"score={score:.3f}")
+                return None
+            if "," in mask_b64:
+                mask_b64 = mask_b64.split(",", 1)[1]
+            mask_bytes = base64.b64decode(mask_b64)
+            mask_u8 = cv2.imdecode(np.frombuffer(mask_bytes, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            if mask_u8 is None:
+                self._set_ball_sam3_status("mask_decode_failed", f"score={score:.3f}")
+                return None
+            if mask_u8.shape != rgb.shape[:2]:
+                mask_u8 = cv2.resize(mask_u8, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+            mask_bool = mask_u8 > 0
+            area = int(mask_bool.sum())
+            self.ball_mask_sam3_raw_area = area
+            if area < SUCCESS_MIN_BALL_AREA:
+                self._set_ball_sam3_status(
+                    "area_too_small",
+                    f"area={area} min={SUCCESS_MIN_BALL_AREA} score={score:.3f}",
+                )
+                return None
+            if area > SUCCESS_MAX_BALL_AREA:
+                self._set_ball_sam3_status(
+                    "area_too_large",
+                    f"area={area} max={SUCCESS_MAX_BALL_AREA} score={score:.3f}",
+                )
+                return None
+
+            prompt = str(top.get("prompt") or self.ball_sam3_prompt)
+            self.ball_mask_prompt = prompt
+            self.ball_mask_score = score
+            self._set_ball_sam3_status("accepted", f"area={area} score={score:.3f}")
+            return mask_bool, f"sam3:{prompt} score={score:.2f}"
+        except Exception as exc:
+            self._set_ball_sam3_status("request_failed", str(exc))
+            return None
+
+    def _update_ball_track_descriptor(self, rgb: np.ndarray, mask: np.ndarray) -> None:
+        if not mask.any():
+            return
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-        mask = cv2.inRange(hsv, SUCCESS_BLUE_LOWER_HSV, SUCCESS_BLUE_UPPER_HSV)
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        best_label = 0
-        best_area = 0
-        for label in range(1, count):
-            area = int(stats[label, cv2.CC_STAT_AREA])
-            if SUCCESS_MIN_BALL_AREA <= area <= SUCCESS_MAX_BALL_AREA and area > best_area:
-                best_area = area
-                best_label = label
-        if best_label == 0:
-            return np.zeros(mask.shape, dtype=bool)
-        return labels == best_label
+        values = hsv[mask]
+        if values.size == 0:
+            return
+        self.ball_track_hsv_median = np.median(values, axis=0).astype(np.float32)
+
+    def _calculate_sam2_ball_mask(self, rgb: np.ndarray) -> tuple[np.ndarray, str] | None:
+        if not self.ball_sam2_url:
+            self._set_ball_sam2_status("disabled")
+            return None
+        if self.ball_mask is None or not self.ball_mask.any():
+            self._set_ball_sam2_status("no_seed")
+            return None
+
+        box = self._mask_box(self.ball_mask)
+        if box is None:
+            self._set_ball_sam2_status("no_seed_box")
+            return None
+
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+        )
+        if not ok:
+            self._set_ball_sam2_status("encode_failed")
+            return None
+
+        mask_png_b64 = self._mask_to_png_b64(self.ball_mask)
+        if mask_png_b64 is None:
+            self._set_ball_sam2_status("seed_mask_encode_failed")
+            return None
+
+        self._set_ball_sam2_status("requesting")
+        self.ball_mask_sam2_error = ""
+        self.ball_mask_sam2_raw_score = None
+        self.ball_mask_sam2_raw_area = None
+        self.ball_mask_sam2_box_xyxy = None
+        payload = {
+            "image_b64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+            "box_xyxy": box,
+            "mask_png_b64": mask_png_b64,
+            "session_id": f"ball-{self.ball_mask_generation}",
+            "reset_session": not str(self.ball_mask_source).startswith("sam2:"),
+            "min_area": SUCCESS_MIN_BALL_AREA,
+            "max_area": SUCCESS_MAX_BALL_AREA,
+            "multimask_output": SUCCESS_BALL_SAM2_MULTIMASK_OUTPUT,
+            "resize_max_side": SUCCESS_BALL_SAM2_RESIZE_MAX_SIDE,
+            "alpha": 0.65,
+        }
+        try:
+            resp = requests.post(self.ball_sam2_url, json=payload, timeout=self.ball_sam2_timeout_s)
+            resp.raise_for_status()
+            data = resp.json()
+            top = data.get("top_mask") if isinstance(data, dict) else None
+            if not isinstance(top, dict):
+                top = data if isinstance(data, dict) else {}
+            if top.get("tracked") is False:
+                self._set_ball_sam2_status("not_tracked", str(top.get("error") or ""))
+                return None
+
+            score_value = top.get("score")
+            score = None if score_value is None else float(score_value)
+            self.ball_mask_sam2_raw_score = score
+            box_value = top.get("box_xyxy")
+            if isinstance(box_value, list):
+                self.ball_mask_sam2_box_xyxy = [float(x) for x in box_value]
+
+            mask_b64 = top.get("mask_png_b64")
+            if not mask_b64:
+                self._set_ball_sam2_status("no_mask_payload")
+                return None
+            mask_bool = self._mask_from_png_b64(str(mask_b64), rgb.shape[:2])
+            if mask_bool is None:
+                self._set_ball_sam2_status("mask_decode_failed")
+                return None
+
+            area = int(mask_bool.sum())
+            self.ball_mask_sam2_raw_area = area
+            if area < SUCCESS_MIN_BALL_AREA:
+                self._set_ball_sam2_status("area_too_small", f"area={area} min={SUCCESS_MIN_BALL_AREA}")
+                return None
+            if area > SUCCESS_MAX_BALL_AREA:
+                self._set_ball_sam2_status("area_too_large", f"area={area} max={SUCCESS_MAX_BALL_AREA}")
+                return None
+
+            self.ball_mask_score = score
+            score_suffix = "" if score is None else f" score={score:.2f}"
+            mode = str(data.get("mode") or top.get("source") or "box")
+            frame_value = top.get("frame_idx")
+            frame_suffix = "" if frame_value is None else f" frame={frame_value}"
+            self._set_ball_sam2_status("accepted", f"area={area}{score_suffix}{frame_suffix}")
+            if mode == "sam2_video" or str(top.get("source", "")).startswith("sam2_video"):
+                return mask_bool, f"sam2:video{score_suffix}"
+            return mask_bool, f"sam2:box{score_suffix}"
+        except Exception as exc:
+            self._set_ball_sam2_status("request_failed", str(exc))
+            return None
+
+    def _seed_ball_mask(self, rgb: np.ndarray) -> np.ndarray:
+        result = self._calculate_sam3_ball_mask(rgb)
+        if result is None:
+            self.ball_mask = np.zeros(rgb.shape[:2], dtype=bool)
+            self.ball_mask_source = f"sam3_failed:{self.ball_mask_sam3_status}"
+            self.ball_mask_box_xyxy = None
+            self.ball_mask_calculated_at_frame = self.frame_idx
+            self.ball_track_hsv_median = None
+            self._set_ball_sam2_status("no_sam3_seed")
+            return self.ball_mask
+
+        self.ball_mask, self.ball_mask_source = result
+        self.ball_mask_box_xyxy = self._mask_box(self.ball_mask)
+        self.ball_mask_calculated_at_frame = self.frame_idx
+        self.ball_track_missing_frames = 0
+        self._set_ball_sam2_status("seed_ready" if self.ball_sam2_url else "disabled")
+        return self.ball_mask
+
+    def _ball_mask(self, rgb: np.ndarray) -> np.ndarray:
+        if not self.ball_sam2_url:
+            self._set_ball_sam2_status("disabled")
+            return self._seed_ball_mask(rgb)
+
+        if self.ball_mask is None or self.ball_mask.shape != rgb.shape[:2] or not self.ball_mask.any():
+            return self._seed_ball_mask(rgb)
+
+        if (
+            str(self.ball_mask_source).startswith("sam2:")
+            and self.ball_mask_calculated_at_frame is not None
+            and self.frame_idx - self.ball_mask_calculated_at_frame < SUCCESS_BALL_SAM2_EVERY_N_FRAMES
+        ):
+            return self.ball_mask
+
+        result = self._calculate_sam2_ball_mask(rgb)
+        if result is None:
+            self.ball_track_missing_frames += 1
+            if self.ball_track_missing_frames >= SUCCESS_BALL_TRACK_MAX_MISSING_FRAMES:
+                return self._seed_ball_mask(rgb)
+            self.ball_mask_source = f"sam2_track_missing:{self.ball_mask_sam2_status}"
+            self.ball_mask_box_xyxy = None
+            return np.zeros(rgb.shape[:2], dtype=bool)
+
+        tracked, source = result
+        self.ball_mask = tracked
+        self.ball_mask_source = source
+        self.ball_mask_box_xyxy = self._mask_box(tracked)
+        self.ball_mask_calculated_at_frame = self.frame_idx
+        self.ball_track_missing_frames = 0
+        return tracked
 
     def update(self, rgb: np.ndarray) -> tuple[dict[str, Any], np.ndarray]:
         self.frame_idx += 1
@@ -822,6 +1230,28 @@ class LiveCupSuccessTracker:
             "container_mask_sam3_raw_score": self.cup_mask_sam3_raw_score,
             "container_mask_sam3_raw_area": self.cup_mask_sam3_raw_area,
             "container_mask_sam3_box_xyxy": self.cup_mask_sam3_box_xyxy,
+            "container_mask_episode_iou": self.cup_mask_episode_iou,
+            "container_mask_episode_iou_threshold": self.cup_mask_episode_iou_threshold,
+            "previous_container_mask_source": self.previous_cup_mask_source,
+            "previous_container_mask_area": self.previous_cup_mask_area,
+            "ball_mask_source": self.ball_mask_source,
+            "ball_mask_generation": self.ball_mask_generation,
+            "ball_mask_box_xyxy": self.ball_mask_box_xyxy,
+            "ball_mask_calculated_at_frame": self.ball_mask_calculated_at_frame,
+            "ball_mask_prompt": self.ball_mask_prompt,
+            "ball_mask_score": self.ball_mask_score,
+            "ball_mask_min_score": self.ball_mask_min_score,
+            "ball_mask_sam3_status": self.ball_mask_sam3_status,
+            "ball_mask_sam3_error": self.ball_mask_sam3_error,
+            "ball_mask_sam3_raw_score": self.ball_mask_sam3_raw_score,
+            "ball_mask_sam3_raw_area": self.ball_mask_sam3_raw_area,
+            "ball_mask_sam3_box_xyxy": self.ball_mask_sam3_box_xyxy,
+            "ball_mask_sam2_status": self.ball_mask_sam2_status,
+            "ball_mask_sam2_error": self.ball_mask_sam2_error,
+            "ball_mask_sam2_raw_score": self.ball_mask_sam2_raw_score,
+            "ball_mask_sam2_raw_area": self.ball_mask_sam2_raw_area,
+            "ball_mask_sam2_box_xyxy": self.ball_mask_sam2_box_xyxy,
+            "ball_track_missing_frames": self.ball_track_missing_frames,
         }
 
 
@@ -960,6 +1390,7 @@ class SO101Controller:
             "max_consecutive_failures": DEFAULT_EVAL_MAX_CONSECUTIVE_FAILURES,
             "allow_teleop": True,
             "record_episodes": True,
+            "record_interventions_only": False,
             "record_start_delay_s": DEFAULT_EVAL_RECORD_START_DELAY_S,
             "waiting_for_intervention": False,
             "current_attempt": None,
@@ -1067,6 +1498,97 @@ class SO101Controller:
             elif outcome == "failure":
                 counts["failure_count"] += 1
         return counts
+
+    def _uncompressed_success_episodes(self, root: Path) -> list[Path]:
+        if not root.exists():
+            return []
+        episodes: list[Path] = []
+        for path in sorted(root.iterdir(), key=lambda p: p.stat().st_mtime):
+            if not path.is_dir() or not (path / "episode_meta.json").exists():
+                continue
+            result = self._episode_json(path / "episode_result.json")
+            meta = self._episode_json(path / "episode_meta.json")
+            outcome = str(result.get("outcome") or meta.get("outcome") or "")
+            if outcome != "success":
+                continue
+            if result.get("compressed_dataset") or meta.get("compressed_dataset"):
+                continue
+            episodes.append(path)
+        return episodes
+
+    @staticmethod
+    def _episode_camera_frame_count(episode_dir: Path, camera: str) -> int:
+        cam_dir = episode_dir / camera
+        if not cam_dir.exists():
+            return 0
+        total = 0
+        for pattern in ("frame_*.jpg", "frame_*.jpeg", "frame_*.png"):
+            total += sum(1 for _ in cam_dir.glob(pattern))
+        return total
+
+    @staticmethod
+    def _ordered_camera_names(cameras: Iterable[str]) -> list[str]:
+        seen = {str(camera).strip() for camera in cameras if str(camera).strip()}
+        ordered: list[str] = []
+        for camera in (*SEMANTIC_CAMERA_NAMES, *DEFAULT_RECORD_CAMERA_NAMES):
+            if camera in seen and camera not in ordered:
+                ordered.append(camera)
+        for camera in sorted(seen):
+            if camera not in ordered:
+                ordered.append(camera)
+        return ordered
+
+    @staticmethod
+    def _lerobot_dataset_cameras(root: Path) -> list[str]:
+        try:
+            info = json.loads((root / "meta" / "info.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+        features = info.get("features")
+        if not isinstance(features, dict):
+            return []
+        prefix = "observation.images."
+        return SO101Controller._ordered_camera_names(
+            key[len(prefix) :]
+            for key, value in features.items()
+            if key.startswith(prefix) and isinstance(value, dict) and value.get("dtype") == "video"
+        )
+
+    def resolve_record_export_cameras(
+        self,
+        *,
+        dataset_name: str = "",
+        root: str = "",
+        episodes_root_name: str = "",
+    ) -> list[str]:
+        root_path = Path(root) if root.strip() else None
+        if root_path is None and dataset_name.strip():
+            root_path = REPO_ROOT / "datasets" / "lerobot" / _safe_dataset_name(dataset_name)
+        if root_path is not None and root_path.exists():
+            existing = self._lerobot_dataset_cameras(root_path)
+            if existing:
+                return existing
+
+        required = [name for name in REQUIRED_RECORD_CAMERA_NAMES if name in DEFAULT_RECORD_CAMERA_NAMES]
+        if not required:
+            required = [name for name in DEFAULT_RECORD_CAMERA_NAMES if name in {"front", "wrist"}]
+        if not required:
+            required = list(DEFAULT_RECORD_CAMERA_NAMES)
+
+        episodes_root = RECORD_ROOT / _safe_dataset_name(episodes_root_name) if episodes_root_name.strip() else RECORD_ROOT
+        episodes = self._uncompressed_success_episodes(episodes_root)
+        required_usable = [
+            episode
+            for episode in episodes
+            if all(self._episode_camera_frame_count(episode, camera) > 0 for camera in required)
+        ]
+        cameras = list(required)
+        for camera in DEFAULT_RECORD_CAMERA_NAMES:
+            if camera in cameras:
+                continue
+            if required_usable and all(self._episode_camera_frame_count(episode, camera) > 0 for episode in required_usable):
+                cameras.append(camera)
+        return self._ordered_camera_names(cameras)
 
     def _dataset_snapshot_locked(self) -> dict[str, Any]:
         data = dict(self.dataset_status)
@@ -1556,7 +2078,9 @@ class SO101Controller:
             exec_steps=int(config.get("exec_steps", DEFAULT_EXEC_STEPS)),
             max_step_deg=float(config.get("max_step_deg", DEFAULT_MAX_STEP_DEG)),
             hz=float(config.get("hz", DEFAULT_HZ)),
-            from_eval=False,
+            realtime_chunking=bool(config.get("realtime_chunking", DEFAULT_REALTIME_CHUNKING)),
+            realtime_query_fraction_value=config.get("realtime_query_fraction", REALTIME_QUERY_FRACTION),
+            from_eval=bool(config.get("from_eval", False)),
             success_container_reason="policy_resume_after_intervention",
         )
         return True
@@ -1586,12 +2110,17 @@ class SO101Controller:
             policy_running = self._motion_running() and self.mode == "policy"
             if not policy_running and not self.eval_status.get("running"):
                 return self._intervention_snapshot_locked()
-            if policy_running and not self.eval_status.get("running"):
+            intervention_episode_mode = bool(
+                self.eval_status.get("running")
+                and self.eval_config.get("record_interventions_only")
+                and self.eval_config.get("record_episodes", True)
+            )
+            if policy_running and (not self.eval_status.get("running") or intervention_episode_mode):
                 config = dict(self.active_policy_config or {})
                 duration_s = float(config.get("duration_s", DEFAULT_DURATION_S))
                 if self.started_at is not None:
                     duration_s = max(1.0, duration_s - max(0.0, now - self.started_at))
-                config.update({"duration_s": duration_s})
+                config.update({"duration_s": duration_s, "from_eval": bool(self.eval_status.get("running"))})
                 self.paused_policy_config = config
                 self.policy_pause_requested = True
                 should_pause_policy = True
@@ -1733,12 +2262,20 @@ class SO101Controller:
                     "stop_reason": reason,
                 }
             )
-        restarted_recording_dir = self._restart_recording_for_intervention(
-            intervention_id=intervention_id,
-            operator=operator,
-            reason=reason,
-            started_at=started_at,
-        )
+        if self._record_interventions_only_enabled():
+            restarted_recording_dir = self._start_intervention_only_recording(
+                intervention_id=intervention_id,
+                operator=operator,
+                reason=reason,
+                started_at=started_at,
+            )
+        else:
+            restarted_recording_dir = self._restart_recording_for_intervention(
+                intervention_id=intervention_id,
+                operator=operator,
+                reason=reason,
+                started_at=started_at,
+            )
         self.intervention_stop_event.clear()
         self.intervention_thread = threading.Thread(
             target=self._leader_delta_intervention_loop,
@@ -1824,6 +2361,16 @@ class SO101Controller:
                         "error": error,
                     }
                 )
+                record_interventions_only = bool(
+                    self.eval_config.get("record_interventions_only")
+                    and self.eval_config.get("record_episodes", True)
+                )
+                intervention_recording_dir = self.intervention_status.get("recording_dir")
+                intervention_attempt = int(
+                    self.intervention_status.get("attempt")
+                    or self.eval_status.get("interventions")
+                    or 0
+                )
                 if self.eval_status.get("state") == "intervention_active":
                     self.eval_status.update(
                         {
@@ -1835,23 +2382,53 @@ class SO101Controller:
                     )
             self.set_stage("idle")
             self.set_mode("idle")
-            self._append_eval_event(
-                {
-                    "type": "intervention_end",
-                    "id": intervention_id,
-                    "operator": operator,
-                    "reason": reason,
-                    "outcome": state,
-                    "at": completed_at,
-                    "started_at": started_at,
-                    "duration_s": duration_s,
-                    "samples": samples,
-                    "error": error,
-                    "recording_dir": None if self.record_dir is None else str(self.record_dir),
-                }
-            )
+            policy_resumed = False
+            end_event = {
+                "type": "intervention",
+                "id": intervention_id,
+                "operator": operator,
+                "reason": reason,
+                "outcome": "intervention" if state == "complete" else "failure",
+                "at": completed_at,
+                "started_at": started_at,
+                "duration_s": duration_s,
+                "samples": samples,
+                "error": error,
+                "record_interventions_only": record_interventions_only,
+                "recording_dir": str(intervention_recording_dir or self.record_dir or ""),
+            }
+            if record_interventions_only and intervention_recording_dir:
+                if self._recording_running():
+                    self.stop_recording()
+                if state == "complete" and not stopped_by_request:
+                    policy_resumed = self._resume_paused_policy()
+                final_recording_dir = self._finalize_recorded_episode(
+                    Path(str(intervention_recording_dir)),
+                    outcome="intervention" if state == "complete" else "failure",
+                    reason=reason if state == "complete" else error or reason,
+                    attempt=max(1, intervention_attempt),
+                    started_at=started_at,
+                    ended_at=completed_at,
+                    duration_s=duration_s,
+                    event=end_event,
+                )
+                if final_recording_dir:
+                    end_event["recording_dir"] = final_recording_dir
+                    end_event["recording_final_dir"] = final_recording_dir
+                with self.status_lock:
+                    self.eval_status.update(
+                        {
+                            "state": "intervention_complete",
+                            "waiting_for_intervention": False,
+                            "current_attempt": None,
+                            "last_attempt": dict(end_event),
+                            "recording_dir": end_event.get("recording_dir"),
+                            "stop_reason": "",
+                        }
+                    )
+            self._append_eval_event(end_event)
             self.log(f"intervention {state} id={intervention_id} duration={duration_s}s samples={samples}")
-            if state == "complete" and not stopped_by_request:
+            if state == "complete" and not stopped_by_request and not policy_resumed:
                 self._resume_paused_policy()
 
     def read_state(self, retries: int = 4) -> np.ndarray:
@@ -1989,6 +2566,7 @@ class SO101Controller:
                 "last_query_s": self.last_query_s,
                 "policy_url": self.molmo_url,
                 "policy_cameras": list(self.policy_camera_names),
+                "policy_config": dict(self.active_policy_config or {}),
                 "log_path": "/tmp/so101_web_intervene.log",
                 "running": self.policy_thread is not None and self.policy_thread.is_alive(),
                 "elapsed": None if self.started_at is None else round(time.monotonic() - self.started_at, 1),
@@ -2095,6 +2673,41 @@ class SO101Controller:
             f"{status.get('container_mask_prompt')!r} min_score={status.get('container_mask_min_score')}"
         )
         return dict(status)
+
+    def rerun_success_sam3(self, camera: Any = "front", prompt: str | None = None, min_score: float | None = None) -> dict[str, Any]:
+        if self._motion_running() or self._eval_running():
+            raise RuntimeError("Rerun SAM3 only works while idle; stop MolmoAct/eval first")
+        cam = self._camera_from_spec(camera)
+        rgb = self.read_camera_frame(cam, timeout_s=5.0)
+        with self.success_tracker_lock:
+            if prompt is not None or min_score is not None:
+                self.success_tracker.configure_sam3(prompt=prompt, min_score=min_score)
+            self.success_tracker.reset(
+                recalculate_container=True,
+                container_reason="manual_sam3_rerun",
+            )
+            status, overlay = self.success_tracker.update(rgb)
+        with self.status_lock:
+            self.success_status = status
+            self.success_error = ""
+        self._set_success_overlay(overlay)
+        self.log(
+            "success SAM3 rerun "
+            f"camera={cam.name} cup={status.get('container_mask_sam3_status')} "
+            f"ball={status.get('ball_mask_sam3_status')}"
+        )
+        self.start_success_preview_tracking()
+        return dict(status)
+
+    def start_success_preview_tracking(self) -> None:
+        if not self.success_enabled:
+            return
+        if self.success_thread is not None and self.success_thread.is_alive():
+            return
+        self.success_stop_event.clear()
+        self.success_thread = threading.Thread(target=self._success_loop, daemon=True)
+        self.success_thread.start()
+        self.log("success tracker preview start")
 
     def preview_success_sam3(self, prompt: str, min_score: float, camera: Any = "front") -> dict[str, Any]:
         prompt = prompt.strip()
@@ -2585,7 +3198,7 @@ class SO101Controller:
         )
         return {"dir": str(out_dir), "cameras": camera_names, "capture_mode": capture_mode, "meta_file": meta_file}
 
-    def stop_recording(self) -> None:
+    def stop_recording(self, *, stop_policy: bool = False) -> None:
         self.record_rollover_cancel_event.set()
         with self.status_lock:
             was_rollover = self.record_rollover_active
@@ -2596,6 +3209,8 @@ class SO101Controller:
         if self._recording_running():
             self.record_stop_event.set()
             self.log("recording stop requested")
+        if stop_policy:
+            self.stop_policy()
 
     def _mark_recording_restarted_for_intervention(
         self,
@@ -2628,6 +3243,99 @@ class SO101Controller:
             meta_path.write_text(json.dumps(meta, indent=2) + "\n")
         except BaseException as exc:
             self.log(f"intervention restart meta update failed out={old_dir}: {exc}")
+
+    def _record_interventions_only_enabled(self) -> bool:
+        with self.status_lock:
+            return bool(
+                self.eval_status.get("running")
+                and self.eval_config.get("record_episodes", True)
+                and self.eval_config.get("record_interventions_only")
+            )
+
+    def _start_intervention_only_recording(
+        self,
+        *,
+        intervention_id: str,
+        operator: str,
+        reason: str,
+        started_at: str,
+    ) -> str | None:
+        with self.status_lock:
+            if not (
+                self.eval_status.get("running")
+                and self.eval_config.get("record_episodes", True)
+                and self.eval_config.get("record_interventions_only")
+            ):
+                return None
+            if self._recording_running():
+                return None if self.record_dir is None else str(self.record_dir)
+            config = dict(self.eval_config)
+            summary_path = self.eval_summary_path
+            attempt = int(self.eval_status.get("interventions") or 0) + 1
+
+        dataset_name = str(config.get("dataset_name") or "").strip()
+        dataset_slug = str(config.get("dataset_slug") or "").strip()
+        if not dataset_slug and dataset_name:
+            dataset_slug = _safe_dataset_name(dataset_name, fallback="so101-eval")
+        summary_dir = summary_path.parent if summary_path is not None else RECORD_ROOT / (dataset_slug or "so101-interventions")
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        fps = float(config.get("record_fps") or DEFAULT_EVAL_RECORD_FPS)
+        cameras = [name for name in DEFAULT_RECORD_CAMERA_NAMES if name in self.cameras_by_name]
+        recording = self.start_recording(
+            duration_s=max(1.0, float(INTERVENTION_DURATION_S) + 1.0),
+            fps=fps,
+            cameras=cameras,
+            task=str(config.get("instruction") or DEFAULT_INSTRUCTION),
+            name_prefix=f"so101_intervention_run{attempt:04d}",
+            root_dir=summary_dir,
+            extra_meta={
+                "dataset_name": dataset_name,
+                "dataset_slug": dataset_slug,
+                "episodes_root": str(summary_dir),
+                "eval_attempt": attempt,
+                "eval_run": attempt,
+                "record_started_at": started_at,
+                "record_start_trigger": "intervention_only",
+                "record_interventions_only": True,
+                "record_only_policy_execute": True,
+                "episode_kind": "intervention",
+                "had_intervention": True,
+                "intervention_id": intervention_id,
+                "intervention_operator": operator,
+                "intervention_reason": reason,
+                "intervention_started_at": started_at,
+                "control_sources_expected": ["leader_delta"],
+                "eval_summary_path": "" if summary_path is None else str(summary_path),
+                "expected_outcomes": ["intervention"],
+            },
+        )
+        recording_dir = str(recording["dir"])
+        current_attempt = {
+            "attempt": attempt,
+            "run": attempt,
+            "started_at": started_at,
+            "outcome": "running",
+            "reason": reason,
+            "episode_kind": "intervention",
+            "record_interventions_only": True,
+            "recording_dir": recording_dir,
+            "recording_pending": False,
+            "intervention_id": intervention_id,
+            "operator": operator,
+        }
+        with self.status_lock:
+            self.intervention_status.update({"recording_dir": recording_dir, "attempt": attempt})
+            self.eval_status.update(
+                {
+                    "state": "intervention_active",
+                    "interventions": attempt,
+                    "current_attempt": dict(current_attempt),
+                    "recording_dir": recording_dir,
+                    "record_interventions_only": True,
+                }
+            )
+        self.log(f"intervention-only recording start id={intervention_id} out={recording_dir}")
+        return recording_dir
 
     def _restart_recording_for_intervention(
         self,
@@ -2994,13 +3702,18 @@ class SO101Controller:
         exec_steps: int,
         max_step_deg: float,
         hz: float,
+        realtime_chunking: bool | None = None,
+        realtime_query_fraction_value: float | int | str | None = None,
         allow_teleop: bool = True,
         record_episodes: bool = True,
+        record_interventions_only: bool = False,
         dataset_name: str = "",
     ) -> None:
         if self._eval_running():
             raise RuntimeError("continuous eval is already running")
-        if self._motion_running():
+        record_interventions_only = bool(record_interventions_only)
+        attach_existing_policy = bool(record_interventions_only and self._motion_running() and self.mode == "policy")
+        if self._motion_running() and not attach_existing_policy:
             raise RuntimeError("motion is already running")
         self._raise_if_teleop_active()
         if run_duration_s <= 0:
@@ -3013,6 +3726,8 @@ class SO101Controller:
             raise ValueError("eval record fps must be positive")
 
         instruction = instruction.strip() or DEFAULT_INSTRUCTION
+        realtime_enabled = bool(DEFAULT_REALTIME_CHUNKING if realtime_chunking is None else realtime_chunking)
+        query_fraction = realtime_query_fraction(realtime_query_fraction_value)
         dataset_name = dataset_name.strip()
         dataset_slug = _safe_dataset_name(dataset_name, fallback="so101-eval") if dataset_name else ""
         now = time.monotonic()
@@ -3029,8 +3744,12 @@ class SO101Controller:
             "exec_steps": int(exec_steps),
             "max_step_deg": float(max_step_deg),
             "hz": float(hz),
+            "realtime_chunking": realtime_enabled,
+            "realtime_query_fraction": query_fraction,
             "allow_teleop": bool(allow_teleop),
             "record_episodes": bool(record_episodes),
+            "record_interventions_only": record_interventions_only,
+            "attach_existing_policy": attach_existing_policy,
         }
         with self.status_lock:
             self.eval_history = []
@@ -3055,6 +3774,7 @@ class SO101Controller:
                     "max_consecutive_failures": int(max_consecutive_failures),
                     "allow_teleop": bool(allow_teleop),
                     "record_episodes": bool(record_episodes),
+                    "record_interventions_only": record_interventions_only,
                     "record_start_delay_s": DEFAULT_EVAL_RECORD_START_DELAY_S,
                 }
             )
@@ -3070,8 +3790,11 @@ class SO101Controller:
                 int(exec_steps),
                 float(max_step_deg),
                 float(hz),
+                realtime_enabled,
+                query_fraction,
                 bool(allow_teleop),
                 bool(record_episodes),
+                record_interventions_only,
                 dataset_name,
                 False,
             ),
@@ -3081,7 +3804,10 @@ class SO101Controller:
         self.log(
             f"eval start run={run_duration_s}s no_success_timeout={attempt_duration_s}s "
             f"max_failures={max_consecutive_failures} record_fps={record_fps} "
-            f"allow_teleop={allow_teleop} record_episodes={record_episodes} dataset={dataset_name!r}"
+            f"allow_teleop={allow_teleop} record_episodes={record_episodes} "
+            f"record_interventions_only={record_interventions_only} "
+            f"realtime_chunking={realtime_enabled} query_fraction={query_fraction:.2f} "
+            f"dataset={dataset_name!r}"
         )
 
     def resume_eval(self) -> None:
@@ -3143,8 +3869,11 @@ class SO101Controller:
                 int(config.get("exec_steps", DEFAULT_EXEC_STEPS)),
                 float(config.get("max_step_deg", DEFAULT_MAX_STEP_DEG)),
                 float(config.get("hz", DEFAULT_HZ)),
+                bool(config.get("realtime_chunking", DEFAULT_REALTIME_CHUNKING)),
+                realtime_query_fraction(config.get("realtime_query_fraction", REALTIME_QUERY_FRACTION)),
                 bool(config.get("allow_teleop", True)),
                 bool(config.get("record_episodes", True)),
+                bool(config.get("record_interventions_only", False)),
                 str(config.get("dataset_name", "")),
                 True,
             ),
@@ -3160,7 +3889,10 @@ class SO101Controller:
                 self.eval_status.update({"state": "stopping", "stop_reason": "user_stop"})
             elif self.eval_status.get("state") not in {"idle", "stopped", "complete", "waiting_intervention"}:
                 self.eval_status.update({"state": "stopped", "stop_reason": "user_stop"})
-        self.stop_policy()
+        if self._intervention_active_or_requested():
+            self.stop_intervention_control(outcome="user_stop", resume_policy=False)
+        else:
+            self.stop_policy()
         self.stop_success_tracking(join=False)
         self.stop_recording()
         self.log("eval stop requested; policy, tracker, and recording stop signaled")
@@ -3251,6 +3983,9 @@ class SO101Controller:
         private: bool = False,
         include_failures: bool = False,
         overwrite: bool = False,
+        append: bool = False,
+        cameras: list[str] | None = None,
+        skip_unusable: bool = False,
     ) -> dict[str, Any]:
         if self._dataset_running():
             raise RuntimeError("dataset compression is already running")
@@ -3285,6 +4020,14 @@ class SO101Controller:
             cmd.append("--include-failures")
         if overwrite:
             cmd.append("--overwrite")
+        if append:
+            cmd.append("--append")
+        for camera in cameras or []:
+            camera = str(camera).strip()
+            if camera:
+                cmd.extend(["--camera", camera])
+        if skip_unusable:
+            cmd.append("--skip-unusable")
 
         with self.status_lock:
             self.dataset_status = self._new_dataset_status()
@@ -3299,6 +4042,9 @@ class SO101Controller:
                     "upload": bool(upload),
                     "private": bool(private),
                     "overwrite": bool(overwrite),
+                    "append": bool(append),
+                    "cameras": list(cameras or []),
+                    "skip_unusable": bool(skip_unusable),
                     **counts,
                 }
             )
@@ -3307,6 +4053,48 @@ class SO101Controller:
         self.dataset_thread.start()
         self.log(f"dataset compression start upload={upload} repo_id={repo_id or 'auto'}")
         return self.status().get("dataset", {})
+
+    def export_recorded_dataset(
+        self,
+        *,
+        dataset_name: str = "",
+        upload: bool = False,
+        private: bool = False,
+    ) -> dict[str, Any]:
+        with self.status_lock:
+            record_dir = self.record_dir
+        meta: dict[str, Any] = {}
+        if record_dir is not None:
+            meta_path = record_dir / "episode_meta.json"
+            if not meta_path.exists():
+                meta_path = record_dir / "session_meta.json"
+            meta = self._episode_json(meta_path)
+
+        dataset_name = (dataset_name or str(meta.get("dataset_name") or "")).strip()
+        episodes_root_name = str(meta.get("dataset_slug") or "").strip()
+        if not episodes_root_name and record_dir is not None and record_dir.parent != RECORD_ROOT:
+            episodes_root_name = record_dir.parent.name
+        if not dataset_name:
+            dataset_name = episodes_root_name or "so101-ball-cup-eval"
+
+        try:
+            cameras = self.resolve_record_export_cameras(
+                dataset_name=dataset_name,
+                episodes_root_name=episodes_root_name,
+            )
+            dataset = self.start_dataset_compression(
+                dataset_name=dataset_name,
+                episodes_root_name=episodes_root_name,
+                upload=upload,
+                private=private,
+                append=True,
+                cameras=cameras,
+                skip_unusable=True,
+            )
+            return {"started": True, "dataset": dataset}
+        except RuntimeError as exc:
+            self.log(f"dataset auto export skipped: {exc}")
+            return {"started": False, "error": str(exc), "dataset": self.status().get("dataset", {})}
 
     def _dataset_compress_loop(self, cmd: list[str]) -> None:
         output: deque[str] = deque(maxlen=80)
@@ -3416,11 +4204,15 @@ class SO101Controller:
         exec_steps: int,
         max_step_deg: float,
         hz: float,
+        realtime_chunking: bool,
+        realtime_query_fraction_value: float,
         allow_teleop: bool = True,
         record_episodes: bool = True,
+        record_interventions_only: bool = False,
         dataset_name: str = "",
         resume: bool = False,
     ) -> None:
+        record_interventions_only = bool(record_interventions_only)
         end_t = time.monotonic() + run_duration_s
         stop_reason = "complete"
         waiting_for_intervention = False
@@ -3482,6 +4274,7 @@ class SO101Controller:
                         "summary_path": str(summary_path),
                         "allow_teleop": bool(allow_teleop),
                         "record_episodes": bool(record_episodes),
+                        "record_interventions_only": record_interventions_only,
                         "record_start_delay_s": record_start_delay_s,
                         "episode_root": str(summary_dir),
                     }
@@ -3492,7 +4285,7 @@ class SO101Controller:
                 remaining_s = end_t - time.monotonic()
                 if remaining_s < 1.0:
                     break
-                if record_episodes and remaining_s < attempt_duration_s:
+                if record_episodes and not record_interventions_only and remaining_s < attempt_duration_s:
                     stop_reason = "run_duration_complete"
                     break
 
@@ -3509,7 +4302,8 @@ class SO101Controller:
                     "outcome": "running",
                     "reason": "",
                     "successes": 0,
-                    "recording_pending": bool(record_episodes),
+                    "recording_pending": bool(record_episodes and not record_interventions_only),
+                    "record_interventions_only": record_interventions_only,
                     "record_start_delay_s": record_start_delay_s,
                 }
                 attempt_record_dir: Path | None = None
@@ -3524,7 +4318,7 @@ class SO101Controller:
                     nonlocal attempt_record_dir
                     nonlocal active_record_dir, active_record_run_num
                     nonlocal active_record_started_at, active_record_started_mono
-                    if not record_episodes or attempt_record_dir is not None:
+                    if record_interventions_only or not record_episodes or attempt_record_dir is not None:
                         return
                     now_mono = time.monotonic()
                     recording_started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -3540,7 +4334,7 @@ class SO101Controller:
                     recording = self.start_recording(
                         record_duration_s,
                         record_fps,
-                        [cam.name for cam in self.camera_configs],
+                        [name for name in DEFAULT_RECORD_CAMERA_NAMES if name in self.cameras_by_name],
                         task=instruction,
                         name_prefix=f"so101_{episode_kind}_run{run_num:04d}",
                         root_dir=summary_dir,
@@ -3607,15 +4401,23 @@ class SO101Controller:
 
                 success_status: dict[str, Any] | None = None
                 policy_duration_s = max(0.1, end_t - time.monotonic())
-                self.start_policy(
-                    instruction=instruction,
-                    duration_s=policy_duration_s,
-                    exec_steps=exec_steps,
-                    max_step_deg=max_step_deg,
-                    hz=hz,
-                    from_eval=True,
-                    success_container_reason=f"eval_run_{run_num}",
+                attach_existing_policy = bool(
+                    record_interventions_only and run_num == 1 and self._motion_running() and self.mode == "policy"
                 )
+                if attach_existing_policy:
+                    self.log(f"eval policy run {run_num} attached to existing policy")
+                else:
+                    self.start_policy(
+                        instruction=instruction,
+                        duration_s=policy_duration_s,
+                        exec_steps=exec_steps,
+                        max_step_deg=max_step_deg,
+                        hz=hz,
+                        realtime_chunking=realtime_chunking,
+                        realtime_query_fraction_value=realtime_query_fraction_value,
+                        from_eval=True,
+                        success_container_reason=f"eval_run_{run_num}",
+                    )
 
                 run_outcome = "running"
                 run_reason = ""
@@ -3624,8 +4426,20 @@ class SO101Controller:
                 last_tracker_success_count = 0
                 while not self.eval_stop_event.is_set():
                     now = time.monotonic()
+                    if record_interventions_only:
+                        with self.status_lock:
+                            intervention_active = bool(self.intervention_status.get("active"))
+                            intervention_requested = bool(self.intervention_status.get("requested"))
+                            interventions = int(self.eval_status.get("interventions") or interventions)
+                        if intervention_active or self._intervention_running():
+                            time.sleep(0.1)
+                            continue
+                        if intervention_requested and self._motion_running():
+                            time.sleep(0.1)
+                            continue
                     if (
                         record_episodes
+                        and not record_interventions_only
                         and attempt_record_dir is None
                         and now >= record_start_ready_mono
                         and self.mode == "policy"
@@ -3634,7 +4448,7 @@ class SO101Controller:
                         start_attempt_recording(trigger="policy_delay", episode_kind="policy")
                     success_status = self._current_success_status()
                     tracker_success_count = int(success_status.get("success_count") or 0)
-                    if tracker_success_count > last_tracker_success_count:
+                    if not record_interventions_only and tracker_success_count > last_tracker_success_count:
                         delta = tracker_success_count - last_tracker_success_count
                         last_tracker_success_count = tracker_success_count
                         segment_successes += delta
@@ -3695,7 +4509,7 @@ class SO101Controller:
                         self.stop_policy()
                         break
 
-                    if now >= watchdog_deadline:
+                    if not record_interventions_only and now >= watchdog_deadline:
                         failures += 1
                         consecutive_failures += 1
                         run_outcome = "failure"
@@ -3749,6 +4563,20 @@ class SO101Controller:
                             run_reason = "run_duration_complete"
                             break
                         if intervention_request is not None:
+                            if record_interventions_only:
+                                self._start_leader_delta_intervention(intervention_request)
+                                while not self.eval_stop_event.is_set():
+                                    with self.status_lock:
+                                        intervention_active = bool(
+                                            self.intervention_status.get("active")
+                                            or self.intervention_status.get("requested")
+                                        )
+                                        interventions = int(self.eval_status.get("interventions") or interventions)
+                                    if not intervention_active and not self._intervention_running():
+                                        break
+                                    time.sleep(0.1)
+                                time.sleep(0.2)
+                                continue
                             start_attempt_recording(
                                 trigger="intervention_start",
                                 episode_kind="intervention",
@@ -4079,6 +4907,8 @@ class SO101Controller:
         exec_steps: int,
         max_step_deg: float,
         hz: float,
+        realtime_chunking: bool | None = None,
+        realtime_query_fraction_value: float | int | str | None = None,
         from_eval: bool = False,
         success_container_reason: str = "policy_start",
     ) -> None:
@@ -4091,6 +4921,8 @@ class SO101Controller:
         if not from_eval:
             self._raise_if_teleop_active()
         instruction = instruction.strip() or DEFAULT_INSTRUCTION
+        realtime_enabled = bool(DEFAULT_REALTIME_CHUNKING if realtime_chunking is None else realtime_chunking)
+        query_fraction = realtime_query_fraction(realtime_query_fraction_value)
         self.stop_event.clear()
         self.start_success_tracking(container_reason=success_container_reason)
         with self.status_lock:
@@ -4102,6 +4934,10 @@ class SO101Controller:
                 "exec_steps": int(exec_steps),
                 "max_step_deg": float(max_step_deg),
                 "hz": float(hz),
+                "realtime_chunking": realtime_enabled,
+                "realtime_query_fraction": query_fraction,
+                "from_eval": bool(from_eval),
+                "success_container_reason": success_container_reason,
             }
             self.steps = 0
             self.chunks = 0
@@ -4110,10 +4946,111 @@ class SO101Controller:
             self.started_at = time.monotonic()
         self.policy_thread = threading.Thread(
             target=self._policy_loop,
-            args=(instruction, duration_s, exec_steps, max_step_deg, hz),
+            args=(instruction, duration_s, exec_steps, max_step_deg, hz, realtime_enabled, query_fraction),
             daemon=True,
         )
         self.policy_thread.start()
+
+    def _query_policy_chunk(
+        self,
+        chunk_index: int,
+        instruction: str,
+        *,
+        update_stage: bool,
+        realtime: bool = False,
+    ) -> dict[str, Any]:
+        captured_at = time.monotonic()
+        if update_stage:
+            self.set_stage("read_state")
+        measured = self.read_state()
+        policy_state = robot_state_to_policy_state(measured)
+        realtime_note = " realtime" if realtime else ""
+        self.log(
+            f"chunk {chunk_index}{realtime_note} capture start measured {_fmt(measured)} "
+            f"policy_state {_fmt(policy_state)}"
+        )
+        if update_stage:
+            self.set_stage("capture")
+        images: dict[str, np.ndarray] = {}
+        capture_times = []
+        for cam in self._policy_cameras():
+            t_cam = time.monotonic()
+            images[cam.name] = self.read_camera_frame(cam, timeout_s=5.0)
+            capture_times.append(time.monotonic() - t_cam)
+            self.log(f"chunk {chunk_index}{realtime_note} {cam.name} frame={capture_times[-1]:.2f}s")
+        t0 = time.monotonic()
+        if update_stage:
+            self.set_stage("query")
+        self.log(f"chunk {chunk_index}{realtime_note} query start timeout={MOLMO_TIMEOUT_S:.0f}s")
+        chunk = self.policy_client.act(
+            images=images,
+            state=policy_state,
+            instruction=instruction,
+            joints=JOINTS,
+        )
+        query_s = time.monotonic() - t0
+        with self.status_lock:
+            self.last_query_s = round(query_s, 3)
+        actions = np.asarray(chunk, dtype=np.float32).reshape(-1, len(JOINTS))
+        return {
+            "chunk_index": int(chunk_index),
+            "measured": measured,
+            "captured_at": captured_at,
+            "actions": actions,
+            "query_s": query_s,
+            "capture_s": sum(capture_times),
+            "realtime": bool(realtime),
+        }
+
+    def _start_policy_chunk_query(self, chunk_index: int, instruction: str) -> PolicyChunkQuery:
+        pending = PolicyChunkQuery(
+            chunk_index=int(chunk_index),
+            done=threading.Event(),
+            started_at=time.monotonic(),
+        )
+
+        def run() -> None:
+            try:
+                pending.result = self._query_policy_chunk(
+                    chunk_index,
+                    instruction,
+                    update_stage=False,
+                    realtime=True,
+                )
+            except BaseException as exc:
+                pending.error = exc
+            finally:
+                pending.done.set()
+
+        thread = threading.Thread(
+            target=run,
+            name=f"so101-policy-chunk-{chunk_index}",
+            daemon=True,
+        )
+        pending.thread = thread
+        thread.start()
+        self.log(f"chunk {chunk_index} realtime query dispatched")
+        return pending
+
+    def _await_policy_chunk_query(self, pending: PolicyChunkQuery) -> dict[str, Any] | None:
+        wait_start = time.monotonic()
+        if not pending.done.is_set():
+            self.set_stage("query_wait")
+            self.log(f"chunk {pending.chunk_index} realtime underrun; waiting for query")
+        while not self.stop_event.is_set():
+            if pending.done.wait(timeout=0.02):
+                break
+        wait_s = time.monotonic() - wait_start
+        if not pending.done.is_set():
+            self.log(f"chunk {pending.chunk_index} realtime query abandoned after stop")
+            return None
+        if pending.error is not None:
+            raise pending.error
+        if pending.result is None:
+            raise RuntimeError(f"chunk {pending.chunk_index} realtime query finished without a result")
+        if wait_s > REALTIME_QUERY_WAIT_LOG_THRESHOLD_S:
+            self.log(f"chunk {pending.chunk_index} realtime wait={wait_s:.2f}s")
+        return pending.result
 
     def _policy_loop(
         self,
@@ -4122,65 +5059,66 @@ class SO101Controller:
         exec_steps: int,
         max_step_deg: float,
         hz: float,
+        realtime_chunking: bool,
+        realtime_query_fraction_value: float,
     ) -> None:
         self.set_mode("policy")
         self.set_stage("starting")
         effective_max_step_deg, max_step_clamped = policy_step_limit(max_step_deg)
         clamp_note = f" clamped_to={effective_max_step_deg}" if max_step_clamped else ""
+        realtime_chunking = bool(realtime_chunking)
+        query_fraction = realtime_query_fraction(realtime_query_fraction_value)
         self.log(
             f"policy start duration={duration_s}s exec_steps={exec_steps} "
-            f"max_step={max_step_deg}{clamp_note} hz={hz} "
+            f"max_step={max_step_deg}{clamp_note} hz={hz} realtime_chunking={realtime_chunking} "
+            f"query_fraction={query_fraction:.2f} "
             f"policy_to_robot_signs={_fmt(POLICY_TO_ROBOT_JOINT_SIGNS)} "
             f"policy_to_robot_offsets={_fmt(POLICY_TO_ROBOT_JOINT_OFFSETS_DEG)} "
             f"instruction={instruction!r}"
         )
         start = time.monotonic()
         period = 1.0 / hz if hz > 0 else 0.0
+        pending_query: PolicyChunkQuery | None = None
+        next_chunk_index = 1
         try:
             while not self.stop_event.is_set() and time.monotonic() - start < duration_s:
-                next_chunk = self.chunks + 1
-                self.set_stage("read_state")
-                measured = self.read_state()
-                policy_state = robot_state_to_policy_state(measured)
-                self.log(
-                    f"chunk {next_chunk} capture start measured {_fmt(measured)} "
-                    f"policy_state {_fmt(policy_state)}"
-                )
-                self.set_stage("capture")
-                images: dict[str, np.ndarray] = {}
-                capture_times = []
-                for cam in self._policy_cameras():
-                    t_cam = time.monotonic()
-                    images[cam.name] = self.read_camera_frame(cam, timeout_s=5.0)
-                    capture_times.append(time.monotonic() - t_cam)
-                    self.log(f"chunk {next_chunk} {cam.name} frame={capture_times[-1]:.2f}s")
-                t0 = time.monotonic()
-                self.set_stage("query")
-                self.log(f"chunk {next_chunk} query start timeout={MOLMO_TIMEOUT_S:.0f}s")
-                chunk = self.policy_client.act(
-                    images=images,
-                    state=policy_state,
-                    instruction=instruction,
-                    joints=JOINTS,
-                )
-                query_s = time.monotonic() - t0
-                with self.status_lock:
-                    self.last_query_s = round(query_s, 3)
+                if pending_query is None:
+                    result = self._query_policy_chunk(next_chunk_index, instruction, update_stage=True)
+                else:
+                    result = self._await_policy_chunk_query(pending_query)
+                    pending_query = None
+                    if result is None:
+                        break
                 if self.stop_event.is_set():
-                    self.log(f"chunk {next_chunk} query returned after stop; dropping chunk query={query_s:.1f}s")
+                    self.log(
+                        f"chunk {result['chunk_index']} query returned after stop; "
+                        f"dropping chunk query={result['query_s']:.1f}s"
+                    )
                     break
-                chunk = np.asarray(chunk, dtype=np.float32).reshape(-1, len(JOINTS))
+                chunk = np.asarray(result["actions"], dtype=np.float32).reshape(-1, len(JOINTS))
+                captured_at = float(result.get("captured_at") or time.monotonic())
+                stale_s = max(0.0, time.monotonic() - captured_at)
+                stale_steps = int(round(stale_s * hz)) if result["realtime"] and hz > 0 else 0
+                skipped_steps = min(max(0, stale_steps), max(0, len(chunk) - 1))
+                if skipped_steps:
+                    self.log(
+                        f"chunk {result['chunk_index']} realtime stale={stale_s:.2f}s "
+                        f"skip_actions={skipped_steps}"
+                    )
+                    chunk = chunk[skipped_steps:]
                 n = min(max(exec_steps, 0), len(chunk))
                 with self.status_lock:
                     self.chunks += 1
                     chunk_num = self.chunks
                 self.log(
-                    f"chunk {chunk_num} query={query_s:.1f}s capture={sum(capture_times):.1f}s "
-                    f"shape={chunk.shape} executing={n}"
+                    f"chunk {chunk_num} query={result['query_s']:.1f}s capture={result['capture_s']:.1f}s "
+                    f"shape={chunk.shape} executing={n} realtime={result['realtime']} skipped={skipped_steps}"
                 )
-                cur_cmd = measured.copy()
+                cur_cmd = self.read_state()
                 executed = 0
-                last_measured = measured
+                last_measured = cur_cmd
+                next_chunk_index = int(result["chunk_index"]) + 1
+                dispatch_after_steps = 1 if skipped_steps else max(1, min(n, int(round(n * query_fraction))))
                 for k in range(n):
                     if self.stop_event.is_set() or time.monotonic() - start >= duration_s:
                         break
@@ -4201,6 +5139,15 @@ class SO101Controller:
                     executed += 1
                     last_measured = after
                     cur_cmd = target
+                    if (
+                        realtime_chunking
+                        and pending_query is None
+                        and executed >= dispatch_after_steps
+                        and k < n - 1
+                        and not self.stop_event.is_set()
+                        and time.monotonic() - start < duration_s
+                    ):
+                        pending_query = self._start_policy_chunk_query(next_chunk_index, instruction)
                     if period > 0:
                         time.sleep(period)
                 if executed:
@@ -4388,6 +5335,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .live-record-bar { display:none; align-items:flex-end; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; padding: 9px; background:#151515; border:1px solid #333; border-radius:6px; }
 .live-record-bar label { display:flex; flex-direction:column; gap:4px; min-width: 180px; flex: 1 1 220px; }
 .live-record-bar label.prompt { flex: 3 1 420px; }
+.live-record-bar label.intervention-only-option { flex:0 0 auto; min-width:190px; flex-direction:row; align-items:center; align-self:center; gap:7px; padding:8px 10px; border:1px solid #444; border-radius:5px; background:#202020; color:#fff; }
+.live-record-bar label.intervention-only-option input { width:auto; }
 .live-record-bar input { width:100%; box-sizing:border-box; }
 .live-record-bar button { min-height: 36px; white-space: nowrap; }
 .live-record-status { flex: 1 1 260px; min-height: 20px; color:#bbb; font-size: 12px; }
@@ -4428,8 +5377,6 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .live-events.dense .event-pill { width: 22px; height: 20px; font-size: 13px; }
 .live-events.tiny { gap:3px; }
 .live-events.tiny .event-pill { width: 18px; height: 17px; font-size: 11px; }
-.monitor-actions { display:flex; align-items:center; justify-content:flex-end; gap: 8px; flex-wrap:wrap; }
-.monitor-actions label { display:inline-flex; align-items:center; gap: 4px; }
 .dataset-prompt { margin-top:12px; }
 .dataset-prompt h2 { margin:0 0 8px; font-size:15px; }
 .dataset-prompt p { margin:6px 0; color:#ccc; font-size:13px; }
@@ -4437,19 +5384,26 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .sam3-editor input[type=text] { flex: 1 1 260px; min-width: 0; }
 .sam3-editor img { width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background:#000; border:1px solid #333; border-radius:5px; margin-top: 8px; }
 .sam3-editor .sam3-status { min-height: 18px; color:#bbb; font-size: 12px; }
+.mask-toolbar { position:absolute; right:8px; bottom:8px; z-index:3; display:flex; justify-content:flex-end; gap:6px; }
+.mask-toolbar button { padding:5px 8px; font-size:12px; background:rgba(31,111,235,.88); border-color:#2f81f7; }
+.advanced-policy { margin: 8px 0; border: 1px solid #333; border-radius: 5px; background:#151515; }
+.advanced-policy summary { cursor:pointer; padding: 8px 10px; color:#ddd; font-weight: 650; }
+.advanced-policy .row { padding: 0 10px 10px; margin: 0; }
+.advanced-policy label.checkbox { display:inline-flex; flex-direction:row; align-items:center; gap:6px; }
+.advanced-policy .hint { padding: 0 10px 10px; margin: 0; color:#aaa; font-size:12px; }
 body.live-view main { grid-template-columns: 1fr; }
 body.live-view.page-setup .control-panel { display:none; }
 body.live-view .status-panel { display:none; }
-body.live-view .cams { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+body.live-view .cams { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 body.live-view .cams img { height: min(62vh, 680px); max-height: none; }
 body.live-view .visual-pane { min-height: calc(100vh - 74px); }
-body.live-view .live-record-bar, body.page-monitor .live-record-bar { display:flex; }
-body.page-setup .monitor-only { display:none !important; }
+body.page-setup .live-record-bar, body.live-view .live-record-bar, body.page-monitor .live-record-bar { display:flex; }
+body.page-setup:not(.live-view) .monitor-only { display:none !important; }
 body.page-monitor .setup-only { display:none !important; }
 body.page-monitor main { grid-template-columns: 1fr; }
 body.page-monitor .control-panel { display:none; }
 body.page-monitor .status-panel { display:none; }
-body.page-monitor .cams { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+body.page-monitor .cams { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 body.page-monitor .cams img { height: min(62vh, 680px); max-height: none; }
 body.page-monitor .visual-pane { min-height: calc(100vh - 74px); }
 body.page-monitor #liveToggle { display:none; }
@@ -4481,10 +5435,12 @@ body.page-monitor #liveToggle { display:none; }
 <main>
 	  <section class="visual-pane">
 	    <div class="live-prompt mono" id="livePrompt"></div>
-	    <div class="live-record-bar">
+	    <div class="live-record-bar monitor-only">
 	      <label class="prompt">Model Prompt <input id="liveInstruction" type="text" value="Move to light blue ball, grab it, and move it to the tall black cylinder"></label>
 	      <label>Dataset Name <input id="evalDatasetName" type="text" value="so101-ball-cup-eval"></label>
+	      <label class="checkbox intervention-only-option"><input id="evalInterventionsOnly" type="checkbox"> Intervention episodes only</label>
 	      <button id="startEvalButton" class="primary" onclick="startEval()">Start Recording</button>
+	      <button id="startTeleopRecordingButton" class="primary" onclick="startLiveTeleopRecording()">Record Teleop</button>
 	      <button id="stopRecordingButton" class="danger" onclick="stopRecording()" disabled>Stop Recording</button>
 	      <span id="liveSuccessIndicator" class="live-success-indicator mono">success 0</span>
 	      <span id="liveRecordStatus" class="live-record-status mono">idle</span>
@@ -4505,24 +5461,20 @@ body.page-monitor #liveToggle { display:none; }
 	        <div class="cam-badge">WRIST</div>
 	        <div class="cam-source mono" id="camera-wrist-source"></div>
 	      </div>
-      <img id="successOverlay" alt="success tracking overlay">
+	      <div class="cam-card mask-card" data-camera="masks">
+	        <img id="liveSuccessOverlay" alt="success tracking masks">
+	        <div class="cam-badge">MASKS</div>
+	        <div class="mask-toolbar">
+	          <button id="liveSam3RerunButton" onclick="rerunSam3Masks()">Rerun SAM3</button>
+	        </div>
+	      </div>
     </div>
 	    <div class="live-summary monitor-only">
 	      <div class="live-events" id="liveEvents"></div>
-	      <div class="monitor-actions">
-	        <label><input id="evalWithTeleop" type="checkbox" checked> w teleop</label>
-	        <label><input id="evalRecordEpisodes" type="checkbox" checked> record episodes</label>
-	        <button id="liveInterventionToggleButton" class="danger" onclick="toggleIntervention()">Intervene</button>
-        <button class="primary" onclick="resumeEval()">Resume</button>
-        <button id="liveStopEvalButton" class="danger" onclick="stopEval()">Stop</button>
-        <button onclick="clearEval()">Clear</button>
-        <span id="evalStatus" class="mono"></span>
-      </div>
     </div>
     <div class="live-stats mono monitor-only" id="liveStats"></div>
     <div class="panel dataset-prompt monitor-only hidden" id="datasetPrompt"></div>
     <div class="panel teleop-panel monitor-only">
-      <label>Teleop Intervention</label>
       <div class="teleop mono" id="teleop"></div>
       <div class="row">
         <label>Operator <input id="teleopOperator" type="text" value="operator" style="width:130px"></label>
@@ -4561,8 +5513,16 @@ body.page-monitor #liveToggle { display:none; }
       <label>Duration <input id="duration" type="number" value="300" min="1" max="900" style="width:72px"></label>
       <label>Steps/chunk <input id="execSteps" type="number" value="30" min="1" max="30" style="width:72px"></label>
       <label>Max step deg <input id="maxStep" type="number" value="1" min="0.1" max="10" step="0.1" style="width:72px"></label>
-      <label>Hz <input id="hz" type="number" value="30" min="1" max="60" step="0.5" style="width:64px"></label>
     </div>
+    <details class="advanced-policy setup-only">
+      <summary>Advanced</summary>
+      <div class="row">
+        <label>Hz <input id="hz" type="number" value="30" min="1" max="60" step="0.5" style="width:64px"></label>
+        <label class="checkbox"><input id="realtimeChunking" type="checkbox"> Realtime chunking</label>
+        <label>Query at <input id="realtimeQueryFraction" type="number" value="0.5" min="0.05" max="0.95" step="0.05" style="width:72px"></label>
+      </div>
+      <p class="hint mono">30 Hz makes 30 actions last ~1s; realtime chunking can be enabled to dispatch the next chunk before the current one finishes.</p>
+    </details>
     <div class="row setup-only">
       <button class="primary" onclick="startPolicy()">Start MolmoAct</button>
       <button class="danger" onclick="stopPolicy()">Stop</button>
@@ -4576,12 +5536,13 @@ body.page-monitor #liveToggle { display:none; }
     <div class="sam3-editor setup-only">
       <label>SAM3 Container Prompt</label>
       <div class="row">
-        <input id="sam3Prompt" type="text" value="black cylinder along with the insides">
+        <input id="sam3Prompt" type="text" value="black container">
       </div>
       <div class="row">
         <label>Confidence <input id="sam3MinScore" type="number" value="0.15" min="0" max="1" step="0.01" style="width:72px"></label>
         <label>Camera <select id="sam3Camera"><option value="front">Front</option><option value="side">Side</option><option value="wrist">Wrist</option></select></label>
         <button id="sam3PreviewButton" onclick="previewSam3()">Preview SAM3</button>
+        <button id="sam3RerunButton" onclick="rerunSam3Masks()">Rerun SAM3</button>
         <button class="good" onclick="applySam3Prompt()">Use For Success</button>
       </div>
       <div id="sam3PreviewStatus" class="sam3-status mono"></div>
@@ -4599,7 +5560,7 @@ body.page-monitor #liveToggle { display:none; }
       <label>Record duration <input id="recordDuration" type="number" value="120" min="1" max="900" style="width:72px"></label>
       <label>Record FPS <input id="recordFps" type="number" value="30" min="0.5" max="30" step="0.5" style="width:64px"></label>
       <label><input id="recordFront" type="checkbox" checked> Front</label>
-      <label><input id="recordSide" type="checkbox" checked> Side</label>
+      <label><input id="recordSide" type="checkbox"> Side</label>
       <label><input id="recordWrist" type="checkbox" checked> Wrist</label>
     </div>
     <div class="row hidden" aria-hidden="true">
@@ -4612,7 +5573,8 @@ body.page-monitor #liveToggle { display:none; }
 </main>
 <script>
 const host = location.hostname;
-document.getElementById('successOverlay').src = `/api/success.mjpg`;
+const initialSuccessOverlay = document.getElementById('liveSuccessOverlay');
+if (initialSuccessOverlay) initialSuccessOverlay.src = `/api/success.mjpg`;
 let liveViewPinned = false;
 let liveViewSuppressed = false;
 let sam3PromptDirty = false;
@@ -4638,27 +5600,51 @@ window.addEventListener('hashchange', () => {
   setPage(location.hash.replace('#', '') || localStorage.getItem('so101ControlPage') || 'setup');
 });
 
-function startMjpegImage(id, path) {
+const CAMERA_PREVIEW_REFRESH_MS = 100;
+const CAMERA_PREVIEW_STALL_MS = 1500;
+function startPreviewImage(id, path) {
   const el = document.getElementById(id);
   if (!el) return;
-  let reconnectTimer = null;
+  let nextTimer = null;
+  let stallTimer = null;
+  let frame = 0;
+  const clearTimers = () => {
+    if (nextTimer) clearTimeout(nextTimer);
+    if (stallTimer) clearTimeout(stallTimer);
+    nextTimer = null;
+    stallTimer = null;
+  };
+  const schedule = (delay = CAMERA_PREVIEW_REFRESH_MS) => {
+    if (nextTimer) clearTimeout(nextTimer);
+    nextTimer = setTimeout(load, delay);
+  };
   const connect = () => {
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
+    clearTimers();
+    el.src = `${path}?t=${Date.now()}_${frame++}`;
+    stallTimer = setTimeout(load, CAMERA_PREVIEW_STALL_MS);
+  };
+  const load = () => {
+    if (document.hidden) {
+      schedule(1000);
+      return;
     }
-    el.src = `${path}?t=${Date.now()}`;
+    connect();
   };
   el.onerror = () => {
-    if (reconnectTimer) return;
-    reconnectTimer = setTimeout(connect, 500);
+    clearTimers();
+    schedule(500);
   };
-  connect();
+  el.onload = () => {
+    if (stallTimer) clearTimeout(stallTimer);
+    stallTimer = null;
+    schedule();
+  };
+  load();
 }
 
-startMjpegImage('camera-front', '/camera/front.mjpg');
-startMjpegImage('camera-side', '/camera/side.mjpg');
-startMjpegImage('camera-wrist', '/camera/wrist.mjpg');
+startPreviewImage('camera-front', '/camera/front.jpg');
+startPreviewImage('camera-side', '/camera/side.jpg');
+startPreviewImage('camera-wrist', '/camera/wrist.jpg');
 
 function shortCameraUrl(url) {
   try {
@@ -4687,6 +5673,10 @@ async function api(path, body) {
   return json;
 }
 function val(id) { return document.getElementById(id).value; }
+function checked(id, fallback = false) {
+  const el = document.getElementById(id);
+  return el ? !!el.checked : fallback;
+}
 const teleopOperatorInput = document.getElementById('teleopOperator');
 if (teleopOperatorInput) {
   teleopOperatorInput.value = localStorage.getItem(teleopOperatorKey) || 'operator';
@@ -4715,16 +5705,22 @@ function toggleLiveView() {
   updateLiveView(lastStatus || {});
 }
 function resetSuccessStream() {
-  const img = document.getElementById('successOverlay');
-  if (img) img.src = `/api/success.mjpg?t=${Date.now()}`;
+  const t = Date.now();
+  const setupImg = document.getElementById('liveSuccessOverlay');
+  if (setupImg) setupImg.src = `/api/success.mjpg?t=${t}`;
+  const liveImg = ensureLiveSuccessOverlay();
+  if (liveImg) liveImg.src = `/api/success.mjpg?t=${t}`;
 }
 async function startPolicy() {
+  await applySam3Prompt();
   await api('/api/start', {
     instruction: val('instruction'),
     duration_s: Number(val('duration')),
     exec_steps: Number(val('execSteps')),
     max_step_deg: Number(val('maxStep')),
     hz: Number(val('hz')),
+    realtime_chunking: checked('realtimeChunking', false),
+    realtime_query_fraction: Number(val('realtimeQueryFraction')),
   });
   resetSuccessStream();
   await refresh();
@@ -4765,6 +5761,31 @@ async function previewSam3() {
     setSam3PreviewStatus(e.message);
   }
 }
+async function rerunSam3Masks() {
+  const cfg = sam3EditorConfig();
+  setSam3PreviewStatus('rerunning SAM3 masks');
+  setLiveRecordStatus('rerunning SAM3 masks', 'warn');
+  try {
+    const data = await api('/api/success/rerun_sam3', {
+      camera: cfg.camera,
+      prompt: cfg.prompt,
+      min_score: cfg.min_score,
+    });
+    sam3PromptDirty = false;
+    sam3MinScoreDirty = false;
+    resetSuccessStream();
+    const s = data.success_tracking || {};
+    const cup = s.container_mask_sam3_status || s.container_mask_source || '';
+    const ball = s.ball_mask_sam3_status || s.ball_mask_source || '';
+    const text = `cup=${cup} ball=${ball}`;
+    setSam3PreviewStatus(text);
+    setLiveRecordStatus(text, cup === 'accepted' && ball === 'accepted' ? 'ok' : 'warn');
+    await refresh();
+  } catch (e) {
+    setSam3PreviewStatus(e.message);
+    setLiveRecordStatus(`SAM3 error: ${e.message}`, 'bad');
+  }
+}
 async function applySam3Prompt() {
   const cfg = sam3EditorConfig();
   await api('/api/success/sam3', {prompt: cfg.prompt, min_score: cfg.min_score});
@@ -4790,9 +5811,14 @@ function setLiveRecordStatus(text, cls = '') {
   el.className = `live-record-status mono ${cls}`.trim();
   el.innerHTML = text ? escapeHtml(text) : 'idle';
 }
+function ensureLiveSuccessOverlay() {
+  return document.getElementById('liveSuccessOverlay');
+}
 function renderLiveSuccess(data) {
   const el = document.getElementById('liveSuccessIndicator');
   if (!el) return;
+  const liveImg = ensureLiveSuccessOverlay();
+  if (liveImg && !liveImg.src) liveImg.src = `/api/success.mjpg?t=${Date.now()}`;
   const s = data.success_tracking || {};
   const count = Number(s.success_count || 0);
   const increased = count > lastLiveSuccessCount;
@@ -4820,7 +5846,7 @@ async function startLivePolicyRecording() {
   await api('/api/record/start', {
     duration_s: Math.max(1, Number(val('recordDuration')) || Number(val('evalAttempt')) || 120),
     fps: Number(val('evalRecordFps')) || Number(val('recordFps')) || 30,
-    cameras: ['front', 'side', 'wrist'],
+    cameras: ['front', 'wrist', 'side'],
     task: modelPromptValue(),
     name_prefix: 'so101_policy_recording',
     dataset_name: val('evalDatasetName'),
@@ -4830,6 +5856,24 @@ async function startLivePolicyRecording() {
       record_only_policy_execute: true,
     },
   });
+}
+async function startLiveTeleopRecording() {
+  await api('/api/record/start', {
+    duration_s: Math.max(1, Number(val('recordDuration')) || Number(val('evalAttempt')) || 120),
+    fps: Number(val('evalRecordFps')) || Number(val('recordFps')) || 30,
+    cameras: ['front', 'wrist', 'side'],
+    task: modelPromptValue(),
+    name_prefix: 'so101_teleop_recording',
+    dataset_name: val('evalDatasetName'),
+    capture_mode: 'continuous',
+    extra_meta: {
+      record_start_trigger: 'live_teleop_button',
+      episode_kind: 'teleop',
+      control_sources_expected: ['leader_delta', 'manual'],
+    },
+  });
+  setLiveRecordStatus('recording teleop...', 'ok');
+  await refresh();
 }
 function liveRecordStatusText(data) {
   const e = data?.eval || {};
@@ -4841,6 +5885,7 @@ function liveRecordStatusText(data) {
     return {text: `recording ${rec.elapsed || 0}s${sampleText}`, cls: 'ok'};
   }
   if (e.running) {
+    if (e.config?.record_interventions_only) return {text: 'intervention episodes armed', cls: 'warn'};
     const attempt = e.current_attempt || {};
     if (attempt.recording_pending) {
       const delay = Number(attempt.record_start_delay_s || e.record_start_delay_s || 0);
@@ -4870,8 +5915,10 @@ async function startEval() {
   }
   setLiveRecordStatus('starting recording...', 'warn');
   try {
+    await applySam3Prompt();
     const policyAlreadyRunning = !!lastStatus && lastStatus.mode === 'policy' && !lastStatus.eval?.running;
-    if (policyAlreadyRunning) {
+    const onlyInterventions = checked('evalInterventionsOnly', false);
+    if (policyAlreadyRunning && !onlyInterventions) {
       await startLivePolicyRecording();
     } else {
       try {
@@ -4885,11 +5932,15 @@ async function startEval() {
           exec_steps: Number(val('execSteps')),
           max_step_deg: Number(val('maxStep')),
           hz: Number(val('hz')),
+          realtime_chunking: checked('realtimeChunking', false),
+          realtime_query_fraction: Number(val('realtimeQueryFraction')),
           allow_teleop: !!document.getElementById('evalWithTeleop')?.checked,
           record_episodes: !!document.getElementById('evalRecordEpisodes')?.checked,
+          record_interventions_only: onlyInterventions,
         });
       } catch (e) {
         if (!String(e.message || '').includes('motion is already running')) throw e;
+        if (onlyInterventions) throw e;
         await startLivePolicyRecording();
       }
     }
@@ -5031,7 +6082,9 @@ async function stopRecording() {
   }
   setLiveRecordStatus('stopping recording...', 'warn');
   try {
-    await api('/api/record/stop', {});
+    const data = await api('/api/record/stop', {dataset_name: val('evalDatasetName')});
+    if (data.export?.started) setLiveRecordStatus('recording stopped; exporting dataset...', 'warn');
+    else if (data.export?.error) setLiveRecordStatus(`recording stopped; export skipped: ${data.export.error}`, 'warn');
     await refresh();
   } catch (e) {
     setLiveRecordStatus(`error: ${e.message}`, 'bad');
@@ -5083,11 +6136,24 @@ function renderSuccess(data) {
     ? ` box=${s.container_mask_sam3_box_xyxy.map(v => Number(v).toFixed(0)).join(',')}`
     : '';
   const sam3Diag = `${s.container_mask_sam3_status || ''}${sam3RawScore}${sam3RawArea}${sam3Box} ${s.container_mask_sam3_error || ''}`;
+  const ballMask = `gen ${s.ball_mask_generation || 0} ${s.ball_mask_source || ''} area=${s.ball_area || 0}`;
+  const sam2RawScore = s.ball_mask_sam2_raw_score === null || s.ball_mask_sam2_raw_score === undefined
+    ? ''
+    : ` score=${s.ball_mask_sam2_raw_score.toFixed(2)}`;
+  const sam2RawArea = s.ball_mask_sam2_raw_area === null || s.ball_mask_sam2_raw_area === undefined
+    ? ''
+    : ` area=${s.ball_mask_sam2_raw_area}`;
+  const sam2Box = Array.isArray(s.ball_mask_sam2_box_xyxy)
+    ? ` box=${s.ball_mask_sam2_box_xyxy.map(v => Number(v).toFixed(0)).join(',')}`
+    : '';
+  const sam2Diag = `${s.ball_mask_sam2_status || ''}${sam2RawScore}${sam2RawArea}${sam2Box} ${s.ball_mask_sam2_error || ''}`;
   el.innerHTML = [
     `<div>successes</div><div class="${cls}"><b>${s.success_count || 0}</b></div>`,
     `<div>tracker</div><div>${s.running ? 'running' : 'idle'} / ${s.state || ''}</div>`,
     `<div>mask overlap</div><div>${overlap}</div>`,
     `<div>ball area</div><div>${s.ball_area || 0}</div>`,
+    `<div>ball mask</div><div>${ballMask}</div>`,
+    `<div>SAM2 ball</div><div>${sam2Diag}</div>`,
     `<div>container mask</div><div>${containerMask}</div>`,
     `<div>SAM3 prompt</div><div>${s.container_mask_prompt || ''} ${containerScore}</div>`,
     `<div>SAM3 status</div><div>${sam3Diag}</div>`,
@@ -5106,13 +6172,18 @@ function renderEval(data) {
   const cls = e.waiting_for_intervention ? 'bad' : e.running ? 'warn' : (e.successes ? 'ok' : '');
   const remaining = e.remaining_s === null || e.remaining_s === undefined ? '' : `${e.remaining_s}s left`;
   const noSuccessRemaining = e.attempt_remaining_s === null || e.attempt_remaining_s === undefined ? '' : `${e.attempt_remaining_s}s`;
-  document.getElementById('evalStatus').textContent = `${running} ${e.state || ''} ${remaining}`;
+  const evalStatusEl = document.getElementById('evalStatus');
+  if (evalStatusEl) evalStatusEl.textContent = `${running} ${e.state || ''} ${remaining}`;
   const liveRecordStatus = liveRecordStatusText(data);
   setLiveRecordStatus(liveRecordStatus.text, liveRecordStatus.cls);
   const teleopOption = document.getElementById('evalWithTeleop');
   if (teleopOption && e.config && e.config.allow_teleop !== undefined && !e.running) teleopOption.checked = !!e.config.allow_teleop;
   const recordOption = document.getElementById('evalRecordEpisodes');
   if (recordOption && e.config && e.config.record_episodes !== undefined && !e.running) recordOption.checked = !!e.config.record_episodes;
+  const interventionsOnlyOption = document.getElementById('evalInterventionsOnly');
+  if (interventionsOnlyOption && e.config && e.config.record_interventions_only !== undefined && !e.running) {
+    interventionsOnlyOption.checked = !!e.config.record_interventions_only;
+  }
   const datasetInput = document.getElementById('evalDatasetName');
   if (datasetInput && e.config?.dataset_name && !e.running && document.activeElement !== datasetInput) {
     datasetInput.value = e.config.dataset_name;
@@ -5124,10 +6195,16 @@ function renderEval(data) {
     startButton.textContent = rec.running ? 'Stop Recording' : e.running ? 'Recording...' : 'Start Recording';
     startButton.className = rec.running ? 'danger' : 'primary';
   }
+  const teleopRecordButton = document.getElementById('startTeleopRecordingButton');
+  if (teleopRecordButton) {
+    const rec = data.recording || {};
+    teleopRecordButton.disabled = !!rec.running || !!e.running;
+    teleopRecordButton.textContent = rec.running ? 'Recording...' : 'Record Teleop';
+  }
   for (const stopButton of [document.getElementById('stopRecordingButton'), document.getElementById('headerStopRecordingButton')]) {
     if (!stopButton) continue;
     const rec = data.recording || {};
-    stopButton.disabled = !rec.running;
+    stopButton.disabled = !(rec.running || e.running);
     stopButton.textContent = rec.running ? 'Stop Recording' : 'Stop Recording';
   }
   const livePromptInput = document.getElementById('liveInstruction');
@@ -5145,6 +6222,7 @@ function renderEval(data) {
     `<div>last</div><div>${last}</div>`,
     `<div>w teleop</div><div>${e.config?.allow_teleop === false ? 'off' : 'on'}</div>`,
     `<div>record episodes</div><div>${e.config?.record_episodes === false ? 'off' : 'on'}</div>`,
+    `<div>only interventions</div><div>${e.config?.record_interventions_only ? 'on' : 'off'}</div>`,
     `<div>dataset</div><div>${e.config?.dataset_name || e.dataset_name || ''}</div>`,
     `<div>recording</div><div>${e.recording_dir || ''}</div>`,
     `<div>summary</div><div>${e.summary_path || ''}</div>`,
@@ -5316,7 +6394,7 @@ function datasetFingerprint(dataset) {
   return `${dataset.success_count || 0}:${dataset.failure_count || 0}:${dataset.uncompressed_success_count || 0}:${dataset.started_at || ''}:${dataset.completed_at || ''}`;
 }
 async function compressDataset(upload = false) {
-  const body = {upload};
+  const body = {upload, append: true, auto_cameras: true, skip_unusable: true};
   if (upload) {
     const prior = localStorage.getItem('so101HfDatasetRepoId') || '';
     const repoId = prompt('HF dataset repo id', prior || 'username/so101-ball-cup-success');
@@ -5422,6 +6500,11 @@ async function refresh() {
     const sam3PreviewButton = document.getElementById('sam3PreviewButton');
     if (sam3PreviewButton) {
       sam3PreviewButton.disabled = data.mode === 'policy' || data.mode === 'stopping' || !!data.eval?.running;
+    }
+    for (const sam3RerunButton of [document.getElementById('sam3RerunButton'), document.getElementById('liveSam3RerunButton')]) {
+      if (sam3RerunButton) {
+        sam3RerunButton.disabled = data.mode === 'policy' || data.mode === 'stopping' || !!data.eval?.running;
+      }
     }
     renderState(data);
     const nextLogText = (data.logs || []).join('\n');
@@ -5644,10 +6727,21 @@ tr.other-source td { color:#c5ced8; }
 .episode-button { text-align:left; min-height:52px; }
 .episode-button.active { border-color:#9ee493; background:#17351f; }
 .episode-button span { display:block; color:#9aa4af; font-size:11px; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.episode-button span.compaction { color:#ffd166; }
+.episode-button span.compaction.ok { color:#9ee493; }
 .episode-mini-timeline { position:relative; height:8px; margin-top:8px; border-radius:3px; background:#0f1215; overflow:hidden; border:1px solid #30363d; }
 .episode-mini-segment { position:absolute; top:0; bottom:0; min-width:3px; background:#2ea043; }
 .episode-output-list { display:grid; gap:3px; margin-top:7px; color:#d7e1ea; font-size:11px; }
 .episode-output-item { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.joint-graph-panel canvas { display:block; width:100%; height:360px; background:#0f1215; border:1px solid #30363d; border-radius:5px; }
+.joint-graph-meta { color:#9aa4af; font-size:12px; min-height:20px; }
+.joint-legend { display:flex; gap:12px; flex-wrap:wrap; color:#9aa4af; font-size:12px; margin-top:7px; }
+.joint-legend span { display:inline-flex; align-items:center; gap:5px; }
+.joint-legend i { display:inline-block; width:16px; height:3px; border-radius:999px; }
+.joint-legend .state-line { background:#9ecbff; }
+.joint-legend .action-line { background:#ffd166; }
+.joint-legend .velocity-line { background:#9ee493; }
+.joint-legend .velocity-average-line { background:#2ea043; }
 @media (max-width: 900px) {
   main { grid-template-columns:1fr; }
   .episode-panel { position:static; max-height:none; }
@@ -5696,6 +6790,19 @@ tr.other-source td { color:#c5ced8; }
     <div class="status mono" id="manifestStatus" style="margin-top:8px"></div>
   </section>
   <section class="cams" id="cams"></section>
+  <section class="panel joint-graph-panel">
+    <div class="row">
+      <b>Joint graph</b>
+      <div class="joint-graph-meta mono" id="jointGraphStats"></div>
+    </div>
+    <canvas id="jointGraph" width="960" height="360"></canvas>
+    <div class="joint-legend mono">
+      <span><i class="state-line"></i>joint positions</span>
+      <span><i class="action-line"></i>action targets</span>
+      <span><i class="velocity-line"></i>velocity magnitude</span>
+      <span><i class="velocity-average-line"></i>avg velocity magnitude</span>
+    </div>
+  </section>
   <section class="panel">
     <div style="overflow:auto; margin-top:10px">
       <table>
@@ -5723,7 +6830,6 @@ tr.other-source td { color:#c5ced8; }
     </div>
   </section>
   <section class="panel" style="display:none">
-    <div class="mono" id="sample"></div>
     <div class="mono" id="stats"></div>
   </section>
   </div>
@@ -5768,7 +6874,7 @@ function queryEpisodeName() {
   return new URLSearchParams(location.search).get('episode') || '';
 }
 function sourceKey(ep) {
-  return ep?.source_repo_id || ep?.dataset_repo_id || (ep?.name || '').replace(/_ep\d+$/, '') || 'local recordings';
+  return ep?.source_repo_id || ep?.dataset_repo_id || ep?.dataset_slug || ep?.dataset_name || (ep?.name || '').replace(/_ep\d+$/, '') || 'local recordings';
 }
 function defaultPrompt() {
   return document.getElementById('defaultPrompt')?.value.trim() || '';
@@ -6063,8 +7169,13 @@ function renderEpisodeList() {
   el.innerHTML = visible.map((ep, idx) => {
     const active = ep.name === current ? 'active' : '';
     const label = ep.label || `Episode ${idx + 1}`;
+    const compacted = !!ep.compacted;
+    const compactionText = compacted
+      ? `Compacted${ep.compacted_root_exists === false ? ' - missing local root' : ''}`
+      : 'Dataset not compacted';
     return `<button class="episode-button ${active}" value="${escapeHtml(ep.name)}" title="${escapeHtml(ep.name)}" onclick="selectEpisode(this.value)">
       ${escapeHtml(label)}
+      <span class="compaction ${compacted && ep.compacted_root_exists !== false ? 'ok' : ''}">${escapeHtml(compactionText)}</span>
       ${ep.task ? `<span>${escapeHtml(ep.task)}</span>` : ''}
       ${miniTimeline(ep)}
       ${episodeOutputSummary(ep)}
@@ -6102,7 +7213,11 @@ async function loadEpisode(name) {
   renderSegments();
   renderFrame(0);
   renderEpisodeList();
-  setStatus(`loaded ${episode.name}`, segments.length ? '' : 'warn');
+  const compacted = !!episode.compacted;
+  const compactText = compacted
+    ? `compacted${episode.compacted_root_exists === false ? ' (local root missing)' : ''}`
+    : 'Dataset not compacted: raw frame playback may be choppy';
+  setStatus(`loaded ${episode.name} - ${compactText}`, compacted ? '' : 'warn');
 }
 function cameraList() {
   const fromMeta = Array.isArray(episode?.cameras) ? episode.cameras : [];
@@ -6133,6 +7248,193 @@ function frameRef(frame, fallbackIdx) {
   if (frame.path) return String(fallbackIdx);
   return String(fallbackIdx);
 }
+function jointNames() {
+  const names = episode?.meta?.joints;
+  if (Array.isArray(names) && names.length) return names.map(String);
+  return ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
+}
+function jointValue(value) {
+  const next = Number(value);
+  return Number.isFinite(next) ? next.toFixed(2) : '-';
+}
+function graphSeries(jointIdx) {
+  const samples = episode?.samples || [];
+  return samples.map((sample, idx) => {
+    const state = Array.isArray(sample.observation_state) ? Number(sample.observation_state[jointIdx]) : NaN;
+    const action = Array.isArray(sample.action) ? Number(sample.action[jointIdx]) : NaN;
+    const prev = idx > 0 && Array.isArray(samples[idx - 1].action) ? Number(samples[idx - 1].action[jointIdx]) : NaN;
+    const actionStep = Number.isFinite(action) && Number.isFinite(prev) ? action - prev : 0;
+    const timestamp = Number(sample.timestamp_s ?? sample.timestamp ?? idx / Math.max(1, Number(episode?.meta?.fps || 30)));
+    return {idx, timestamp, state, action, actionStep, sample};
+  });
+}
+function finiteValues(rows, key) {
+  return rows.map(row => Number(row[key])).filter(Number.isFinite);
+}
+function averageFinite(rows, key) {
+  let total = 0;
+  let count = 0;
+  rows.forEach(row => {
+    const value = Number(row[key]);
+    if (!Number.isFinite(value)) return;
+    total += value;
+    count += 1;
+  });
+  return count ? total / count : NaN;
+}
+function sampleJointPosition(sample, jointIdx) {
+  const state = Array.isArray(sample?.observation_state) ? Number(sample.observation_state[jointIdx]) : NaN;
+  if (Number.isFinite(state)) return state;
+  const action = Array.isArray(sample?.action) ? Number(sample.action[jointIdx]) : NaN;
+  return Number.isFinite(action) ? action : NaN;
+}
+function velocityMagnitudeSeries() {
+  const samples = episode?.samples || [];
+  const joints = jointNames();
+  return samples.map((sample, idx) => {
+    const timestamp = Number(sample.timestamp_s ?? sample.timestamp ?? idx / Math.max(1, Number(episode?.meta?.fps || 30)));
+    if (idx <= 0) return {idx, timestamp, velocityMagnitude: NaN};
+    const previous = samples[idx - 1] || {};
+    const previousTimestamp = Number(previous.timestamp_s ?? previous.timestamp ?? (idx - 1) / Math.max(1, Number(episode?.meta?.fps || 30)));
+    const dt = timestamp - previousTimestamp;
+    if (!Number.isFinite(dt) || dt <= 0) return {idx, timestamp, velocityMagnitude: NaN};
+    let sumSq = 0;
+    let count = 0;
+    joints.forEach((_, jointIdx) => {
+      const currentValue = sampleJointPosition(sample, jointIdx);
+      const previousValue = sampleJointPosition(previous, jointIdx);
+      if (!Number.isFinite(currentValue) || !Number.isFinite(previousValue)) return;
+      const velocity = (currentValue - previousValue) / dt;
+      sumSq += velocity * velocity;
+      count += 1;
+    });
+    return {idx, timestamp, velocityMagnitude: count ? Math.sqrt(sumSq) : NaN};
+  });
+}
+function drawGraphLine(ctx, rows, key, color, width, xFor, yFor, dash = []) {
+  ctx.setLineDash(dash);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  let started = false;
+  rows.forEach(row => {
+    const value = Number(row[key]);
+    if (!Number.isFinite(value)) return;
+    const x = xFor(row.idx);
+    const y = yFor(value);
+    if (!started) {
+      ctx.moveTo(x, y);
+      started = true;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  });
+  if (started) ctx.stroke();
+  ctx.setLineDash([]);
+}
+function jointGraphColor(idx) {
+  return ['#9ecbff', '#ffd166', '#ff7b72', '#a5d6ff', '#d2a8ff', '#ffa657'][idx % 6];
+}
+function renderJointGraph() {
+  const canvas = document.getElementById('jointGraph');
+  const stats = document.getElementById('jointGraphStats');
+  if (!canvas || !episode) return;
+  const joints = jointNames();
+  const series = joints.map((joint, jointIdx) => {
+    const rows = graphSeries(jointIdx);
+    return {joint, jointIdx, rows};
+  });
+  const velocityRows = velocityMagnitudeSeries();
+  const avgVelocityMagnitude = averageFinite(velocityRows, 'velocityMagnitude');
+  const maxVelocityMagnitude = Math.max(1, ...finiteValues(velocityRows, 'velocityMagnitude'));
+  const ctx = canvas.getContext('2d');
+  const cssWidth = Math.max(320, Math.floor(canvas.clientWidth || 960));
+  const cssHeight = Math.max(300, Math.floor(canvas.clientHeight || 360));
+  const scale = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(cssWidth * scale) || canvas.height !== Math.round(cssHeight * scale)) {
+    canvas.width = Math.round(cssWidth * scale);
+    canvas.height = Math.round(cssHeight * scale);
+  }
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+  ctx.fillStyle = '#0f1215';
+  ctx.fillRect(0, 0, cssWidth, cssHeight);
+  const pad = {left: 58, right: 72, top: 18, bottom: 32};
+  const plotW = Math.max(1, cssWidth - pad.left - pad.right);
+  const plotH = Math.max(1, cssHeight - pad.top - pad.bottom);
+  const maxIdx = Math.max(1, ...series.map(item => item.rows.length - 1), velocityRows.length - 1);
+  const positionValues = series.flatMap(item => [...finiteValues(item.rows, 'state'), ...finiteValues(item.rows, 'action')]);
+  const minRaw = positionValues.length ? Math.min(...positionValues) : -1;
+  const maxRaw = positionValues.length ? Math.max(...positionValues) : 1;
+  const positionSpan = Math.max(1, maxRaw - minRaw);
+  const minPosition = minRaw - positionSpan * 0.1;
+  const maxPosition = maxRaw + positionSpan * 0.1;
+  const maxVelocityAxis = Math.max(1, maxVelocityMagnitude * 1.12);
+  const xFor = idx => pad.left + (idx / maxIdx) * plotW;
+  const yForPosition = value => pad.top + (1 - ((value - minPosition) / Math.max(1e-9, maxPosition - minPosition))) * plotH;
+  const yForVelocity = value => pad.top + (1 - (value / maxVelocityAxis)) * plotH;
+
+  ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  ctx.strokeStyle = '#30363d';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 5; i++) {
+    const y = pad.top + (i / 5) * plotH;
+    const positionValue = maxPosition - (i / 5) * (maxPosition - minPosition);
+    const velocityValue = maxVelocityAxis - (i / 5) * maxVelocityAxis;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(pad.left + plotW, y);
+    ctx.stroke();
+    ctx.fillStyle = '#9aa4af';
+    ctx.fillText(positionValue.toFixed(1), 6, y + 4);
+    ctx.fillText(velocityValue.toFixed(1), pad.left + plotW + 8, y + 4);
+  }
+  ctx.fillStyle = '#9aa4af';
+  ctx.fillText('joint pos', 6, 12);
+  ctx.fillText('vel mag', pad.left + plotW + 8, 12);
+
+  series.forEach(item => {
+    const color = jointGraphColor(item.jointIdx);
+    drawGraphLine(ctx, item.rows, 'state', color, 1.8, xFor, yForPosition);
+    drawGraphLine(ctx, item.rows, 'action', color, 1.1, xFor, yForPosition, [4, 3]);
+    const last = [...item.rows].reverse().find(row => Number.isFinite(row.state));
+    if (last) {
+      const labelX = Math.min(pad.left + plotW - 80, xFor(last.idx) + 4);
+      const labelY = yForPosition(last.state);
+      ctx.fillStyle = color;
+      ctx.fillText(item.joint, labelX, labelY - 3);
+    }
+  });
+  drawGraphLine(ctx, velocityRows, 'velocityMagnitude', '#9ee493', 2, xFor, yForVelocity);
+  if (Number.isFinite(avgVelocityMagnitude)) {
+    const avgY = yForVelocity(avgVelocityMagnitude);
+    ctx.strokeStyle = '#2ea043';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, avgY);
+    ctx.lineTo(pad.left + plotW, avgY);
+    ctx.stroke();
+    ctx.fillStyle = '#9ee493';
+    ctx.fillText(`avg vel mag ${avgVelocityMagnitude.toFixed(1)}/s`, pad.left + 8, avgY - 4);
+  }
+
+  const cursorX = xFor(Math.max(0, Math.min(frameIdx, maxIdx)));
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cursorX, pad.top);
+  ctx.lineTo(cursorX, pad.top + plotH);
+  ctx.stroke();
+  if (stats) {
+    const sample = (episode.samples || [])[Math.max(0, Math.min(frameIdx, Math.max(0, Number(episode.length || 0) - 1)))] || {};
+    const timestamp = sample.timestamp_s ?? sample.timestamp ?? '-';
+    const currentVelocity = velocityRows[Math.max(0, Math.min(frameIdx, velocityRows.length - 1))] || {};
+    const avgVelocityText = Number.isFinite(avgVelocityMagnitude) ? avgVelocityMagnitude.toFixed(1) : '-';
+    const currentVelocityText = Number.isFinite(currentVelocity.velocityMagnitude) ? currentVelocity.velocityMagnitude.toFixed(1) : '-';
+    const maxVelocityText = Number.isFinite(maxVelocityMagnitude) ? maxVelocityMagnitude.toFixed(1) : '-';
+    stats.textContent = `frame=${frameIdx} t=${timestamp}s velocity_magnitude=${currentVelocityText}/s avg_velocity_magnitude=${avgVelocityText}/s max_velocity_magnitude=${maxVelocityText}/s`;
+  }
+}
 function renderFrame(idx) {
   if (!episode) return;
   frameIdx = Math.max(0, Math.min(idx, Math.max(0, Number(episode.length || 0) - 1)));
@@ -6154,15 +7456,7 @@ function renderFrame(idx) {
       info.textContent = `${camera} no frame`;
     }
   }
-  const sample = (episode.samples || [])[frameIdx] || {};
-  document.getElementById('sample').innerHTML = [
-    '<div>sample</div>', `<div>${frameIdx} / ${Math.max(0, Number(episode.length || 0) - 1)}</div>`,
-    '<div>timestamp</div>', `<div>${sample.timestamp_s ?? '-'}</div>`,
-    '<div>state</div>', `<div>${escapeHtml(fmtVec(sample.observation_state))}</div>`,
-    '<div>action</div>', `<div>${escapeHtml(fmtVec(sample.action))}</div>`,
-    '<div>action age</div>', `<div>${sample.action_age_s ?? '-'}</div>`,
-    '<div>error</div>', `<div>${escapeHtml(sample.error || '-')}</div>`,
-  ].join('');
+  renderJointGraph();
   renderStats();
   renderSegments();
   renderTimeline();
@@ -6524,6 +7818,7 @@ document.getElementById('outputDatasetName')?.addEventListener('input', () => {
     if (repo) repo.value = defaultOutputRepoId();
   }
 });
+window.addEventListener('resize', () => renderJointGraph());
 document.addEventListener('keydown', e => {
   if (e.key === 'ArrowLeft') stepFrame(-1);
   if (e.key === 'ArrowRight') stepFrame(1);
@@ -6567,6 +7862,14 @@ def _read_jsonl_file(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _count_jsonl_rows(path: Path) -> int:
+    try:
+        with path.open() as f:
+            return sum(1 for line in f if line.strip())
+    except FileNotFoundError:
+        return 0
+
+
 def _recording_meta_path(path: Path) -> Path | None:
     if (path / "session_meta.json").exists():
         return path / "session_meta.json"
@@ -6580,7 +7883,17 @@ def _recording_dirs() -> list[Path]:
     for root in (RAW_RECORD_ROOT, RECORD_ROOT):
         if not root.exists():
             continue
-        dirs.extend(path for path in root.rglob("*") if path.is_dir() and _recording_meta_path(path) is not None)
+        for path in root.iterdir():
+            if not path.is_dir():
+                continue
+            if _recording_meta_path(path) is not None:
+                dirs.append(path)
+                continue
+            dirs.extend(
+                child
+                for child in path.iterdir()
+                if child.is_dir() and _recording_meta_path(child) is not None
+            )
     return sorted(dirs, key=lambda path: path.stat().st_mtime, reverse=True)
 
 
@@ -6768,16 +8081,30 @@ def _write_segment_manifest(path: Path, segments: list[dict[str, Any]]) -> dict[
     return manifest
 
 
+def _compaction_status(meta: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    compressed = result.get("compressed_dataset") or meta.get("compressed_dataset") or {}
+    if not isinstance(compressed, dict):
+        compressed = {}
+    root = str(compressed.get("root") or "")
+    root_exists = bool(root and Path(root).exists())
+    return {
+        "compacted": bool(compressed),
+        "compacted_root_exists": root_exists,
+        "compaction_status": "compacted" if compressed else "not_compacted",
+        "compressed_dataset": compressed,
+    }
+
+
 def _episode_summary(path: Path) -> dict[str, Any]:
     meta_path = _recording_meta_path(path)
     meta = _read_json_file(meta_path) if meta_path is not None else {}
     result = _read_json_file(path / "episode_result.json")
     eval_summary = _read_json_file(path / "eval_summary.json").get("eval", {})
-    samples = _read_jsonl_file(path / _sample_file_for(path, meta))
+    sample_count = _count_jsonl_rows(path / _sample_file_for(path, meta))
     camera_counts = {}
     cameras = _camera_specs_for(path, meta)
     for cam in cameras:
-        camera_counts[str(cam["name"])] = len(_read_jsonl_file(path / str(cam["frames_file"])))
+        camera_counts[str(cam["name"])] = _count_jsonl_rows(path / str(cam["frames_file"]))
     manifest = _read_segment_manifest(path)
     return {
         "name": path.name,
@@ -6785,10 +8112,14 @@ def _episode_summary(path: Path) -> dict[str, Any]:
         "kind": "recording" if meta_path is not None and meta_path.name == "session_meta.json" else "episode",
         "created_at": meta.get("created_at"),
         "source_repo_id": meta.get("source_repo_id") or meta.get("dataset_repo_id"),
+        "dataset_name": meta.get("dataset_name"),
+        "dataset_slug": meta.get("dataset_slug"),
+        "episodes_root": meta.get("episodes_root"),
         "task": meta.get("task"),
         "duration_s": meta.get("duration_s") or result.get("duration_s"),
         "result": result,
-        "counts": {"samples": len(samples), **camera_counts},
+        **_compaction_status(meta, result),
+        "counts": {"samples": sample_count, **camera_counts},
         "cameras": cameras,
         "segment_count": len(manifest.get("segments", [])),
         "eval": {
@@ -6815,6 +8146,10 @@ def _episode_detail(path: Path) -> dict[str, Any]:
         "kind": "recording" if meta_path is not None and meta_path.name == "session_meta.json" else "episode",
         "meta": meta,
         "result": result,
+        "dataset_name": meta.get("dataset_name"),
+        "dataset_slug": meta.get("dataset_slug"),
+        "episodes_root": meta.get("episodes_root"),
+        **_compaction_status(meta, result),
         "eval_summary": {
             "state": result.get("outcome") or eval_summary.get("state"),
             "successes": eval_summary.get("successes", 0),
@@ -7080,8 +8415,11 @@ def make_handler(controller: SO101Controller):
                         exec_steps=int(data.get("exec_steps", DEFAULT_EXEC_STEPS)),
                         max_step_deg=float(data.get("max_step_deg", DEFAULT_MAX_STEP_DEG)),
                         hz=float(data.get("hz", DEFAULT_HZ)),
+                        realtime_chunking=bool(data.get("realtime_chunking", DEFAULT_REALTIME_CHUNKING)),
+                        realtime_query_fraction_value=data.get("realtime_query_fraction", REALTIME_QUERY_FRACTION),
                         allow_teleop=bool(data.get("allow_teleop", True)),
                         record_episodes=bool(data.get("record_episodes", True)),
+                        record_interventions_only=bool(data.get("record_interventions_only", False)),
                         dataset_name=str(data.get("dataset_name", "")),
                     )
                     _json_response(self, 200, {"ok": True, "eval": controller.status().get("eval")})
@@ -7137,6 +8475,8 @@ def make_handler(controller: SO101Controller):
                         exec_steps=int(data.get("exec_steps", DEFAULT_EXEC_STEPS)),
                         max_step_deg=float(data.get("max_step_deg", DEFAULT_MAX_STEP_DEG)),
                         hz=float(data.get("hz", DEFAULT_HZ)),
+                        realtime_chunking=bool(data.get("realtime_chunking", DEFAULT_REALTIME_CHUNKING)),
+                        realtime_query_fraction_value=data.get("realtime_query_fraction", REALTIME_QUERY_FRACTION),
                     )
                     _json_response(self, 200, {"ok": True})
                 elif parsed.path == "/api/stop":
@@ -7197,8 +8537,18 @@ def make_handler(controller: SO101Controller):
                     )
                     _json_response(self, 200, {"ok": True, **result})
                 elif parsed.path == "/api/record/stop":
-                    controller.stop_recording()
-                    _json_response(self, 200, {"ok": True})
+                    if controller._eval_running():
+                        controller.stop_eval()
+                    else:
+                        controller.stop_recording(stop_policy=True)
+                    if controller.eval_thread is not None:
+                        controller.eval_thread.join(timeout=10.0)
+                    if controller.record_thread is not None:
+                        controller.record_thread.join(timeout=10.0)
+                    if controller.policy_thread is not None:
+                        controller.policy_thread.join(timeout=10.0)
+                    export = controller.export_recorded_dataset(dataset_name=str(data.get("dataset_name", "")))
+                    _json_response(self, 200, {"ok": True, "export": export})
                 elif parsed.path == "/api/segments/save":
                     source_dir = _safe_episode_dir(str(data.get("source", "latest")))
                     manifest = _write_segment_manifest(source_dir, data.get("segments", []))
@@ -7218,15 +8568,28 @@ def make_handler(controller: SO101Controller):
                     )
                     _json_response(self, 200, {"ok": True, **summary})
                 elif parsed.path == "/api/dataset/compress":
+                    dataset_name = str(data.get("dataset_name", ""))
+                    root = str(data.get("root", ""))
+                    episodes_root_name = str(data.get("episodes_root_name", ""))
+                    cameras = [str(camera) for camera in data.get("cameras", [])]
+                    if bool(data.get("auto_cameras", False)):
+                        cameras = controller.resolve_record_export_cameras(
+                            dataset_name=dataset_name,
+                            root=root,
+                            episodes_root_name=episodes_root_name,
+                        )
                     status = controller.start_dataset_compression(
                         repo_id=str(data.get("repo_id", "")),
-                        dataset_name=str(data.get("dataset_name", "")),
-                        root=str(data.get("root", "")),
-                        episodes_root_name=str(data.get("episodes_root_name", "")),
+                        dataset_name=dataset_name,
+                        root=root,
+                        episodes_root_name=episodes_root_name,
                         upload=bool(data.get("upload", False)),
                         private=bool(data.get("private", False)),
                         include_failures=bool(data.get("include_failures", False)),
                         overwrite=bool(data.get("overwrite", False)),
+                        append=bool(data.get("append", False)),
+                        cameras=cameras,
+                        skip_unusable=bool(data.get("skip_unusable", False)),
                     )
                     _json_response(self, 200, {"ok": True, "dataset": status})
                 elif parsed.path == "/api/sam3/preview":
@@ -7241,6 +8604,13 @@ def make_handler(controller: SO101Controller):
                     _json_response(self, 200, result)
                 elif parsed.path == "/api/success/sam3":
                     status = controller.configure_success_sam3(
+                        prompt=str(data.get("prompt", SUCCESS_CONTAINER_SAM3_PROMPT)),
+                        min_score=float(data.get("min_score", SUCCESS_CONTAINER_SAM3_MIN_SCORE)),
+                    )
+                    _json_response(self, 200, {"ok": True, "success_tracking": status})
+                elif parsed.path == "/api/success/rerun_sam3":
+                    status = controller.rerun_success_sam3(
+                        camera=data.get("camera", "front"),
                         prompt=str(data.get("prompt", SUCCESS_CONTAINER_SAM3_PROMPT)),
                         min_score=float(data.get("min_score", SUCCESS_CONTAINER_SAM3_MIN_SCORE)),
                     )

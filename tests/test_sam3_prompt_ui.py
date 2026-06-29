@@ -68,3 +68,10 @@ def test_detect_image_returns_mask_only_when_requested():
     assert "mask_png_b64" in live["top_mask"]
     assert "mask_png_b64" in live["results"][0]["detections"][0]
 
+
+def test_sam3_service_exposes_health_route() -> None:
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "sam3_prompt_ui.py").read_text()
+
+    assert 'parsed.path == "/health"' in source
+    assert '"ok": True' in source
+    assert '"active_backend": self.session._active_backend' in source

@@ -108,6 +108,8 @@ class LeRobotMolmoAct2Runner:
         *,
         policy_path: str | None,
         checkpoint_path: str | None,
+        lora_llm_path: str | None,
+        lora_vision_path: str | None,
         norm_tag: str | None,
         image_keys: list[str],
         state_key: str,
@@ -125,6 +127,8 @@ class LeRobotMolmoAct2Runner:
 
         self.policy_path = str(Path(policy_path).expanduser()) if policy_path else None
         self.checkpoint_path = checkpoint_path
+        self.lora_llm_path = str(Path(lora_llm_path).expanduser()) if lora_llm_path else None
+        self.lora_vision_path = str(Path(lora_vision_path).expanduser()) if lora_vision_path else None
         self.norm_tag = norm_tag
         self.image_keys = list(image_keys)
         self.state_key = state_key
@@ -144,6 +148,11 @@ class LeRobotMolmoAct2Runner:
         self.policy_type = "molmoact2"
         self.runner_api = "lerobot_policy"
         self.loaded_from = self.policy_path or self.checkpoint_path or ""
+        if self.lora_llm_path or self.lora_vision_path:
+            self.loaded_from += (
+                f" + lora(llm={self.lora_llm_path or 'none'}, "
+                f"vision={self.lora_vision_path or 'none'})"
+            )
 
         self._load_policy()
 
@@ -279,8 +288,107 @@ class LeRobotMolmoAct2Runner:
                 "allenai/MolmoAct2-FAST-Tokenizer",
                 trust_remote_code=True,
             )
+        self._apply_hf_lora_adapters()
         self.policy_type = "molmoact2"
         self.runner_api = "hf_predict_action"
+
+    def _apply_hf_lora_adapters(self) -> None:
+        if not (self.lora_llm_path or self.lora_vision_path):
+            return
+        try:
+            from peft import PeftModel
+        except Exception as exc:
+            raise SystemExit("peft is required to load MolmoAct2 LoRA adapters.") from exc
+
+        inner_model = getattr(self.policy, "model", self.policy)
+
+        if self.lora_llm_path:
+            transformer = getattr(inner_model, "transformer", None)
+            if transformer is None:
+                raise SystemExit("Cannot load --lora-llm-path: policy.model.transformer was not found.")
+            print(f"[molmoact2] merging LLM LoRA adapter from {self.lora_llm_path}", flush=True)
+            self._merge_llm_lora_adapter(transformer, self.lora_llm_path)
+
+        if self.lora_vision_path:
+            vision_backbone = getattr(inner_model, "vision_backbone", None)
+            if vision_backbone is None:
+                raise SystemExit(
+                    "Cannot load --lora-vision-path: policy.model.vision_backbone was not found."
+                )
+            print(f"[molmoact2] loading vision LoRA adapter from {self.lora_vision_path}", flush=True)
+            inner_model.vision_backbone = PeftModel.from_pretrained(
+                vision_backbone,
+                self.lora_vision_path,
+                is_trainable=False,
+            ).merge_and_unload()
+
+    def _merge_llm_lora_adapter(self, transformer: Any, adapter_path: str) -> None:
+        adapter_dir = Path(adapter_path)
+        config_path = adapter_dir / "adapter_config.json"
+        weights_path = adapter_dir / "adapter_model.bin"
+        if not config_path.exists() or not weights_path.exists():
+            raise SystemExit(f"LLM LoRA adapter is missing adapter_config.json or adapter_model.bin: {adapter_path}")
+
+        with config_path.open("r", encoding="utf-8") as f:
+            adapter_config = json.load(f)
+        rank = float(adapter_config.get("r") or 1.0)
+        alpha = float(adapter_config.get("lora_alpha") or rank)
+        scaling = alpha / rank
+        fan_in_fan_out = bool(adapter_config.get("fan_in_fan_out", False))
+        state = self.torch.load(str(weights_path), map_location="cpu")
+
+        merged = 0
+        skipped: list[str] = []
+        with self.torch.no_grad():
+            for a_key, lora_a in state.items():
+                if not a_key.endswith(".lora_A.weight"):
+                    continue
+                prefix = a_key[: -len(".lora_A.weight")]
+                b_key = prefix + ".lora_B.weight"
+                lora_b = state.get(b_key)
+                if lora_b is None:
+                    skipped.append(prefix)
+                    continue
+                raw_module_name = prefix.removeprefix("base_model.model.")
+                module_name = self._map_llm_lora_module_name(raw_module_name)
+                try:
+                    module = transformer.get_submodule(module_name)
+                except AttributeError:
+                    skipped.append(raw_module_name)
+                    continue
+                weight = getattr(module, "weight", None)
+                if weight is None:
+                    skipped.append(raw_module_name)
+                    continue
+                delta = (lora_b.float() @ lora_a.float()) * scaling
+                if fan_in_fan_out:
+                    delta = delta.T
+                if tuple(delta.shape) != tuple(weight.shape):
+                    if tuple(delta.T.shape) == tuple(weight.shape):
+                        delta = delta.T
+                    else:
+                        skipped.append(raw_module_name)
+                        continue
+                weight.data.add_(delta.to(device=weight.device, dtype=weight.dtype))
+                merged += 1
+        if skipped:
+            print(
+                f"[molmoact2] warning: skipped {len(skipped)} LLM LoRA modules: "
+                + ", ".join(skipped[:8]),
+                flush=True,
+            )
+        print(f"[molmoact2] merged {merged} LLM LoRA modules", flush=True)
+
+    @staticmethod
+    def _map_llm_lora_module_name(module_name: str) -> str:
+        parts = module_name.split(".")
+        if len(parts) >= 3 and parts[0] == "blocks":
+            leaf = parts[2]
+            if leaf in {"att_proj", "attn_out"}:
+                return ".".join([parts[0], parts[1], "self_attn", *parts[2:]])
+            if leaf in {"ff_proj", "ff_out"}:
+                return ".".join([parts[0], parts[1], "mlp", *parts[2:]])
+        return module_name
 
     def health(self) -> dict[str, Any]:
         cuda_available = None
@@ -526,6 +634,8 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--policy-path", default="", help="LeRobot-saved policy directory or Hub repo.")
     parser.add_argument("--checkpoint-path", default="", help="Original MolmoAct2 HF checkpoint path/repo.")
+    parser.add_argument("--lora-llm-path", default="", help="Optional PEFT LoRA adapter for model.transformer.")
+    parser.add_argument("--lora-vision-path", default="", help="Optional PEFT LoRA adapter for model.vision_backbone.")
     parser.add_argument("--norm-tag", default="", help="Required for original MolmoAct2 HF checkpoints.")
     parser.add_argument("--image-keys", default=json.dumps(list(DEFAULT_IMAGE_KEYS)))
     parser.add_argument("--state-key", default=DEFAULT_STATE_KEY)
@@ -542,6 +652,8 @@ def main() -> int:
     runner = LeRobotMolmoAct2Runner(
         policy_path=args.policy_path or None,
         checkpoint_path=args.checkpoint_path or None,
+        lora_llm_path=args.lora_llm_path or None,
+        lora_vision_path=args.lora_vision_path or None,
         norm_tag=args.norm_tag or None,
         image_keys=_parse_json_list(args.image_keys, default=DEFAULT_IMAGE_KEYS),
         state_key=args.state_key,

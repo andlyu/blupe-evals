@@ -131,6 +131,9 @@ def main() -> int:
     parser.add_argument("--include-compressed", action="store_true", help="Re-use episodes already marked compressed.")
     parser.add_argument("--append", action="store_true", help="Append to an existing local dataset root.")
     parser.add_argument("--overwrite", action="store_true", help="Delete and recreate the local dataset root.")
+    parser.add_argument("--camera", action="append", default=[], help="Camera to include. Repeat for multiple cameras.")
+    parser.add_argument("--skip-unusable", action="store_true", help="Skip successful episodes with no common usable frames.")
+    parser.add_argument("--parallel-encoding", action="store_true", help="Encode videos in parallel. Sequential is safer on macOS.")
     parser.add_argument("--upload", action="store_true", help="Upload the compressed dataset to Hugging Face Hub.")
     parser.add_argument("--private", action="store_true", help="Create/upload the HF dataset as private.")
     parser.add_argument("--mark-existing-root", action="store_true", help="Mark selected raw episodes as compressed by --root without re-encoding.")
@@ -147,9 +150,25 @@ def main() -> int:
         print("no matching uncompressed episodes")
         return 0
 
+    all_plans = [converter._episode_plan(path, args.camera, 0) for path in episodes]
+    converter._print_plan(all_plans)
+    unusable = [plan for plan in all_plans if int(plan["usable"]) == 0]
+    if unusable and args.skip_unusable:
+        for plan in unusable:
+            print(f"skipping unusable episode {plan['episode_dir']}")
+        plans = [plan for plan in all_plans if int(plan["usable"]) > 0]
+    else:
+        plans = all_plans
+    if not plans:
+        print("no usable episodes")
+        return 0
+
+    if any(plan["usable"] == 0 for plan in plans):
+        bad = [str(plan["episode_dir"]) for plan in plans if plan["usable"] == 0]
+        raise SystemExit(f"episodes have no usable state/action samples: {bad}")
+
+    episodes = [Path(plan["episode_dir"]) for plan in plans]
     root, repo_id = _default_paths(args, episodes)
-    plans = [converter._episode_plan(path, [], 0) for path in episodes]
-    converter._print_plan(plans)
     total_frames = sum(int(plan["usable"]) for plan in plans)
     print(json.dumps({"dataset_root": str(root), "repo_id": repo_id, "episodes": len(episodes), "frames": total_frames}, indent=2))
     if args.dry_run:
@@ -169,9 +188,6 @@ def main() -> int:
         print(f"marked compressed root={root} repo_id={repo_id} frames={total_frames}")
         return 0
 
-    if any(plan["usable"] == 0 for plan in plans):
-        bad = [str(plan["episode_dir"]) for plan in plans if plan["usable"] == 0]
-        raise SystemExit(f"episodes have no usable state/action samples: {bad}")
     if root.exists() and args.overwrite:
         shutil.rmtree(root)
 
@@ -194,7 +210,7 @@ def main() -> int:
     try:
         for plan in plans:
             task = plan["task"] or "SO-101 episode"
-            frames = converter._add_episode(dataset, plan, task, parallel_encoding=True)
+            frames = converter._add_episode(dataset, plan, task, parallel_encoding=args.parallel_encoding)
             total += frames
             print(f"saved episode {plan['episode_dir']} frames={frames} task={task!r}")
     finally:

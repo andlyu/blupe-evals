@@ -561,6 +561,21 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             self._send(200, HTML.encode(), "text/html; charset=utf-8")
             return
+        if parsed.path == "/health":
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "frames": len(self.session.frames),
+                    "width": self.session.size[0],
+                    "height": self.session.size[1],
+                    "device": str(self.session.device),
+                    "backend": self.session.backend,
+                    "active_backend": self.session._active_backend,
+                    "model_id": self.session.model_id,
+                },
+            )
+            return
         if parsed.path == "/api/frames":
             self._json(
                 200,

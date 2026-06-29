@@ -14,6 +14,7 @@ import argparse
 import json
 import select
 import socket
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cv2
 
 BOUNDARY = b"--frame"
+CAPTURE_BACKEND = getattr(cv2, "CAP_AVFOUNDATION", None) if sys.platform == "darwin" else None
 
 
 class Cam:
@@ -51,7 +53,10 @@ class Cam:
     def _open_capture(self):
         if self.cap is not None:
             self.cap.release()
-        cap = cv2.VideoCapture(self.dev)
+        if CAPTURE_BACKEND is None:
+            cap = cv2.VideoCapture(self.dev)
+        else:
+            cap = cv2.VideoCapture(self.dev, CAPTURE_BACKEND)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)

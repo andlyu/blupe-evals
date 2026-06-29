@@ -8,6 +8,7 @@ dist/
 
 # Virtualenvs
 .venv/
+.venv-*/
 venv/
 env/
 
@@ -30,6 +31,8 @@ data/
 recordings/
 episodes/
 datasets/
+artifacts/
+screenlog.*
 *.log
 .gstack/
 
@@ -38,4 +41,5 @@ runs/
 
 # Machine/scene-local state (marked waypoints; Claude permission allowlist may hold tokens)
 scripts/policies/waypoints.json
+fleet.json
 .claude/settings.local.json
