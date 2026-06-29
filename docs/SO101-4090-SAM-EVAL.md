@@ -42,13 +42,14 @@ When the Vast SSH target changes, copy `config/so101_eval_stack.env.example` to
 
 The success tracker uses SAM3 to seed the cup/cylinder mask and to refresh the
 ball mask periodically. The stack default refreshes the ball with SAM3 every
-`SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=3` success-tracker frames, then uses
-SAM2 as the bridge between SAM3 refreshes. SAM2 requests run in the background
-every `SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2` success-tracker frames, about
-5 Hz at the default 10 Hz success loop, while the live video keeps drawing with
-the latest completed mask. Current defaults are `black cylinder along with
-insides` for the cup/cylinder at minimum score `0.25`, and `blue rubber ball`
-for the ball at minimum score `0.25`.
+`SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=100` success-tracker frames, about every
+10 seconds at the default 10 Hz success loop, then uses SAM2 as the bridge
+between SAM3 refreshes. SAM2 requests run in the background every
+`SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2` success-tracker frames, about 5 Hz at
+the default 10 Hz success loop, while `/api/success.mjpg` keeps drawing fresh
+camera frames with the latest completed mask. Current defaults are `black
+cylinder along with insides` for the cup/cylinder at minimum score `0.25`, and
+`blue rubber ball` for the ball at minimum score `0.25`.
 
 ## 4090 Setup
 
@@ -126,7 +127,7 @@ SO101_SUCCESS_SAM3_PROMPT="black cylinder along with insides" \
 SO101_SUCCESS_SAM3_MIN_SCORE=0.25 \
 SO101_SUCCESS_BALL_SAM3_PROMPT="blue rubber ball" \
 SO101_SUCCESS_BALL_SAM3_MIN_SCORE=0.25 \
-SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=3 \
+SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=100 \
 SO101_SUCCESS_BALL_SAM2_AUTO=1 \
 SO101_SUCCESS_BALL_SAM2_URL=http://127.0.0.1:8214/api/track_image \
 SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2 \

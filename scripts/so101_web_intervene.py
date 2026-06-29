@@ -97,6 +97,7 @@ HOME_POSE_PATH = REPO_ROOT / "config" / "so101_home.json"
 HOME_EPS_DEG = 1.0
 HOME_STEP_DEG = 5.0
 DEFAULT_SUCCESS_FPS = 10.0
+SUCCESS_MASK_STREAM_FPS = float(os.environ.get("SO101_SUCCESS_MASK_STREAM_FPS", "15"))
 DEFAULT_STATUS_LOG_LIMIT = 60
 MAX_STATUS_LOG_LIMIT = 150
 TELEOP_LEASE_TIMEOUT_S = 30.0
@@ -3053,6 +3054,36 @@ class SO101Controller:
         with self.success_condition:
             self.success_overlay_jpeg = encoded.tobytes()
             self.success_condition.notify_all()
+
+    def render_success_overlay_jpeg(self, camera: Any = "front", timeout_s: float = 1.0) -> bytes | None:
+        try:
+            cam = self._camera_from_spec(camera)
+            rgb = self.read_camera_frame(cam, timeout_s=timeout_s)
+        except BaseException:
+            return self.success_overlay_jpeg
+
+        with self.success_tracker_lock:
+            cup_mask = self.success_tracker.cup_mask
+            ball_mask = self.success_tracker.ball_mask
+            shape = rgb.shape[:2]
+            if cup_mask is None or cup_mask.shape != shape:
+                cup_mask = np.zeros(shape, dtype=bool)
+            else:
+                cup_mask = cup_mask.copy()
+            if ball_mask is None or ball_mask.shape != shape:
+                ball_mask = np.zeros(shape, dtype=bool)
+            else:
+                ball_mask = ball_mask.copy()
+            overlay = self.success_tracker.overlay(rgb, cup_mask, ball_mask, success_this_frame=False)
+
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), 82],
+        )
+        if not ok:
+            return self.success_overlay_jpeg
+        return encoded.tobytes()
 
     def _set_success_status(self, status: dict[str, Any], overlay_rgb: np.ndarray | None) -> None:
         should_handle_record_success = False
@@ -8565,12 +8596,14 @@ def _success_mjpeg_stream(handler: BaseHTTPRequestHandler, controller: SO101Cont
     handler.send_header("Cache-Control", "no-store")
     handler.end_headers()
     last_jpeg: bytes | None = None
+    period = 1.0 / SUCCESS_MASK_STREAM_FPS if SUCCESS_MASK_STREAM_FPS > 0 else 0.0
     try:
         while True:
-            with controller.success_condition:
-                controller.success_condition.wait(timeout=1.0)
-                jpeg = controller.success_overlay_jpeg
+            started = time.monotonic()
+            jpeg = controller.render_success_overlay_jpeg("front")
             if jpeg is None or jpeg == last_jpeg:
+                if period > 0:
+                    time.sleep(period)
                 continue
             last_jpeg = jpeg
             handler.wfile.write(b"--" + boundary + b"\r\n")
@@ -8578,6 +8611,8 @@ def _success_mjpeg_stream(handler: BaseHTTPRequestHandler, controller: SO101Cont
             handler.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii"))
             handler.wfile.write(jpeg)
             handler.wfile.write(b"\r\n")
+            if period > 0:
+                time.sleep(max(0.0, period - (time.monotonic() - started)))
     except (BrokenPipeError, ConnectionResetError):
         return
 

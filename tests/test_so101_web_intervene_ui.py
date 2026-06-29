@@ -111,6 +111,13 @@ def test_live_view_start_recording_uses_visible_prompt_and_dataset_name() -> Non
     assert "getElementById('successOverlay')" not in SOURCE
 
 
+def test_success_mask_stream_renders_fresh_camera_frames_with_cached_masks() -> None:
+    assert "SUCCESS_MASK_STREAM_FPS" in SOURCE
+    assert "def render_success_overlay_jpeg" in SOURCE
+    assert "controller.render_success_overlay_jpeg(\"front\")" in SOURCE
+    assert "controller.success_condition.wait(timeout=1.0)" not in SOURCE
+
+
 def test_stop_state_does_not_force_live_view() -> None:
     auto_active_start = SOURCE.index("const autoActive = (")
     auto_active_end = SOURCE.index("  );", auto_active_start)
