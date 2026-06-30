@@ -562,6 +562,9 @@ def test_success_tracker_tracks_sam3_request_timings(monkeypatch) -> None:
     assert status["ball_mask_sam3_async_request_to_response_s"] is not None
     assert status["ball_mask_sam3_async_request_to_response_s"] >= 0.0
     assert status["ball_mask_sam3_async_frame_to_request_history_s"]
+    assert status["ball_mask_sam3_inference_hz"] is not None
+    assert status["ball_mask_sam3_inference_hz"] >= 3.0
+    assert status["ball_mask_sam3_inference_hz_meets_target"] is True
 
 
 def test_success_tracker_tracks_sam2_request_timings(monkeypatch) -> None:
@@ -634,3 +637,96 @@ def test_success_tracker_tracks_sam2_request_timings(monkeypatch) -> None:
     assert status["ball_mask_sam2_async_request_to_response_s"] is not None
     assert status["ball_mask_sam2_async_request_to_response_s"] >= 0.0
     assert status["ball_mask_sam2_async_frame_to_request_history_s"]
+
+
+def test_success_tracker_tracks_sam2_vs_sam3_alignment_rate(monkeypatch) -> None:
+    module = _load_so101_web_intervene()
+    module.SUCCESS_BALL_SAM2_MIN_PRIOR_IOU = 0.0
+    module.SUCCESS_BALL_SAM2_MAX_CENTER_SHIFT_PX = 9999.0
+    calls = []
+
+    def fake_post(url, json, timeout):
+        del timeout
+        calls.append({"url": url})
+        aligned_mask = np.zeros((360, 640), dtype=np.uint8)
+        aligned_mask[130:155, 270:295] = 255
+        shifted_mask = np.zeros((360, 640), dtype=np.uint8)
+        shifted_mask[200:225, 300:325] = 255
+
+        if len(calls) == 1:
+            data_mask = aligned_mask
+            frame_idx = 1
+        else:
+            data_mask = shifted_mask
+            frame_idx = 2
+
+        ok, encoded = cv2.imencode(".png", data_mask)
+        assert ok
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "top_mask": {
+                        "tracked": True,
+                        "source": "sam2_video_track",
+                        "frame_idx": frame_idx,
+                        "score": 0.77,
+                        "area": int((data_mask > 0).sum()),
+                        "box_xyxy": [0, 0, 1, 1],
+                        "mask_png_b64": module.base64.b64encode(encoded.tobytes()).decode("ascii"),
+                    }
+                }
+
+        return Response()
+
+    monkeypatch.setattr(module.requests, "post", fake_post)
+
+    class Tracker(module.LiveCupSuccessTracker):
+        def __init__(self):
+            self.sam3_ball_calls = 0
+            super().__init__()
+            self.ball_sam2_url = "http://sam2.test/api/track_image"
+            self.ball_mask_sam3_every_n_frames = 0
+            self.ball_mask_sam2_every_n_frames = 1
+
+        def _calculate_sam3_cup_mask(self, rgb, default_area):
+            mask = np.zeros(rgb.shape[:2], dtype=bool)
+            mask[100:180, 240:320] = True
+            self.cup_mask_score = 1.0
+            self._set_sam3_mask_status("accepted", "test")
+            return mask, "sam3:test cup"
+
+        def _calculate_sam3_ball_mask(self, rgb):
+            self.sam3_ball_calls += 1
+            mask = np.zeros(rgb.shape[:2], dtype=bool)
+            mask[130:155, 270:295] = True
+            self.ball_mask_score = 0.9
+            self._set_ball_sam3_status("accepted", "test")
+            return mask, "sam3:blue rubber ball score=0.90"
+
+    tracker = Tracker()
+    tracker.update(_frame())
+    tracker.update(_frame())
+    assert _wait_until(lambda: len(calls) >= 1, timeout_s=2.0)
+
+    updates = 0
+    while updates < 6 and tracker.status()["ball_mask_sam2_vs_sam3_align_total"] < 2:
+        tracker.update(_frame())
+        updates += 1
+    assert _wait_until(lambda: len(calls) >= 2, timeout_s=2.0)
+    assert _wait_until(lambda: not tracker.status()["ball_mask_sam2_refresh_running"], timeout_s=2.0)
+
+    status = tracker.status()
+    assert status["ball_mask_sam2_vs_sam3_align_total"] == 2
+    assert status["ball_mask_sam2_vs_sam3_align_count"] == 1
+    assert status["ball_mask_sam2_vs_sam3_align_rate"] == 0.5
+    assert status["ball_mask_sam2_vs_sam3_last_aligned"] is False
+    assert status["ball_mask_sam2_vs_sam3_last_iou"] is not None
+    assert status["ball_mask_sam2_vs_sam3_last_iou"] < 0.25
+    assert len(status["ball_mask_sam2_vs_sam3_iou_history"]) == 2
+    assert status["ball_mask_sam2_inference_hz"] is not None
+    assert status["ball_mask_sam2_inference_hz"] >= 3.0
+    assert status["ball_mask_sam2_inference_hz_meets_target"] is True

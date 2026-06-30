@@ -61,14 +61,14 @@ SO101_CHECK_SAM3_DETECT=0 scripts/check_so101_eval_stack.sh
 When the Vast SSH target changes, copy `config/so101_eval_stack.env.example` to
 `config/so101_eval_stack.local.env` and update `SO101_GPU_HOST` / `SO101_GPU_PORT`.
 
-The success tracker uses SAM3 to seed the cup/cylinder mask and to refresh the
-ball mask periodically. The stack default refreshes the ball with SAM3 every
-`SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=100` success-tracker frames, about every
-10 seconds at the default 10 Hz success loop, then uses SAM2 as the bridge
-between SAM3 refreshes. The stack defaults to the low-latency SAM2 image
-tracker (`SO101_SAM2_TRACKER=image`) for live masks; set
-`SO101_SAM2_TRACKER=video` only for slower stateful video tracking tests. SAM2
-requests run in the background every
+The success tracker uses SAM3 to seed the cup/cylinder mask. The ball mask is
+refreshed by the configured tracker service behind `/api/track_image`. The
+default is the low-latency SAM2 image tracker (`SO101_SAM2_TRACKER=image`), but
+live evals can use SAM3 Video tracking by setting
+`SO101_SAM2_TRACKER=sam3_video` and pointing `SO101_SAM2_PORT` at the SAM3 Video
+tracker port, usually `8216`. The variable name is legacy; the tracker health
+response reports `mode: sam3_video` when SAM3 Video is active. Tracker requests
+run in the background every
 `SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2` success-tracker frames, about 5 Hz at
 the default 10 Hz success loop, while `/api/success.mjpg` keeps drawing fresh
 camera frames with the latest completed mask. Current defaults are `black

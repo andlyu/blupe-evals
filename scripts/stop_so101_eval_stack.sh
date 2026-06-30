@@ -6,7 +6,7 @@ set -euo pipefail
 # Defaults:
 #   - stop local policy/eval motion through the UI API
 #   - stop local UI, camera relay, and GPU tunnels
-#   - stop remote MolmoAct2/SAM2/SAM3 processes
+#   - stop remote MolmoAct2/SAM3/tracker processes
 #   - do not stop/destroy the Vast instance itself
 
 REPO_ROOT="${BLUPE_EVALS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -109,6 +109,7 @@ REMOTE_ROOT="$1"
 cd "${REMOTE_ROOT}/blupe-evals" 2>/dev/null || true
 pkill -f 'scripts/molmoact2_policy_runner.py' >/dev/null 2>&1 || true
 pkill -f 'scripts/sam3_prompt_ui.py' >/dev/null 2>&1 || true
+pkill -f 'scripts/sam3_video_track_ui.py' >/dev/null 2>&1 || true
 pkill -f 'scripts/sam2_video_track_ui.py' >/dev/null 2>&1 || true
 pkill -f 'scripts/sam2_track_ui.py' >/dev/null 2>&1 || true
 REMOTE

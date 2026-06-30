@@ -169,6 +169,42 @@ class Sam3Session:
     ) -> tuple[list[dict], int]:
         processor = self._processor_ready()
         assert self._model is not None
+        if hasattr(processor, "init_video_session") and hasattr(processor, "postprocess_outputs"):
+            dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+            session = processor.init_video_session(
+                inference_device=self.device,
+                inference_state_device=self.device,
+                processing_device=self.device,
+                video_storage_device=self.device,
+                dtype=dtype,
+            )
+            session = processor.add_text_prompt(session, prompt)
+            inputs = processor(images=image, return_tensors="pt").to(self.device)
+            outputs = self._model(session, frame=inputs["pixel_values"][0])
+            results = processor.postprocess_outputs(
+                session,
+                outputs,
+                original_sizes=inputs.get("original_sizes"),
+            )
+            masks = _to_numpy(results.get("masks", []))
+            boxes = _to_numpy(results.get("boxes", []))
+            scores = _to_numpy(results.get("scores", []))
+            detections = []
+            count = min(max_masks, len(masks))
+            for mask_idx in range(count):
+                score = float(scores[mask_idx])
+                if min_score is not None and score < min_score:
+                    continue
+                detections.append(
+                    _detection_from_mask(
+                        masks[mask_idx],
+                        boxes[mask_idx],
+                        score,
+                        include_mask=include_masks,
+                    )
+                )
+            return detections, int(len(masks))
+
         inputs = processor(images=image, text=prompt, return_tensors="pt").to(self.device)
         outputs = self._model(**inputs)
         target_sizes = inputs.get("original_sizes")

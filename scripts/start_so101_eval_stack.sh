@@ -6,7 +6,7 @@ set -euo pipefail
 # Starts or verifies:
 #   - remote MolmoAct2 policy server on :8202
 #   - remote SAM3 prompt server on :8213
-#   - remote SAM2 tracker on :8214
+#   - remote ball tracker on :8214 (SAM2 image/video or SAM3 video)
 #   - local SSH tunnels for :8202/:8213/:8214
 #   - local camera relay on :8089
 #   - local eval UI on :8092
@@ -71,6 +71,8 @@ SAM3_DETECT_TIMEOUT_S="${SO101_SAM3_DETECT_TIMEOUT_S:-240}"
 SAM3_DETECT_REQUEST_TIMEOUT_S="${SO101_SAM3_DETECT_REQUEST_TIMEOUT_S:-90}"
 SAM2_TRACKER="${SO101_SAM2_TRACKER:-image}"
 SAM2_MODEL_ID="${SO101_SAM2_MODEL_ID:-facebook/sam2.1-hiera-base-plus}"
+SAM3_VIDEO_MODEL_ID="${SO101_SAM3_VIDEO_MODEL_ID:-$SAM3_MODEL_ID}"
+SAM3_VIDEO_PROMPT="${SO101_SUCCESS_BALL_SAM3_PROMPT:-blue rubber ball}"
 
 UI_PORT="${SO101_WEB_PORT:-8092}"
 CAMERA_RELAY_PORT="${SO101_CAMERA_RELAY_PORT:-8089}"
@@ -201,6 +203,8 @@ start_remote_gpu_services() {
     "$SAM3_READY_PATH" \
     "$SAM2_TRACKER" \
     "$SAM2_MODEL_ID" \
+    "$SAM3_VIDEO_MODEL_ID" \
+    "$SAM3_VIDEO_PROMPT" \
     "$SAM3_DETECT_TIMEOUT_S" \
     "$SAM3_DETECT_REQUEST_TIMEOUT_S" <<'REMOTE'
 set -euo pipefail
@@ -237,8 +241,10 @@ SAM3_FRAMES_DIR="${20}"
 SAM3_READY_PATH="${21}"
 SAM2_TRACKER="${22}"
 SAM2_MODEL_ID="${23}"
-SAM3_DETECT_TIMEOUT_S="${24}"
-SAM3_DETECT_REQUEST_TIMEOUT_S="${25}"
+SAM3_VIDEO_MODEL_ID="${24}"
+SAM3_VIDEO_PROMPT="${25}"
+SAM3_DETECT_TIMEOUT_S="${26}"
+SAM3_DETECT_REQUEST_TIMEOUT_S="${27}"
 IMAGE_KEYS="$(printf '%s' "$IMAGE_KEYS_B64" | base64 -d)"
 
 mkdir -p "$LOG_DIR" "$SAM3_FRAMES_DIR"
@@ -350,26 +356,38 @@ case "$SAM2_TRACKER" in
   image)
     SAM2_SCRIPT="scripts/sam2_track_ui.py"
     SAM2_EXPECTED_MODE="sam2_image"
+    TRACKER_MODEL_ID="$SAM2_MODEL_ID"
+    TRACKER_EXTRA_ARGS=()
     ;;
   video)
     SAM2_SCRIPT="scripts/sam2_video_track_ui.py"
     SAM2_EXPECTED_MODE="sam2_video"
+    TRACKER_MODEL_ID="$SAM2_MODEL_ID"
+    TRACKER_EXTRA_ARGS=()
+    ;;
+  sam3_video)
+    SAM2_SCRIPT="scripts/sam3_video_track_ui.py"
+    SAM2_EXPECTED_MODE="sam3_video"
+    TRACKER_MODEL_ID="$SAM3_VIDEO_MODEL_ID"
+    TRACKER_EXTRA_ARGS=(--prompt "$SAM3_VIDEO_PROMPT")
     ;;
   *)
-    echo "Unknown SO101_SAM2_TRACKER=${SAM2_TRACKER}; expected image or video" >&2
+    echo "Unknown SO101_SAM2_TRACKER=${SAM2_TRACKER}; expected image, video, or sam3_video" >&2
     exit 1
     ;;
 esac
 
 SAM2_HEALTH="$(curl -fsS --max-time 2 "http://127.0.0.1:${SAM2_PORT}/health" 2>/dev/null || true)"
 if ! printf '%s' "$SAM2_HEALTH" | grep -q "\"mode\":\"${SAM2_EXPECTED_MODE}\""; then
+  pkill -f 'scripts/sam3_video_track_ui.py' >/dev/null 2>&1 || true
   pkill -f 'scripts/sam2_video_track_ui.py' >/dev/null 2>&1 || true
   pkill -f 'scripts/sam2_track_ui.py' >/dev/null 2>&1 || true
   nohup "$PYTHON" "$SAM2_SCRIPT" \
     --host 127.0.0.1 \
     --port "$SAM2_PORT" \
     --device cuda \
-    --model-id "$SAM2_MODEL_ID" \
+    --model-id "$TRACKER_MODEL_ID" \
+    "${TRACKER_EXTRA_ARGS[@]}" \
     >"${LOG_DIR}/sam2_${SAM2_PORT}.log" 2>&1 &
   echo $! >"${LOG_DIR}/sam2_${SAM2_PORT}.pid"
 fi
@@ -408,7 +426,7 @@ fi
 
 wait_local_http "http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}" 60 "remote SAM3 port"
 wait_sam3_detect "$SAM3_DETECT_TIMEOUT_S" "remote SAM3 detect"
-wait_local_http "http://127.0.0.1:${SAM2_PORT}/health" 60 "remote SAM2"
+wait_local_http "http://127.0.0.1:${SAM2_PORT}/health" 60 "remote ball tracker"
 wait_local_http "http://127.0.0.1:${POLICY_PORT}/health" 240 "remote MolmoAct2"
 REMOTE
 }
@@ -431,7 +449,7 @@ start_tunnels() {
       "${GPU_USER}@${GPU_HOST}"
 
   wait_http "http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}" "$TUNNEL_READY_TIMEOUT_S" "local SAM3 tunnel"
-  wait_http "http://127.0.0.1:${SAM2_PORT}/health" "$TUNNEL_READY_TIMEOUT_S" "local SAM2 tunnel"
+  wait_http "http://127.0.0.1:${SAM2_PORT}/health" "$TUNNEL_READY_TIMEOUT_S" "local ball-tracker tunnel"
   wait_http "http://127.0.0.1:${POLICY_PORT}/health" "$GPU_READY_TIMEOUT_S" "local MolmoAct2 tunnel"
 }
 
@@ -484,4 +502,4 @@ echo "  UI:       ${UI_URL}"
 echo "  Cameras:  http://127.0.0.1:${CAMERA_RELAY_PORT}/health"
 echo "  Policy:   http://127.0.0.1:${POLICY_PORT}/health"
 echo "  SAM3:     http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}"
-echo "  SAM2:     http://127.0.0.1:${SAM2_PORT}/health"
+echo "  Tracker:  http://127.0.0.1:${SAM2_PORT}/health"

@@ -37,7 +37,7 @@ def test_pipeline_script_routes_so101_eval_commands() -> None:
 def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
     assert "remote MolmoAct2 policy server on :8202" in START_SCRIPT
     assert "remote SAM3 prompt server on :8213" in START_SCRIPT
-    assert "remote SAM2 tracker on :8214" in START_SCRIPT
+    assert "remote ball tracker on :8214" in START_SCRIPT
     assert "local SSH tunnels for :8202/:8213/:8214" in START_SCRIPT
     assert 'POLICY_PORT="${SO101_POLICY_PORT:-8202}"' in START_SCRIPT
     assert 'SAM3_PORT="${SO101_SAM3_PORT:-8213}"' in START_SCRIPT
@@ -51,6 +51,10 @@ def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
     assert 'SAM2_EXPECTED_MODE="sam2_image"' in START_SCRIPT
     assert 'SAM2_SCRIPT="scripts/sam2_video_track_ui.py"' in START_SCRIPT
     assert 'SAM2_EXPECTED_MODE="sam2_video"' in START_SCRIPT
+    assert 'SAM2_SCRIPT="scripts/sam3_video_track_ui.py"' in START_SCRIPT
+    assert 'SAM2_EXPECTED_MODE="sam3_video"' in START_SCRIPT
+    assert 'TRACKER_MODEL_ID="$SAM3_VIDEO_MODEL_ID"' in START_SCRIPT
+    assert 'TRACKER_EXTRA_ARGS=(--prompt "$SAM3_VIDEO_PROMPT")' in START_SCRIPT
     assert 'REMOTE_POLICY_PATH="${MOLMOACT2_POLICY_PATH:-__none__}"' in START_SCRIPT
     assert 'if [ "$POLICY_PATH" = "__none__" ]; then' in START_SCRIPT
     assert 'MOLMOACT2_IMAGE_KEYS_B64="$(printf \'%s\' "$MOLMOACT2_IMAGE_KEYS" | base64 | tr -d \'\\n\')"' in START_SCRIPT
@@ -93,6 +97,7 @@ def test_stop_script_stops_motion_local_processes_tunnels_and_remote_services() 
     assert 'stop_screen "$TUNNEL_SCREEN"' in STOP_SCRIPT
     assert 'pkill -f \'scripts/molmoact2_policy_runner.py\'' in STOP_SCRIPT
     assert 'pkill -f \'scripts/sam3_prompt_ui.py\'' in STOP_SCRIPT
+    assert 'pkill -f \'scripts/sam3_video_track_ui.py\'' in STOP_SCRIPT
     assert 'pkill -f \'scripts/sam2_video_track_ui.py\'' in STOP_SCRIPT
     assert 'pkill -f \'scripts/sam2_track_ui.py\'' in STOP_SCRIPT
     assert 'SO101_STOP_VAST_INSTANCE' in STOP_SCRIPT
@@ -109,6 +114,7 @@ def test_check_script_verifies_local_stack_and_optional_remote_gpu() -> None:
     assert '"http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}"' in CHECK_SCRIPT
     assert '"http://127.0.0.1:${SAM3_PORT}/api/detect_image"' in CHECK_SCRIPT
     assert '"http://127.0.0.1:${SAM2_PORT}/health"' in CHECK_SCRIPT
+    assert 'check_local_json_hint "tracker" "http://127.0.0.1:${SAM2_PORT}/health"' in CHECK_SCRIPT
     assert '"http://127.0.0.1:${UI_PORT}/api/status?log_limit=1"' in CHECK_SCRIPT
     assert 'ssh "${ssh_opts[@]}" "${GPU_USER}@${GPU_HOST}"' in CHECK_SCRIPT
     assert "SO101 eval stack preflight passed." in CHECK_SCRIPT
@@ -125,6 +131,8 @@ def test_stack_env_example_documents_mutable_vast_config() -> None:
     assert "SO101_SAM3_DETECT_TIMEOUT_S=240" in ENV_EXAMPLE
     assert "SO101_RUN_FINAL_CHECK=1" in ENV_EXAMPLE
     assert "SO101_SAM2_TRACKER=image" in ENV_EXAMPLE
+    assert "SO101_SAM2_TRACKER=sam3_video" in ENV_EXAMPLE
+    assert "SO101_SAM3_VIDEO_MODEL_ID=facebook/sam3" in ENV_EXAMPLE
     assert "SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=100" in ENV_EXAMPLE
     assert "SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2" in ENV_EXAMPLE
     assert "SO101_STOP_REMOTE_SERVICES=1" in ENV_EXAMPLE
@@ -135,5 +143,6 @@ def test_overview_documents_current_runtime_topology() -> None:
     assert "Camera relay :8089 -> local USB cameras" in OVERVIEW
     assert ":8202 -> GPU MolmoAct2 policy server" in OVERVIEW
     assert ":8213 -> GPU SAM3 prompt server" in OVERVIEW
-    assert ":8214 -> GPU SAM2 tracker" in OVERVIEW
+    assert ":8214 -> GPU ball tracker" in OVERVIEW
+    assert "SO101_SAM2_TRACKER=sam3_video" in OVERVIEW
     assert "Converted v2.1 datasets are used for MolmoAct2 LoRA training." in OVERVIEW

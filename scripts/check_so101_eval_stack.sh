@@ -7,7 +7,7 @@ set -euo pipefail
 #   - camera relay :8089
 #   - MolmoAct2 tunnel/server :8202
 #   - SAM3 tunnel/server :8213
-#   - SAM2 tunnel/server :8214
+#   - ball tracker tunnel/server :8214, or configured SO101_SAM2_PORT
 #
 # Optional:
 #   SO101_CHECK_UI=1      also require eval UI :8092
@@ -166,7 +166,7 @@ PY
 check_http "camera-relay" "http://127.0.0.1:${CAMERA_RELAY_PORT}/health"
 check_local_json_hint "policy" "http://127.0.0.1:${POLICY_PORT}/health"
 check_http "sam3" "http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}"
-check_local_json_hint "sam2" "http://127.0.0.1:${SAM2_PORT}/health"
+check_local_json_hint "tracker" "http://127.0.0.1:${SAM2_PORT}/health"
 if [ "$CHECK_SAM3_DETECT" != "0" ]; then
   check_sam3_detect
 fi

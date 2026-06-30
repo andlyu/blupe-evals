@@ -12,12 +12,12 @@ Mac
   SSH tunnels:
     :8202 -> GPU MolmoAct2 policy server
     :8213 -> GPU SAM3 prompt server
-    :8214 -> GPU SAM2 tracker
+    :8214 -> GPU ball tracker
 
 GPU / Vast 4090
   MolmoAct2 HTTP policy runner :8202
   SAM3 image prompt server :8213
-  SAM2 video tracker :8214
+  ball tracker :8214, or :8216 when using SAM3 Video tracking
 
 SO101 hardware
   follower arm + leader arm connected to the Mac by USB
@@ -71,13 +71,15 @@ and update `SO101_GPU_HOST` / `SO101_GPU_PORT`.
   `status`, `stop`, and `restart`.
 - `scripts/start_so101_eval_stack.sh`: starts/verifies GPU services, local tunnels,
   camera relay, and eval UI. It syncs the local Hugging Face token to the GPU if
-  needed and blocks until SAM3, SAM2, MolmoAct2, cameras, and UI pass readiness.
+  needed and blocks until SAM3, the ball tracker, MolmoAct2, cameras, and UI pass readiness.
 - `scripts/stop_so101_eval_stack.sh`: stops policy/eval/recording, local processes,
   tunnels, and remote GPU services.
 - `scripts/molmoact2_policy_runner.py`: HTTP `/act` and `/health` policy server for
   MolmoAct2.
 - `scripts/sam3_prompt_ui.py`: SAM3 image prompt service.
 - `scripts/sam2_video_track_ui.py`: SAM2 frame-to-frame mask tracking service.
+- `scripts/sam3_video_track_ui.py`: SAM3 Video text-prompt ball tracking service
+  exposed through the same `/api/track_image` tracker interface.
 - `scripts/compress_so101_episodes.py`: compacts raw recordings into LeRobot-style
   datasets with videos.
 - `scripts/convert_lerobot_joint_convention.py`: converts recorded SO101 joint data
@@ -89,7 +91,8 @@ and update `SO101_GPU_HOST` / `SO101_GPU_PORT`.
 - `8092`: local SO101 eval UI
 - `8202`: MolmoAct2 policy server
 - `8213`: SAM3 prompt server
-- `8214`: SAM2 tracker
+- `8214`: default SAM2 tracker
+- `8216`: SAM3 Video tracker when `SO101_SAM2_TRACKER=sam3_video`
 
 ## Data Flow
 
@@ -97,7 +100,7 @@ and update `SO101_GPU_HOST` / `SO101_GPU_PORT`.
 2. The eval UI captures front/wrist frames and current robot state.
 3. The UI sends those to MolmoAct2 over `/act`.
 4. The UI executes returned joint actions on the follower arm.
-5. SAM3 seeds cup masks and periodically re-anchors ball masks; SAM2 refreshes ball masks asynchronously, and the mask MJPEG stream draws fresh camera frames with the latest completed mask.
+5. SAM3 seeds cup masks; the configured ball tracker refreshes ball masks asynchronously, and the mask MJPEG stream draws fresh camera frames with the latest completed mask. For live evals we can set `SO101_SAM2_TRACKER=sam3_video` to use SAM3 Video tracking instead of SAM2.
 6. Recordings are written locally, then compacted/exported to a dataset.
 7. Converted v2.1 datasets are used for MolmoAct2 LoRA training.
 
