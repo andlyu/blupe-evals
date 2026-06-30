@@ -28,9 +28,9 @@ eval ──joints──► serve (robot-side safety: clamp · hold · torque-off
 | Understand the live deployment | [docs/SESSION-HANDOFF.md](docs/SESSION-HANDOFF.md) |
 
 Current SO101 eval stack:
-`scripts/start_so101_eval_stack.sh` starts UI/cameras/GPU tunnels/policy/SAM,
-`scripts/check_so101_eval_stack.sh` verifies the endpoints, and
-`scripts/stop_so101_eval_stack.sh` stops them.
+`scripts/pipeline.sh launch so101-eval` starts UI/cameras/GPU tunnels/policy/SAM
+and waits for deep readiness. Use `scripts/pipeline.sh check so101-eval` to
+verify it and `scripts/pipeline.sh stop so101-eval` to stop it.
 
 ## Quickstart (operator computer, sim — no robot needed)
 

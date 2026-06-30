@@ -56,10 +56,10 @@ def test_detection_from_mask_contains_encoded_mask() -> None:
     assert detection["mask_png_b64"]
 
 
-def test_fast_defaults_use_tiny_model_and_downscale() -> None:
+def test_fast_defaults_use_base_plus_model_and_downscale() -> None:
     sam2_track_ui = _load_sam2_track_ui()
 
-    assert sam2_track_ui.DEFAULT_MODEL_ID == "facebook/sam2-hiera-tiny"
+    assert sam2_track_ui.DEFAULT_MODEL_ID == "facebook/sam2.1-hiera-base-plus"
     assert sam2_track_ui.DEFAULT_RESIZE_MAX_SIDE == 384
 
 

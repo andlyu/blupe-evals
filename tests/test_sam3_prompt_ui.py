@@ -75,3 +75,18 @@ def test_sam3_service_exposes_health_route() -> None:
     assert 'parsed.path == "/health"' in source
     assert '"ok": True' in source
     assert '"active_backend": self.session._active_backend' in source
+
+
+def test_sam3_transformers_backend_uses_auto_classes() -> None:
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "sam3_prompt_ui.py").read_text()
+
+    assert "from transformers import AutoModel, AutoProcessor" in source
+    assert "AutoProcessor.from_pretrained(self.model_id)" in source
+    assert "AutoModel.from_pretrained(self.model_id)" in source
+
+
+def test_sam3_service_logs_request_errors() -> None:
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "sam3_prompt_ui.py").read_text()
+
+    assert "[sam3-ui] request error:" in source
+    assert 'self._json(400, {"error": str(exc)})' in source

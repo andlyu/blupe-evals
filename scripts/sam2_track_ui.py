@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-DEFAULT_MODEL_ID = "facebook/sam2-hiera-tiny"
+DEFAULT_MODEL_ID = "facebook/sam2.1-hiera-base-plus"
 DEFAULT_RESIZE_MAX_SIDE = 384
 
 

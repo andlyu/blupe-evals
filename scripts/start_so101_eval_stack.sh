@@ -31,11 +31,14 @@ REMOTE_ROOT="${SO101_GPU_REMOTE_ROOT:-/workspace}"
 REMOTE_PYTHON="${SO101_GPU_PYTHON:-/venv/main/bin/python}"
 REMOTE_LOG_DIR="${SO101_GPU_LOG_DIR:-${REMOTE_ROOT}/logs}"
 REMOTE_HF_HOME="${SO101_GPU_HF_HOME:-/root/.cache/huggingface}"
+SYNC_HF_TOKEN="${SO101_SYNC_HF_TOKEN:-1}"
+LOCAL_HF_TOKEN_PATH="${SO101_LOCAL_HF_TOKEN_PATH:-${HOME}/.cache/huggingface/token}"
 
 GPU_SERVICES="${SO101_START_GPU_SERVICES:-1}"
 TUNNELS="${SO101_START_TUNNELS:-1}"
 LOCAL_UI="${SO101_START_LOCAL_UI:-1}"
 REPLACE_PORTS="${SO101_REPLACE_PORTS:-1}"
+RUN_FINAL_CHECK="${SO101_RUN_FINAL_CHECK:-1}"
 
 POLICY_PORT="${SO101_POLICY_PORT:-8202}"
 SAM3_PORT="${SO101_SAM3_PORT:-8213}"
@@ -47,7 +50,11 @@ TUNNEL_READY_TIMEOUT_S="${SO101_TUNNEL_READY_TIMEOUT_S:-30}"
 
 MOLMOACT2_CHECKPOINT_PATH="${MOLMOACT2_CHECKPOINT_PATH:-allenai/MolmoAct2-SO100_101}"
 MOLMOACT2_POLICY_PATH="${MOLMOACT2_POLICY_PATH:-}"
+MOLMOACT2_LORA_LLM_PATH="${MOLMOACT2_LORA_LLM_PATH:-}"
+MOLMOACT2_LORA_VISION_PATH="${MOLMOACT2_LORA_VISION_PATH:-}"
 REMOTE_POLICY_PATH="${MOLMOACT2_POLICY_PATH:-__none__}"
+REMOTE_LORA_LLM_PATH="${MOLMOACT2_LORA_LLM_PATH:-__none__}"
+REMOTE_LORA_VISION_PATH="${MOLMOACT2_LORA_VISION_PATH:-__none__}"
 MOLMOACT2_NORM_TAG="${MOLMOACT2_NORM_TAG:-so100_so101_molmoact2}"
 MOLMOACT2_IMAGE_KEYS="${MOLMOACT2_IMAGE_KEYS:-[\"observation.images.front\",\"observation.images.wrist\"]}"
 MOLMOACT2_IMAGE_KEYS_B64="$(printf '%s' "$MOLMOACT2_IMAGE_KEYS" | base64 | tr -d '\n')"
@@ -57,10 +64,13 @@ MOLMOACT2_NUM_ACTIONS="${MOLMOACT2_NUM_ACTIONS:-30}"
 MOLMOACT2_EXPERIMENTS_DIR="${MOLMOACT2_EXPERIMENTS_DIR:-${REMOTE_ROOT}/molmoact2/experiments}"
 
 SAM3_BACKEND="${SO101_SAM3_BACKEND:-transformers}"
+SAM3_MODEL_ID="${SO101_SAM3_MODEL_ID:-facebook/sam3}"
 SAM3_FRAMES_DIR="${SO101_SAM3_FRAMES_DIR:-${REMOTE_ROOT}/sam3-frames}"
 SAM3_READY_PATH="${SO101_SAM3_READY_PATH:-/}"
+SAM3_DETECT_TIMEOUT_S="${SO101_SAM3_DETECT_TIMEOUT_S:-240}"
+SAM3_DETECT_REQUEST_TIMEOUT_S="${SO101_SAM3_DETECT_REQUEST_TIMEOUT_S:-90}"
 SAM2_TRACKER="${SO101_SAM2_TRACKER:-image}"
-SAM2_MODEL_ID="${SO101_SAM2_MODEL_ID:-facebook/sam2-hiera-tiny}"
+SAM2_MODEL_ID="${SO101_SAM2_MODEL_ID:-facebook/sam2.1-hiera-base-plus}"
 
 UI_PORT="${SO101_WEB_PORT:-8092}"
 CAMERA_RELAY_PORT="${SO101_CAMERA_RELAY_PORT:-8089}"
@@ -145,8 +155,28 @@ stop_existing_local_motion() {
   post_json_best_effort "http://127.0.0.1:${UI_PORT}/api/stop"
 }
 
+sync_remote_hf_token() {
+  if [ "$SYNC_HF_TOKEN" = "0" ]; then
+    return 0
+  fi
+  if ssh "${SSH_OPTS[@]}" "${GPU_USER}@${GPU_HOST}" "test -s '${REMOTE_HF_HOME}/token'" >/dev/null 2>&1; then
+    echo "Remote Hugging Face token: present"
+    return 0
+  fi
+  if [ ! -s "$LOCAL_HF_TOKEN_PATH" ]; then
+    echo "Remote Hugging Face token: missing; local token not found at ${LOCAL_HF_TOKEN_PATH}" >&2
+    echo "SAM3 facebook/sam3 is gated, so /api/detect_image may fail until the remote is authenticated." >&2
+    return 0
+  fi
+  echo "Remote Hugging Face token: syncing from ${LOCAL_HF_TOKEN_PATH}"
+  ssh "${SSH_OPTS[@]}" "${GPU_USER}@${GPU_HOST}" \
+    "mkdir -p '${REMOTE_HF_HOME}' && umask 077 && cat > '${REMOTE_HF_HOME}/token'" \
+    <"$LOCAL_HF_TOKEN_PATH"
+}
+
 start_remote_gpu_services() {
   echo "Ensuring GPU services on ${GPU_USER}@${GPU_HOST}:${GPU_PORT}"
+  sync_remote_hf_token
   ssh "${SSH_OPTS[@]}" "${GPU_USER}@${GPU_HOST}" bash -s -- \
     "$REMOTE_ROOT" \
     "$REMOTE_PYTHON" \
@@ -157,6 +187,8 @@ start_remote_gpu_services() {
     "$SAM2_PORT" \
     "$MOLMOACT2_CHECKPOINT_PATH" \
     "$REMOTE_POLICY_PATH" \
+    "$REMOTE_LORA_LLM_PATH" \
+    "$REMOTE_LORA_VISION_PATH" \
     "$MOLMOACT2_NORM_TAG" \
     "$MOLMOACT2_IMAGE_KEYS_B64" \
     "$MOLMOACT2_MODEL_DTYPE" \
@@ -164,10 +196,13 @@ start_remote_gpu_services() {
     "$MOLMOACT2_NUM_ACTIONS" \
     "$MOLMOACT2_EXPERIMENTS_DIR" \
     "$SAM3_BACKEND" \
+    "$SAM3_MODEL_ID" \
     "$SAM3_FRAMES_DIR" \
     "$SAM3_READY_PATH" \
     "$SAM2_TRACKER" \
-    "$SAM2_MODEL_ID" <<'REMOTE'
+    "$SAM2_MODEL_ID" \
+    "$SAM3_DETECT_TIMEOUT_S" \
+    "$SAM3_DETECT_REQUEST_TIMEOUT_S" <<'REMOTE'
 set -euo pipefail
 
 REMOTE_ROOT="$1"
@@ -182,17 +217,28 @@ POLICY_PATH="$9"
 if [ "$POLICY_PATH" = "__none__" ]; then
   POLICY_PATH=""
 fi
-NORM_TAG="${10}"
-IMAGE_KEYS_B64="${11}"
-MODEL_DTYPE="${12}"
-FLOW_STEPS="${13}"
-NUM_ACTIONS="${14}"
-EXPERIMENTS_DIR="${15}"
-SAM3_BACKEND="${16}"
-SAM3_FRAMES_DIR="${17}"
-SAM3_READY_PATH="${18}"
-SAM2_TRACKER="${19}"
-SAM2_MODEL_ID="${20}"
+LORA_LLM_PATH="${10}"
+if [ "$LORA_LLM_PATH" = "__none__" ]; then
+  LORA_LLM_PATH=""
+fi
+LORA_VISION_PATH="${11}"
+if [ "$LORA_VISION_PATH" = "__none__" ]; then
+  LORA_VISION_PATH=""
+fi
+NORM_TAG="${12}"
+IMAGE_KEYS_B64="${13}"
+MODEL_DTYPE="${14}"
+FLOW_STEPS="${15}"
+NUM_ACTIONS="${16}"
+EXPERIMENTS_DIR="${17}"
+SAM3_BACKEND="${18}"
+SAM3_MODEL_ID="${19}"
+SAM3_FRAMES_DIR="${20}"
+SAM3_READY_PATH="${21}"
+SAM2_TRACKER="${22}"
+SAM2_MODEL_ID="${23}"
+SAM3_DETECT_TIMEOUT_S="${24}"
+SAM3_DETECT_REQUEST_TIMEOUT_S="${25}"
 IMAGE_KEYS="$(printf '%s' "$IMAGE_KEYS_B64" | base64 -d)"
 
 mkdir -p "$LOG_DIR" "$SAM3_FRAMES_DIR"
@@ -215,6 +261,72 @@ wait_local_http() {
   return 1
 }
 
+sam3_detect_once() {
+  "$PYTHON" - "$SAM3_PORT" "${SAM3_FRAMES_DIR}/seed.jpg" "$SAM3_DETECT_REQUEST_TIMEOUT_S" <<'PY'
+import base64
+import json
+import sys
+import urllib.error
+import urllib.request
+
+port = sys.argv[1]
+image_path = sys.argv[2]
+timeout_s = float(sys.argv[3])
+
+with open(image_path, "rb") as f:
+    image_b64 = base64.b64encode(f.read()).decode("ascii")
+
+payload = {
+    "image_b64": image_b64,
+    "prompts": ["blue rubber ball"],
+    "max_masks": 1,
+    "min_score": 0.0,
+    "alpha": 0.65,
+}
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/api/detect_image",
+    data=json.dumps(payload).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        body = resp.read()
+        if resp.status != 200:
+            print(f"status={resp.status} body={body[:1000]!r}", file=sys.stderr)
+            sys.exit(1)
+        json.loads(body.decode("utf-8"))
+except urllib.error.HTTPError as exc:
+    body = exc.read().decode("utf-8", errors="replace")
+    print(f"status={exc.code} body={body[:2000]}", file=sys.stderr)
+    sys.exit(1)
+except Exception as exc:
+    print(repr(exc), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+wait_sam3_detect() {
+  local timeout_s="$1"
+  local label="$2"
+  local attempts=$((timeout_s / 5))
+  local i
+  if [ "$attempts" -lt 1 ]; then
+    attempts=1
+  fi
+  for ((i = 0; i < attempts; i++)); do
+    if sam3_detect_once >/dev/null 2>"${LOG_DIR}/sam3_detect_${SAM3_PORT}.last_error"; then
+      echo "${label}: ready"
+      return 0
+    fi
+    sleep 5
+  done
+  echo "${label}: detect_image not ready after ${timeout_s}s" >&2
+  cat "${LOG_DIR}/sam3_detect_${SAM3_PORT}.last_error" >&2 || true
+  tail -120 "${LOG_DIR}/sam3_${SAM3_PORT}.log" >&2 || true
+  return 1
+}
+
 if [ ! -f "${SAM3_FRAMES_DIR}/seed.jpg" ]; then
   "$PYTHON" - <<PY
 from PIL import Image
@@ -229,6 +341,7 @@ if ! curl -fsS --max-time 2 "http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}" >/
     --host 127.0.0.1 \
     --port "$SAM3_PORT" \
     --backend "$SAM3_BACKEND" \
+    --model-id "$SAM3_MODEL_ID" \
     >"${LOG_DIR}/sam3_${SAM3_PORT}.log" 2>&1 &
   echo $! >"${LOG_DIR}/sam3_${SAM3_PORT}.pid"
 fi
@@ -269,6 +382,12 @@ if ! curl -fsS --max-time 2 "http://127.0.0.1:${POLICY_PORT}/health" >/dev/null 
   elif [ -n "$NORM_TAG" ]; then
     checkpoint_args+=(--norm-tag "$NORM_TAG")
   fi
+  if [ -n "$LORA_LLM_PATH" ]; then
+    checkpoint_args+=(--lora-llm-path "$LORA_LLM_PATH")
+  fi
+  if [ -n "$LORA_VISION_PATH" ]; then
+    checkpoint_args+=(--lora-vision-path "$LORA_VISION_PATH")
+  fi
   env_args=(HF_HOME="$HF_HOME_DIR")
   if [ -d "$EXPERIMENTS_DIR" ]; then
     env_args+=(PYTHONPATH="${EXPERIMENTS_DIR}:${EXPERIMENTS_DIR}/lerobot/src:${PYTHONPATH:-}")
@@ -287,7 +406,8 @@ if ! curl -fsS --max-time 2 "http://127.0.0.1:${POLICY_PORT}/health" >/dev/null 
   echo $! >"${LOG_DIR}/molmoact2_${POLICY_PORT}.pid"
 fi
 
-wait_local_http "http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}" 60 "remote SAM3"
+wait_local_http "http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}" 60 "remote SAM3 port"
+wait_sam3_detect "$SAM3_DETECT_TIMEOUT_S" "remote SAM3 detect"
 wait_local_http "http://127.0.0.1:${SAM2_PORT}/health" 60 "remote SAM2"
 wait_local_http "http://127.0.0.1:${POLICY_PORT}/health" 240 "remote MolmoAct2"
 REMOTE
@@ -348,6 +468,14 @@ if [ "$TUNNELS" != "0" ]; then
 fi
 if [ "$LOCAL_UI" != "0" ]; then
   start_local_ui
+fi
+if [ "$RUN_FINAL_CHECK" != "0" ]; then
+  echo "Running final SO101 eval stack readiness check"
+  SO101_CHECK_UI=1 \
+  SO101_CHECK_SAM3_DETECT=1 \
+  SO101_SAM3_DETECT_TIMEOUT_S="$SAM3_DETECT_TIMEOUT_S" \
+  SO101_SAM3_DETECT_REQUEST_TIMEOUT_S="$SAM3_DETECT_REQUEST_TIMEOUT_S" \
+  "$REPO_ROOT/scripts/check_so101_eval_stack.sh"
 fi
 
 echo

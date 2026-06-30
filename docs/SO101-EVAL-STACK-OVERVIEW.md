@@ -29,19 +29,23 @@ SO101 hardware
 Start the full eval stack:
 
 ```bash
-scripts/start_so101_eval_stack.sh
+scripts/pipeline.sh launch so101-eval
 ```
 
 Verify the stack before using it:
 
 ```bash
-scripts/check_so101_eval_stack.sh
+scripts/pipeline.sh check so101-eval
 ```
+
+The check is intentionally a deep check: SAM3 must complete a real
+`/api/detect_image` request, not only serve its HTML page. This catches missing
+Hugging Face auth for gated `facebook/sam3` before an eval starts.
 
 Stop the full eval stack:
 
 ```bash
-scripts/stop_so101_eval_stack.sh
+scripts/pipeline.sh stop so101-eval
 ```
 
 If the Vast SSH host changes, copy:
@@ -63,8 +67,11 @@ and update `SO101_GPU_HOST` / `SO101_GPU_PORT`.
 - `scripts/so101_web_intervene.py`: live eval UI, robot control, policy calls,
   intervention capture, recording, success tracking, and dataset viewer/export.
 - `scripts/launch_so101_eval_ui.sh`: starts local camera relay and the eval UI.
+- `scripts/pipeline.sh`: canonical command entrypoint for `launch`, `check`,
+  `status`, `stop`, and `restart`.
 - `scripts/start_so101_eval_stack.sh`: starts/verifies GPU services, local tunnels,
-  camera relay, and eval UI.
+  camera relay, and eval UI. It syncs the local Hugging Face token to the GPU if
+  needed and blocks until SAM3, SAM2, MolmoAct2, cameras, and UI pass readiness.
 - `scripts/stop_so101_eval_stack.sh`: stops policy/eval/recording, local processes,
   tunnels, and remote GPU services.
 - `scripts/molmoact2_policy_runner.py`: HTTP `/act` and `/health` policy server for

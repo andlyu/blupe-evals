@@ -10,24 +10,30 @@ vision and policy inference to a Vast 4090.
 - SAM2 tracker: `127.0.0.1:8214`
 - Local SO101 eval UI: `http://127.0.0.1:8092/#setup`
 
-## Two-Command Workflow
+## Pipeline Workflow
 
 Start everything:
 
 ```bash
-scripts/start_so101_eval_stack.sh
+scripts/pipeline.sh launch so101-eval
 ```
 
 Verify everything is reachable:
 
 ```bash
-scripts/check_so101_eval_stack.sh
+scripts/pipeline.sh check so101-eval
 ```
 
 Stop everything:
 
 ```bash
-scripts/stop_so101_eval_stack.sh
+scripts/pipeline.sh stop so101-eval
+```
+
+Restart everything:
+
+```bash
+scripts/pipeline.sh restart so101-eval
 ```
 
 The start script verifies or launches the GPU MolmoAct2/SAM3/SAM2 services, opens
@@ -36,6 +42,21 @@ and eval UI. The stop script first asks the UI to stop recording/eval/policy mot
 then stops the UI, camera relay, tunnels, and remote GPU services.
 SAM3 readiness defaults to `/`, because some deployed SAM3 service copies predate
 the newer `/health` route.
+
+The launcher also does the two checks that matter for live masks:
+
+- If the remote Hugging Face token is missing and the Mac has
+  `~/.cache/huggingface/token`, it copies that token to the remote HF cache without
+  printing it. This is required for gated `facebook/sam3`.
+- It waits for a real SAM3 `/api/detect_image` request to complete before printing
+  that the stack is up. A reachable SAM3 web page is not enough.
+
+The standalone check command runs the same deep SAM3 detection smoke test by
+default. Disable that only for low-level debugging:
+
+```bash
+SO101_CHECK_SAM3_DETECT=0 scripts/check_so101_eval_stack.sh
+```
 
 When the Vast SSH target changes, copy `config/so101_eval_stack.env.example` to
 `config/so101_eval_stack.local.env` and update `SO101_GPU_HOST` / `SO101_GPU_PORT`.
@@ -73,6 +94,9 @@ python -m pip install -e /root/sam2
 SAM3 can run either through the local native SAM3 checkout or the Transformers
 `facebook/sam3` backend. The native backend expects the SAM3 assets under
 `/root/sam3`; the Transformers backend uses the Hugging Face model path.
+`facebook/sam3` is gated, so the remote environment must have a valid Hugging Face
+token in `/root/.cache/huggingface/token` or the first `/api/detect_image` request
+will fail with a 401 wrapped as HTTP 400.
 
 The SAM3 service needs a frames directory at startup, even though live eval calls
 use `/api/detect_image`. Put any valid image in it:
@@ -92,7 +116,7 @@ screen -L -dmS sam_4090_8213_8214 bash -lc '
 cd /workspace/blupe-evals
 source /venv/main/bin/activate
 python scripts/sam3_prompt_ui.py --frames-dir /tmp/sam3-frames --host 127.0.0.1 --port 8213 --backend auto &
-python scripts/sam2_track_ui.py --host 127.0.0.1 --port 8214 --device cuda --model-id facebook/sam2-hiera-tiny
+python scripts/sam2_track_ui.py --host 127.0.0.1 --port 8214 --device cuda --model-id facebook/sam2.1-hiera-base-plus
 '
 ```
 

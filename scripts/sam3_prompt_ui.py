@@ -120,10 +120,10 @@ class Sam3Session:
                     raise
 
         if self.backend in {"auto", "transformers"}:
-            from transformers import Sam3Model, Sam3Processor
+            from transformers import AutoModel, AutoProcessor
 
-            self._processor = Sam3Processor.from_pretrained(self.model_id)
-            self._model = Sam3Model.from_pretrained(self.model_id).to(self.device).eval()
+            self._processor = AutoProcessor.from_pretrained(self.model_id)
+            self._model = AutoModel.from_pretrained(self.model_id).to(self.device).eval()
             self._active_backend = "transformers"
             return self._processor
 
@@ -632,6 +632,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             self._json(200, result)
         except Exception as exc:
+            print(f"[sam3-ui] request error: {exc}", flush=True)
             self._json(400, {"error": str(exc)})
 
     def log_message(self, fmt, *args):

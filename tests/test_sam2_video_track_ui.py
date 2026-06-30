@@ -45,10 +45,10 @@ def test_video_tracker_detection_payload_contains_encoded_mask() -> None:
     assert detection["mask_png_b64"]
 
 
-def test_video_tracker_defaults_to_tiny_model() -> None:
+def test_video_tracker_defaults_to_base_plus_model() -> None:
     sam2_video_track_ui = _load_sam2_video_track_ui()
 
-    assert sam2_video_track_ui.DEFAULT_MODEL_ID == "facebook/sam2-hiera-tiny"
+    assert sam2_video_track_ui.DEFAULT_MODEL_ID == "facebook/sam2.1-hiera-base-plus"
 
 
 def test_video_tracker_appends_live_frames_without_temp_jpeg_roundtrip() -> None:

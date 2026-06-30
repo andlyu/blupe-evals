@@ -142,6 +142,17 @@ SUCCESS_BALL_SAM2_MULTIMASK_OUTPUT = os.environ.get("SO101_SUCCESS_BALL_SAM2_MUL
     "on",
 }
 SUCCESS_BALL_SAM2_EVERY_N_FRAMES = max(1, int(os.environ.get("SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES", "2")))
+SUCCESS_BALL_SAM2_BOX_PAD_PX = max(0.0, float(os.environ.get("SO101_SUCCESS_BALL_SAM2_BOX_PAD_PX", "2")))
+SUCCESS_BALL_SAM2_MAX_AREA_MULT = max(1.0, float(os.environ.get("SO101_SUCCESS_BALL_SAM2_MAX_AREA_MULT", "1.0")))
+SUCCESS_BALL_SAM2_MIN_PRIOR_IOU = min(
+    1.0,
+    max(0.0, float(os.environ.get("SO101_SUCCESS_BALL_SAM2_MIN_PRIOR_IOU", "0.02"))),
+)
+SUCCESS_BALL_SAM2_MAX_CENTER_SHIFT_PX = max(
+    0.0,
+    float(os.environ.get("SO101_SUCCESS_BALL_SAM2_MAX_CENTER_SHIFT_PX", "96")),
+)
+SUCCESS_BALL_SAM3_AREA_WINDOW = max(1, int(os.environ.get("SO101_SUCCESS_BALL_SAM3_AREA_WINDOW", "5")))
 SUCCESS_BALL_TRACK_SEARCH_PAD_PX = int(os.environ.get("SO101_SUCCESS_BALL_TRACK_SEARCH_PAD_PX", "80"))
 SUCCESS_BALL_TRACK_MAX_MISSING_FRAMES = int(os.environ.get("SO101_SUCCESS_BALL_TRACK_MAX_MISSING_FRAMES", "8"))
 DEFAULT_CUP_POLYGON = np.array(
@@ -486,9 +497,14 @@ class LiveCupSuccessTracker:
         self.ball_mask_sam3_async_status = "idle"
         self.ball_mask_sam3_async_error = ""
         self.ball_mask_sam3_async_elapsed_s: float | None = None
+        self.ball_mask_sam3_async_request_capture_mono: float | None = None
+        self.ball_mask_sam3_async_frame_to_request_s: float | None = None
+        self.ball_mask_sam3_async_request_to_response_s: float | None = None
         self.ball_mask_sam3_async_started_frame: int | None = None
         self.ball_mask_sam3_async_completed_frame: int | None = None
         self.ball_mask_sam3_async_generation: int | None = None
+        self.ball_mask_sam3_async_frame_to_request_history: deque[float] = deque(maxlen=200)
+        self.ball_mask_sam3_async_request_to_response_history: deque[float] = deque(maxlen=200)
         self.ball_mask_sam3_async_lock = threading.Lock()
         self.ball_mask_sam2_status = "disabled" if not self.ball_sam2_url else "not_run"
         self.ball_mask_sam2_error = ""
@@ -501,11 +517,21 @@ class LiveCupSuccessTracker:
         self.ball_mask_sam2_async_status = "disabled" if not self.ball_sam2_url else "idle"
         self.ball_mask_sam2_async_error = ""
         self.ball_mask_sam2_async_elapsed_s: float | None = None
+        self.ball_mask_sam2_async_request_capture_mono: float | None = None
+        self.ball_mask_sam2_async_frame_to_request_s: float | None = None
+        self.ball_mask_sam2_async_request_to_response_s: float | None = None
         self.ball_mask_sam2_async_started_frame: int | None = None
         self.ball_mask_sam2_async_completed_frame: int | None = None
         self.ball_mask_sam2_async_generation: int | None = None
+        self.ball_mask_sam2_async_frame_to_request_history: deque[float] = deque(maxlen=200)
+        self.ball_mask_sam2_async_request_to_response_history: deque[float] = deque(maxlen=200)
         self.ball_mask_sam2_async_lock = threading.Lock()
+        self.ball_mask_capture_to_display_s: float | None = None
+        self.ball_mask_capture_to_display_source: str = ""
         self.ball_track_hsv_median: np.ndarray | None = None
+        self.ball_sam3_area_history: deque[int] = deque(maxlen=SUCCESS_BALL_SAM3_AREA_WINDOW)
+        self.ball_sam3_area_mean: float | None = None
+        self.ball_sam2_max_area: int | None = None
         self.ball_track_missing_frames = 0
         self.reset()
 
@@ -588,6 +614,11 @@ class LiveCupSuccessTracker:
             self.ball_mask_sam3_async_status = f"pending:{reason}"
             self.ball_mask_sam3_async_error = ""
             self.ball_mask_sam3_async_elapsed_s = None
+            self.ball_mask_sam3_async_request_capture_mono = None
+            self.ball_mask_sam3_async_frame_to_request_s = None
+            self.ball_mask_sam3_async_request_to_response_s = None
+            self.ball_mask_sam3_async_frame_to_request_history.clear()
+            self.ball_mask_sam3_async_request_to_response_history.clear()
             self.ball_mask_sam3_async_started_frame = None
             self.ball_mask_sam3_async_completed_frame = None
             self.ball_mask_sam3_async_generation = None
@@ -596,15 +627,26 @@ class LiveCupSuccessTracker:
         self.ball_mask_sam2_raw_score = None
         self.ball_mask_sam2_raw_area = None
         self.ball_mask_sam2_box_xyxy = None
+        self.ball_sam2_max_area = None
+        if reason in {"manual_sam3_rerun", "sam3_prompt_update"}:
+            self.ball_sam3_area_history.clear()
+            self.ball_sam3_area_mean = None
         self.ball_mask_sam2_last_request_frame = None
         with self.ball_mask_sam2_async_lock:
             self.ball_mask_sam2_refresh_running = False
             self.ball_mask_sam2_async_status = "disabled" if not self.ball_sam2_url else f"pending:{reason}"
             self.ball_mask_sam2_async_error = ""
             self.ball_mask_sam2_async_elapsed_s = None
+            self.ball_mask_sam2_async_request_capture_mono = None
+            self.ball_mask_sam2_async_frame_to_request_s = None
+            self.ball_mask_sam2_async_request_to_response_s = None
+            self.ball_mask_sam2_async_frame_to_request_history.clear()
+            self.ball_mask_sam2_async_request_to_response_history.clear()
             self.ball_mask_sam2_async_started_frame = None
             self.ball_mask_sam2_async_completed_frame = None
             self.ball_mask_sam2_async_generation = None
+        self.ball_mask_capture_to_display_s = None
+        self.ball_mask_capture_to_display_source = ""
         self.ball_track_hsv_median = None
         self.ball_track_missing_frames = 0
         self.ball_mask_generation += 1
@@ -633,6 +675,12 @@ class LiveCupSuccessTracker:
         if union <= 0:
             return None
         return float(np.logical_and(a_bool, b_bool).sum() / union)
+
+    @staticmethod
+    def _box_center(box) -> tuple[float, float] | None:
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            return None
+        return (float(box[0] + box[2]) / 2.0, float(box[1] + box[3]) / 2.0)
 
     @staticmethod
     def _mask_to_png_b64(mask: np.ndarray) -> str | None:
@@ -667,6 +715,48 @@ class LiveCupSuccessTracker:
     def _set_ball_sam2_status(self, status: str, error: str = "") -> None:
         self.ball_mask_sam2_status = status
         self.ball_mask_sam2_error = error
+
+    def _record_ball_mask_request_timings(
+        self,
+        *,
+        model: str,
+        request_capture_mono: float | None,
+        request_started_mono: float,
+        request_to_response_s: float,
+    ) -> None:
+        if request_to_response_s < 0.0:
+            request_to_response_s = 0.0
+        if model == "sam3":
+            lock = self.ball_mask_sam3_async_lock
+            request_capture_key = request_capture_mono
+            with lock:
+                self.ball_mask_sam3_async_request_to_response_s = float(request_to_response_s)
+                if request_capture_key is None:
+                    self.ball_mask_sam3_async_frame_to_request_s = None
+                else:
+                    frame_to_request_s = float(request_started_mono - request_capture_key)
+                    if frame_to_request_s < 0.0:
+                        frame_to_request_s = 0.0
+                    self.ball_mask_sam3_async_frame_to_request_s = frame_to_request_s
+                    self.ball_mask_sam3_async_frame_to_request_history.append(frame_to_request_s)
+                self.ball_mask_sam3_async_request_to_response_history.append(float(request_to_response_s))
+            return
+
+        if model == "sam2":
+            lock = self.ball_mask_sam2_async_lock
+            request_capture_key = request_capture_mono
+            with lock:
+                self.ball_mask_sam2_async_request_to_response_s = float(request_to_response_s)
+                if request_capture_key is None:
+                    self.ball_mask_sam2_async_frame_to_request_s = None
+                else:
+                    frame_to_request_s = float(request_started_mono - request_capture_key)
+                    if frame_to_request_s < 0.0:
+                        frame_to_request_s = 0.0
+                    self.ball_mask_sam2_async_frame_to_request_s = frame_to_request_s
+                    self.ball_mask_sam2_async_frame_to_request_history.append(frame_to_request_s)
+                self.ball_mask_sam2_async_request_to_response_history.append(float(request_to_response_s))
+            return
 
     def _calculate_sam3_cup_mask(self, rgb: np.ndarray, default_area: int) -> tuple[np.ndarray, str] | None:
         if not self.container_sam3_url or not self.container_sam3_prompt:
@@ -940,11 +1030,23 @@ class LiveCupSuccessTracker:
             "min_score": self.ball_sam3_min_score,
             "alpha": 0.65,
         }
+        request_started_mono: float | None = None
+        request_capture_mono = self.ball_mask_sam3_async_request_capture_mono
+        request_to_response_s: float | None = None
         try:
+            request_started_mono = time.monotonic()
             resp = requests.post(
                 self.ball_sam3_url,
                 json=payload,
                 timeout=self.ball_sam3_timeout_s,
+            )
+            request_to_response_s = time.monotonic() - request_started_mono
+            assert request_started_mono is not None
+            self._record_ball_mask_request_timings(
+                model="sam3",
+                request_capture_mono=request_capture_mono,
+                request_started_mono=request_started_mono,
+                request_to_response_s=request_to_response_s,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -1000,6 +1102,14 @@ class LiveCupSuccessTracker:
             self._set_ball_sam3_status("accepted", f"area={area} score={score:.3f}")
             return mask_bool, f"sam3:{prompt} score={score:.2f}"
         except Exception as exc:
+            if request_started_mono is not None and request_to_response_s is None:
+                request_to_response_s = time.monotonic() - request_started_mono
+                self._record_ball_mask_request_timings(
+                    model="sam3",
+                    request_capture_mono=request_capture_mono,
+                    request_started_mono=request_started_mono,
+                    request_to_response_s=request_to_response_s,
+                )
             self._set_ball_sam3_status("request_failed", str(exc))
             return None
 
@@ -1011,6 +1121,18 @@ class LiveCupSuccessTracker:
         if values.size == 0:
             return
         self.ball_track_hsv_median = np.median(values, axis=0).astype(np.float32)
+
+    def _remember_sam3_ball_area(self, mask: np.ndarray) -> None:
+        area = int(mask.sum())
+        if area < SUCCESS_MIN_BALL_AREA or area > SUCCESS_MAX_BALL_AREA:
+            return
+        self.ball_sam3_area_history.append(area)
+        self.ball_sam3_area_mean = float(np.mean(self.ball_sam3_area_history))
+
+    def _sam2_area_reference(self, seed_area: int) -> float:
+        if self.ball_sam3_area_mean is not None:
+            return float(self.ball_sam3_area_mean)
+        return float(seed_area)
 
     def _calculate_sam2_ball_mask(
         self,
@@ -1031,6 +1153,15 @@ class LiveCupSuccessTracker:
         if box is None:
             self._set_ball_sam2_status("no_seed_box")
             return None
+        seed_area = int(current_mask.sum())
+        area_reference = self._sam2_area_reference(seed_area)
+        sam2_max_area = int(
+            min(
+                SUCCESS_MAX_BALL_AREA,
+                max(SUCCESS_MIN_BALL_AREA, area_reference * SUCCESS_BALL_SAM2_MAX_AREA_MULT),
+            )
+        )
+        self.ball_sam2_max_area = sam2_max_area
 
         ok, encoded = cv2.imencode(
             ".jpg",
@@ -1054,9 +1185,10 @@ class LiveCupSuccessTracker:
             "session_id": f"ball-{self.ball_mask_generation}",
             "reset_session": reset_session,
             "min_area": SUCCESS_MIN_BALL_AREA,
-            "max_area": SUCCESS_MAX_BALL_AREA,
+            "max_area": sam2_max_area,
             "multimask_output": SUCCESS_BALL_SAM2_MULTIMASK_OUTPUT,
             "resize_max_side": SUCCESS_BALL_SAM2_RESIZE_MAX_SIDE,
+            "box_pad_px": SUCCESS_BALL_SAM2_BOX_PAD_PX,
             "alpha": 0.65,
         }
         if reset_session:
@@ -1065,8 +1197,20 @@ class LiveCupSuccessTracker:
                 self._set_ball_sam2_status("seed_mask_encode_failed")
                 return None
             payload["mask_png_b64"] = mask_png_b64
+        request_started_mono: float | None = None
+        request_capture_mono = self.ball_mask_sam2_async_request_capture_mono
+        request_to_response_s: float | None = None
         try:
+            request_started_mono = time.monotonic()
             resp = requests.post(self.ball_sam2_url, json=payload, timeout=self.ball_sam2_timeout_s)
+            request_to_response_s = time.monotonic() - request_started_mono
+            assert request_started_mono is not None
+            self._record_ball_mask_request_timings(
+                model="sam2",
+                request_capture_mono=request_capture_mono,
+                request_started_mono=request_started_mono,
+                request_to_response_s=request_to_response_s,
+            )
             resp.raise_for_status()
             data = resp.json()
             top = data.get("top_mask") if isinstance(data, dict) else None
@@ -1097,8 +1241,42 @@ class LiveCupSuccessTracker:
             if area < SUCCESS_MIN_BALL_AREA:
                 self._set_ball_sam2_status("area_too_small", f"area={area} min={SUCCESS_MIN_BALL_AREA}")
                 return None
-            if area > SUCCESS_MAX_BALL_AREA:
-                self._set_ball_sam2_status("area_too_large", f"area={area} max={SUCCESS_MAX_BALL_AREA}")
+            if area > sam2_max_area:
+                self._set_ball_sam2_status(
+                    "area_gt_sam3_reference",
+                    f"area={area} max={sam2_max_area} sam3_ref={area_reference:.1f} mult={SUCCESS_BALL_SAM2_MAX_AREA_MULT:.2f}",
+                )
+                return None
+
+            tracked_box = self._mask_box(mask_bool)
+            if tracked_box is None:
+                self._set_ball_sam2_status("no_tracked_box")
+                return None
+            if self.ball_mask_sam2_box_xyxy is None:
+                self.ball_mask_sam2_box_xyxy = [float(x) for x in tracked_box]
+
+            prior_iou = self._mask_iou(mask_bool, current_mask)
+            if prior_iou is not None and prior_iou < SUCCESS_BALL_SAM2_MIN_PRIOR_IOU:
+                self._set_ball_sam2_status(
+                    "prior_iou_too_low",
+                    f"iou={prior_iou:.3f} min={SUCCESS_BALL_SAM2_MIN_PRIOR_IOU:.3f}",
+                )
+                return None
+
+            prior_center = self._box_center(box)
+            tracked_center = self._box_center(tracked_box)
+            center_shift = None
+            if prior_center is not None and tracked_center is not None:
+                center_shift = float(np.hypot(tracked_center[0] - prior_center[0], tracked_center[1] - prior_center[1]))
+            if (
+                center_shift is not None
+                and SUCCESS_BALL_SAM2_MAX_CENTER_SHIFT_PX > 0
+                and center_shift > SUCCESS_BALL_SAM2_MAX_CENTER_SHIFT_PX
+            ):
+                self._set_ball_sam2_status(
+                    "center_shift_too_large",
+                    f"shift={center_shift:.1f}px max={SUCCESS_BALL_SAM2_MAX_CENTER_SHIFT_PX:.1f}px",
+                )
                 return None
 
             self.ball_mask_score = score
@@ -1108,13 +1286,26 @@ class LiveCupSuccessTracker:
             frame_suffix = "" if frame_value is None else f" frame={frame_value}"
             elapsed_value = data.get("elapsed_s") or top.get("elapsed_s")
             elapsed_suffix = "" if elapsed_value is None else f" elapsed={float(elapsed_value):.3f}s"
-            self._set_ball_sam2_status("accepted", f"area={area}{score_suffix}{frame_suffix}{elapsed_suffix}")
+            iou_suffix = "" if prior_iou is None else f" iou={prior_iou:.2f}"
+            shift_suffix = "" if center_shift is None else f" shift={center_shift:.1f}px"
+            self._set_ball_sam2_status(
+                "accepted",
+                f"area={area}{score_suffix}{frame_suffix}{elapsed_suffix}{iou_suffix}{shift_suffix}",
+            )
             if mode == "sam2_video" or str(top.get("source", "")).startswith("sam2_video"):
                 return mask_bool, f"sam2:video{score_suffix}"
             if mode == "sam2_image" or str(top.get("source", "")).startswith("sam2_image"):
                 return mask_bool, f"sam2:image{score_suffix}"
             return mask_bool, f"sam2:box{score_suffix}"
         except Exception as exc:
+            if request_started_mono is not None and request_to_response_s is None:
+                request_to_response_s = time.monotonic() - request_started_mono
+                self._record_ball_mask_request_timings(
+                    model="sam2",
+                    request_capture_mono=request_capture_mono,
+                    request_started_mono=request_started_mono,
+                    request_to_response_s=request_to_response_s,
+                )
             self._set_ball_sam2_status("request_failed", str(exc))
             return None
 
@@ -1130,6 +1321,7 @@ class LiveCupSuccessTracker:
             return self.ball_mask
 
         self.ball_mask, self.ball_mask_source = result
+        self._remember_sam3_ball_area(self.ball_mask)
         self.ball_mask_box_xyxy = self._mask_box(self.ball_mask)
         self.ball_mask_calculated_at_frame = self.frame_idx
         self.ball_track_missing_frames = 0
@@ -1165,8 +1357,10 @@ class LiveCupSuccessTracker:
         *,
         frame_idx: int,
         elapsed_s: float,
+        request_capture_mono: float | None,
     ) -> None:
         tracked, source = result
+        self._remember_sam3_ball_area(tracked)
         self.ball_mask = tracked
         self.ball_mask_source = source
         self.ball_mask_box_xyxy = self._mask_box(tracked)
@@ -1174,6 +1368,9 @@ class LiveCupSuccessTracker:
         self.ball_track_missing_frames = 0
         self.ball_mask_sam3_async_completed_frame = int(frame_idx)
         self.ball_mask_sam3_async_elapsed_s = float(elapsed_s)
+        if request_capture_mono is not None:
+            self.ball_mask_capture_to_display_s = time.monotonic() - float(request_capture_mono)
+            self.ball_mask_capture_to_display_source = "sam3"
         if self.ball_sam2_url:
             self._set_ball_sam2_status("sam3_live_refresh")
         self.last_event = (
@@ -1181,14 +1378,25 @@ class LiveCupSuccessTracker:
             f"source={self.ball_mask_source} area={int(tracked.sum())} elapsed={elapsed_s:.3f}s"
         )
 
-    def _run_ball_sam3_refresh(self, rgb: np.ndarray, frame_idx: int, generation: int) -> None:
+    def _run_ball_sam3_refresh(
+        self,
+        rgb: np.ndarray,
+        frame_idx: int,
+        generation: int,
+        request_capture_mono: float | None,
+    ) -> None:
         started = time.monotonic()
         try:
             result = self._calculate_sam3_ball_mask(rgb, request_frame_idx=frame_idx)
             elapsed_s = time.monotonic() - started
             with self.ball_mask_sam3_async_lock:
                 if generation == self.ball_mask_generation and result is not None:
-                    self._apply_sam3_ball_refresh_result(result, frame_idx=frame_idx, elapsed_s=elapsed_s)
+                    self._apply_sam3_ball_refresh_result(
+                        result,
+                        frame_idx=frame_idx,
+                        elapsed_s=elapsed_s,
+                        request_capture_mono=request_capture_mono,
+                    )
                     self.ball_mask_sam3_async_status = "accepted"
                     self.ball_mask_sam3_async_error = ""
                 elif result is None:
@@ -1206,9 +1414,10 @@ class LiveCupSuccessTracker:
                 self.ball_mask_sam3_async_elapsed_s = time.monotonic() - started
         finally:
             with self.ball_mask_sam3_async_lock:
+                self.ball_mask_sam3_async_request_capture_mono = None
                 self.ball_mask_sam3_refresh_running = False
 
-    def _start_ball_sam3_refresh(self, rgb: np.ndarray) -> None:
+    def _start_ball_sam3_refresh(self, rgb: np.ndarray, *, request_capture_mono: float | None = None) -> None:
         frame_idx = int(self.frame_idx)
         generation = int(self.ball_mask_generation)
         with self.ball_mask_sam3_async_lock:
@@ -1218,12 +1427,15 @@ class LiveCupSuccessTracker:
             self.ball_mask_sam3_async_status = "requesting"
             self.ball_mask_sam3_async_error = ""
             self.ball_mask_sam3_async_elapsed_s = None
+            self.ball_mask_sam3_async_request_capture_mono = request_capture_mono
+            self.ball_mask_sam3_async_frame_to_request_s = None
+            self.ball_mask_sam3_async_request_to_response_s = None
             self.ball_mask_sam3_async_started_frame = frame_idx
             self.ball_mask_sam3_async_generation = generation
             self.ball_mask_sam3_last_request_frame = frame_idx
         thread = threading.Thread(
             target=self._run_ball_sam3_refresh,
-            args=(rgb.copy(), frame_idx, generation),
+            args=(rgb.copy(), frame_idx, generation, request_capture_mono),
             daemon=True,
         )
         thread.start()
@@ -1234,6 +1446,7 @@ class LiveCupSuccessTracker:
         *,
         frame_idx: int,
         elapsed_s: float,
+        request_capture_mono: float | None,
     ) -> None:
         tracked, source = result
         self.ball_mask = tracked
@@ -1243,6 +1456,9 @@ class LiveCupSuccessTracker:
         self.ball_track_missing_frames = 0
         self.ball_mask_sam2_async_completed_frame = int(frame_idx)
         self.ball_mask_sam2_async_elapsed_s = float(elapsed_s)
+        if request_capture_mono is not None:
+            self.ball_mask_capture_to_display_s = time.monotonic() - float(request_capture_mono)
+            self.ball_mask_capture_to_display_source = "sam2"
         self.last_event = (
             f"ball SAM2 refresh frame={frame_idx} "
             f"source={self.ball_mask_source} area={int(tracked.sum())} elapsed={elapsed_s:.3f}s"
@@ -1255,6 +1471,7 @@ class LiveCupSuccessTracker:
         seed_source: str,
         frame_idx: int,
         generation: int,
+        request_capture_mono: float | None,
     ) -> None:
         started = time.monotonic()
         try:
@@ -1262,7 +1479,12 @@ class LiveCupSuccessTracker:
             elapsed_s = time.monotonic() - started
             with self.ball_mask_sam2_async_lock:
                 if generation == self.ball_mask_generation and result is not None:
-                    self._apply_sam2_ball_refresh_result(result, frame_idx=frame_idx, elapsed_s=elapsed_s)
+                    self._apply_sam2_ball_refresh_result(
+                        result,
+                        frame_idx=frame_idx,
+                        elapsed_s=elapsed_s,
+                        request_capture_mono=request_capture_mono,
+                    )
                     self.ball_mask_sam2_async_status = "accepted"
                     self.ball_mask_sam2_async_error = ""
                 elif result is None:
@@ -1282,9 +1504,10 @@ class LiveCupSuccessTracker:
                 self.ball_mask_sam2_async_elapsed_s = time.monotonic() - started
         finally:
             with self.ball_mask_sam2_async_lock:
+                self.ball_mask_sam2_async_request_capture_mono = None
                 self.ball_mask_sam2_refresh_running = False
 
-    def _start_ball_sam2_refresh(self, rgb: np.ndarray) -> None:
+    def _start_ball_sam2_refresh(self, rgb: np.ndarray, *, request_capture_mono: float | None = None) -> None:
         if self.ball_mask is None or not self.ball_mask.any():
             return
         frame_idx = int(self.frame_idx)
@@ -1298,12 +1521,15 @@ class LiveCupSuccessTracker:
             self.ball_mask_sam2_async_status = "requesting"
             self.ball_mask_sam2_async_error = ""
             self.ball_mask_sam2_async_elapsed_s = None
+            self.ball_mask_sam2_async_request_capture_mono = request_capture_mono
+            self.ball_mask_sam2_async_frame_to_request_s = None
+            self.ball_mask_sam2_async_request_to_response_s = None
             self.ball_mask_sam2_async_started_frame = frame_idx
             self.ball_mask_sam2_async_generation = generation
             self.ball_mask_sam2_last_request_frame = frame_idx
         thread = threading.Thread(
             target=self._run_ball_sam2_refresh,
-            args=(rgb.copy(), seed_mask, seed_source, frame_idx, generation),
+            args=(rgb.copy(), seed_mask, seed_source, frame_idx, generation, request_capture_mono),
             daemon=True,
         )
         thread.start()
@@ -1312,10 +1538,15 @@ class LiveCupSuccessTracker:
         result = self._calculate_sam3_ball_mask(rgb)
         if result is None:
             return None
-        self._apply_sam3_ball_refresh_result(result, frame_idx=self.frame_idx, elapsed_s=0.0)
+        self._apply_sam3_ball_refresh_result(
+            result,
+            frame_idx=self.frame_idx,
+            elapsed_s=0.0,
+            request_capture_mono=None,
+        )
         return self.ball_mask
 
-    def _ball_mask(self, rgb: np.ndarray) -> np.ndarray:
+    def _ball_mask(self, rgb: np.ndarray, *, request_capture_mono: float | None = None) -> np.ndarray:
         if not self.ball_sam2_url:
             self._set_ball_sam2_status("disabled")
             return self._seed_ball_mask(rgb)
@@ -1324,19 +1555,19 @@ class LiveCupSuccessTracker:
             return self._seed_ball_mask(rgb)
 
         if self._should_refresh_ball_with_sam3():
-            self._start_ball_sam3_refresh(rgb)
+            self._start_ball_sam3_refresh(rgb, request_capture_mono=request_capture_mono)
 
         if self._should_refresh_ball_with_sam2():
-            self._start_ball_sam2_refresh(rgb)
+            self._start_ball_sam2_refresh(rgb, request_capture_mono=request_capture_mono)
         elif self.ball_track_missing_frames >= SUCCESS_BALL_TRACK_MAX_MISSING_FRAMES:
-            self._start_ball_sam3_refresh(rgb)
+            self._start_ball_sam3_refresh(rgb, request_capture_mono=request_capture_mono)
 
         return self.ball_mask
 
-    def update(self, rgb: np.ndarray) -> tuple[dict[str, Any], np.ndarray]:
+    def update(self, rgb: np.ndarray, *, image_capture_mono: float | None = None) -> tuple[dict[str, Any], np.ndarray]:
         self.frame_idx += 1
         cup_mask = self._cup_mask_for(rgb)
-        ball_mask = self._ball_mask(rgb)
+        ball_mask = self._ball_mask(rgb, request_capture_mono=image_capture_mono)
         self.ball_area = int(ball_mask.sum())
         visible = self.ball_area > 0
         overlap = None
@@ -1495,6 +1726,12 @@ class LiveCupSuccessTracker:
             "ball_mask_sam3_async_status": self.ball_mask_sam3_async_status,
             "ball_mask_sam3_async_error": self.ball_mask_sam3_async_error,
             "ball_mask_sam3_async_elapsed_s": self.ball_mask_sam3_async_elapsed_s,
+            "ball_mask_sam3_async_frame_to_request_s": self.ball_mask_sam3_async_frame_to_request_s,
+            "ball_mask_sam3_async_request_to_response_s": self.ball_mask_sam3_async_request_to_response_s,
+            "ball_mask_sam3_async_frame_to_request_history_s": list(self.ball_mask_sam3_async_frame_to_request_history),
+            "ball_mask_sam3_async_request_to_response_history_s": list(
+                self.ball_mask_sam3_async_request_to_response_history,
+            ),
             "ball_mask_sam3_async_started_frame": self.ball_mask_sam3_async_started_frame,
             "ball_mask_sam3_async_completed_frame": self.ball_mask_sam3_async_completed_frame,
             "ball_mask_sam3_async_generation": self.ball_mask_sam3_async_generation,
@@ -1503,15 +1740,27 @@ class LiveCupSuccessTracker:
             "ball_mask_sam2_raw_score": self.ball_mask_sam2_raw_score,
             "ball_mask_sam2_raw_area": self.ball_mask_sam2_raw_area,
             "ball_mask_sam2_box_xyxy": self.ball_mask_sam2_box_xyxy,
+            "ball_mask_sam2_max_area": self.ball_sam2_max_area,
             "ball_mask_sam2_every_n_frames": self.ball_mask_sam2_every_n_frames,
             "ball_mask_sam2_last_request_frame": self.ball_mask_sam2_last_request_frame,
             "ball_mask_sam2_refresh_running": self.ball_mask_sam2_refresh_running,
             "ball_mask_sam2_async_status": self.ball_mask_sam2_async_status,
             "ball_mask_sam2_async_error": self.ball_mask_sam2_async_error,
             "ball_mask_sam2_async_elapsed_s": self.ball_mask_sam2_async_elapsed_s,
+            "ball_mask_sam2_async_frame_to_request_s": self.ball_mask_sam2_async_frame_to_request_s,
+            "ball_mask_sam2_async_request_to_response_s": self.ball_mask_sam2_async_request_to_response_s,
+            "ball_mask_sam2_async_frame_to_request_history_s": list(self.ball_mask_sam2_async_frame_to_request_history),
+            "ball_mask_sam2_async_request_to_response_history_s": list(
+                self.ball_mask_sam2_async_request_to_response_history,
+            ),
+            "ball_mask_sam2_async_request_capture_mono": self.ball_mask_sam2_async_request_capture_mono,
             "ball_mask_sam2_async_started_frame": self.ball_mask_sam2_async_started_frame,
             "ball_mask_sam2_async_completed_frame": self.ball_mask_sam2_async_completed_frame,
             "ball_mask_sam2_async_generation": self.ball_mask_sam2_async_generation,
+            "ball_mask_capture_to_display_s": self.ball_mask_capture_to_display_s,
+            "ball_mask_capture_to_display_source": self.ball_mask_capture_to_display_source,
+            "ball_mask_sam3_area_mean": self.ball_sam3_area_mean,
+            "ball_mask_sam3_area_samples": len(self.ball_sam3_area_history),
             "ball_track_missing_frames": self.ball_track_missing_frames,
         }
 
@@ -3232,9 +3481,11 @@ class SO101Controller:
         success_cam = self.camera_configs[0]
         try:
             while not self.success_stop_event.is_set():
+                frame_capture_mono = time.monotonic()
                 rgb = self.read_camera_frame(success_cam, timeout_s=5.0)
                 with self.success_tracker_lock:
-                    status, overlay = self.success_tracker.update(rgb)
+                    status, overlay = self.success_tracker.update(rgb, image_capture_mono=frame_capture_mono)
+                status["success_capture_to_status_latency_s"] = time.monotonic() - frame_capture_mono
                 self._set_success_status(status, overlay)
                 if period > 0:
                     time.sleep(period)

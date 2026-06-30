@@ -4,22 +4,34 @@ from pathlib import Path
 START_SCRIPT = Path("scripts/start_so101_eval_stack.sh").read_text()
 STOP_SCRIPT = Path("scripts/stop_so101_eval_stack.sh").read_text()
 CHECK_SCRIPT = Path("scripts/check_so101_eval_stack.sh").read_text()
+PIPELINE_SCRIPT = Path("scripts/pipeline.sh").read_text()
 OVERVIEW = Path("docs/SO101-EVAL-STACK-OVERVIEW.md").read_text()
 SAM_DOC = Path("docs/SO101-4090-SAM-EVAL.md").read_text()
 ENV_EXAMPLE = Path("config/so101_eval_stack.env.example").read_text()
 README = Path("README.md").read_text()
 
 
-def test_so101_eval_stack_has_two_command_entrypoint() -> None:
-    assert "scripts/start_so101_eval_stack.sh" in README
-    assert "scripts/check_so101_eval_stack.sh" in README
-    assert "scripts/stop_so101_eval_stack.sh" in README
-    assert "scripts/start_so101_eval_stack.sh" in OVERVIEW
-    assert "scripts/check_so101_eval_stack.sh" in OVERVIEW
-    assert "scripts/stop_so101_eval_stack.sh" in OVERVIEW
-    assert "scripts/start_so101_eval_stack.sh" in SAM_DOC
-    assert "scripts/check_so101_eval_stack.sh" in SAM_DOC
-    assert "scripts/stop_so101_eval_stack.sh" in SAM_DOC
+def test_so101_eval_stack_has_pipeline_entrypoint() -> None:
+    assert "scripts/pipeline.sh launch so101-eval" in README
+    assert "scripts/pipeline.sh check so101-eval" in README
+    assert "scripts/pipeline.sh stop so101-eval" in README
+    assert "scripts/pipeline.sh launch so101-eval" in OVERVIEW
+    assert "scripts/pipeline.sh check so101-eval" in OVERVIEW
+    assert "scripts/pipeline.sh stop so101-eval" in OVERVIEW
+    assert "scripts/pipeline.sh launch so101-eval" in SAM_DOC
+    assert "scripts/pipeline.sh check so101-eval" in SAM_DOC
+    assert "scripts/pipeline.sh stop so101-eval" in SAM_DOC
+    assert "scripts/pipeline.sh restart so101-eval" in SAM_DOC
+
+
+def test_pipeline_script_routes_so101_eval_commands() -> None:
+    assert "launch|start" in PIPELINE_SCRIPT
+    assert "check|status" in PIPELINE_SCRIPT
+    assert "restart" in PIPELINE_SCRIPT
+    assert "so101-eval|so101" in PIPELINE_SCRIPT
+    assert 'exec "$REPO_ROOT/scripts/start_so101_eval_stack.sh"' in PIPELINE_SCRIPT
+    assert 'exec "$REPO_ROOT/scripts/check_so101_eval_stack.sh"' in PIPELINE_SCRIPT
+    assert 'exec "$REPO_ROOT/scripts/stop_so101_eval_stack.sh"' in PIPELINE_SCRIPT
 
 
 def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
@@ -46,6 +58,15 @@ def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
     assert 'IMAGE_KEYS="$(printf \'%s\' "$IMAGE_KEYS_B64" | base64 -d)"' in START_SCRIPT
     assert 'SAM3_READY_PATH="${SO101_SAM3_READY_PATH:-/}"' in START_SCRIPT
     assert '"http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}"' in START_SCRIPT
+    assert 'SYNC_HF_TOKEN="${SO101_SYNC_HF_TOKEN:-1}"' in START_SCRIPT
+    assert "sync_remote_hf_token" in START_SCRIPT
+    assert "Remote Hugging Face token: syncing" in START_SCRIPT
+    assert 'SAM3_DETECT_TIMEOUT_S="${SO101_SAM3_DETECT_TIMEOUT_S:-240}"' in START_SCRIPT
+    assert "wait_sam3_detect" in START_SCRIPT
+    assert "/api/detect_image" in START_SCRIPT
+    assert 'RUN_FINAL_CHECK="${SO101_RUN_FINAL_CHECK:-1}"' in START_SCRIPT
+    assert 'SO101_CHECK_SAM3_DETECT=1' in START_SCRIPT
+    assert 'scripts/check_so101_eval_stack.sh' in START_SCRIPT
     assert "ssh \"${SSH_OPTS[@]}\"" in START_SCRIPT
     assert '-L "${POLICY_PORT}:127.0.0.1:${POLICY_PORT}"' in START_SCRIPT
     assert '-L "${SAM3_PORT}:127.0.0.1:${SAM3_PORT}"' in START_SCRIPT
@@ -59,6 +80,8 @@ def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
     assert 'SO101_SUCCESS_BALL_SAM3_PROMPT="${SO101_SUCCESS_BALL_SAM3_PROMPT:-blue rubber ball}"' in START_SCRIPT
     assert 'SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES="${SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES:-100}"' in START_SCRIPT
     assert 'SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES="${SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES:-2}"' in START_SCRIPT
+    assert 'SAM3_MODEL_ID="${SO101_SAM3_MODEL_ID:-facebook/sam3}"' in START_SCRIPT
+    assert '--model-id "$SAM3_MODEL_ID"' in START_SCRIPT
 
 
 def test_stop_script_stops_motion_local_processes_tunnels_and_remote_services() -> None:
@@ -79,9 +102,12 @@ def test_stop_script_stops_motion_local_processes_tunnels_and_remote_services() 
 def test_check_script_verifies_local_stack_and_optional_remote_gpu() -> None:
     assert 'SO101_CHECK_UI' in CHECK_SCRIPT
     assert 'SO101_CHECK_REMOTE' in CHECK_SCRIPT
+    assert 'SO101_CHECK_SAM3_DETECT' in CHECK_SCRIPT
+    assert 'SAM3_DETECT_REQUEST_TIMEOUT_S="${SO101_SAM3_DETECT_REQUEST_TIMEOUT_S:-$SAM3_DETECT_TIMEOUT_S}"' in CHECK_SCRIPT
     assert '"http://127.0.0.1:${CAMERA_RELAY_PORT}/health"' in CHECK_SCRIPT
     assert '"http://127.0.0.1:${POLICY_PORT}/health"' in CHECK_SCRIPT
     assert '"http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}"' in CHECK_SCRIPT
+    assert '"http://127.0.0.1:${SAM3_PORT}/api/detect_image"' in CHECK_SCRIPT
     assert '"http://127.0.0.1:${SAM2_PORT}/health"' in CHECK_SCRIPT
     assert '"http://127.0.0.1:${UI_PORT}/api/status?log_limit=1"' in CHECK_SCRIPT
     assert 'ssh "${ssh_opts[@]}" "${GPU_USER}@${GPU_HOST}"' in CHECK_SCRIPT
@@ -94,6 +120,10 @@ def test_stack_env_example_documents_mutable_vast_config() -> None:
     assert "MOLMOACT2_CHECKPOINT_PATH=allenai/MolmoAct2-SO100_101" in ENV_EXAMPLE
     assert "MOLMOACT2_NORM_TAG=so100_so101_molmoact2" in ENV_EXAMPLE
     assert "SO101_SAM3_READY_PATH=/" in ENV_EXAMPLE
+    assert "SO101_SAM3_MODEL_ID=facebook/sam3" in ENV_EXAMPLE
+    assert "SO101_SYNC_HF_TOKEN=1" in ENV_EXAMPLE
+    assert "SO101_SAM3_DETECT_TIMEOUT_S=240" in ENV_EXAMPLE
+    assert "SO101_RUN_FINAL_CHECK=1" in ENV_EXAMPLE
     assert "SO101_SAM2_TRACKER=image" in ENV_EXAMPLE
     assert "SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=100" in ENV_EXAMPLE
     assert "SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2" in ENV_EXAMPLE
