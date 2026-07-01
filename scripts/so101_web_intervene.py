@@ -268,6 +268,17 @@ class BallMaskAsyncAttrs:
     last_request_frame: str
 
 
+@dataclass(frozen=True)
+class Sam3PromptMaskResult:
+    status: str
+    error: str = ""
+    mask: np.ndarray | None = None
+    prompt: str = ""
+    score: float | None = None
+    area: int | None = None
+    box_xyxy: list[float] | None = None
+
+
 BALL_MASK_ASYNC_ATTRS = {
     "sam3": BallMaskAsyncAttrs(
         lock="ball_mask_sam3_async_lock",
@@ -1309,6 +1320,108 @@ class LiveCupSuccessTracker:
         self.ball_track_last_reject = reason
         status_setter("rejected_by_anchor", reason)
 
+    def _request_sam3_prompt_mask(
+        self,
+        rgb: np.ndarray,
+        *,
+        url: str,
+        prompt: str,
+        min_score: float,
+        timeout_s: float,
+        jpeg_quality: int,
+        timing_model: str | None = None,
+        request_capture_mono: float | None = None,
+    ) -> Sam3PromptMaskResult:
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
+        )
+        if not ok:
+            return Sam3PromptMaskResult(status="encode_failed")
+
+        payload = {
+            "image_b64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+            "prompts": [prompt],
+            "max_masks": 1,
+            "min_score": min_score,
+            "alpha": 0.65,
+        }
+        request_started_mono: float | None = None
+        request_to_response_s: float | None = None
+        score: float | None = None
+        box_xyxy: list[float] | None = None
+        try:
+            request_started_mono = time.monotonic()
+            resp = requests.post(url, json=payload, timeout=timeout_s)
+            request_to_response_s = time.monotonic() - request_started_mono
+            if timing_model is not None:
+                self._record_ball_mask_request_timings(
+                    model=timing_model,
+                    request_capture_mono=request_capture_mono,
+                    request_started_mono=request_started_mono,
+                    request_to_response_s=request_to_response_s,
+                )
+            raise_for_status_with_body(resp)
+            data = resp.json()
+            top = data.get("top_mask") or {}
+            if not top:
+                return Sam3PromptMaskResult(status="no_top_mask")
+
+            score = float(top.get("score", 0.0))
+            box = top.get("box_xyxy")
+            box_xyxy = [float(x) for x in box] if isinstance(box, list) else None
+            if score < min_score:
+                return Sam3PromptMaskResult(
+                    status="low_score",
+                    error=f"score={score:.3f} min={min_score:.3f}",
+                    score=score,
+                    box_xyxy=box_xyxy,
+                )
+
+            mask_b64 = top.get("mask_png_b64")
+            if not mask_b64:
+                return Sam3PromptMaskResult(
+                    status="no_mask_payload",
+                    error=f"score={score:.3f}",
+                    score=score,
+                    box_xyxy=box_xyxy,
+                )
+            if "," in mask_b64:
+                mask_b64 = mask_b64.split(",", 1)[1]
+            mask_bytes = base64.b64decode(mask_b64)
+            mask_u8 = cv2.imdecode(np.frombuffer(mask_bytes, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            if mask_u8 is None:
+                return Sam3PromptMaskResult(
+                    status="mask_decode_failed",
+                    error=f"score={score:.3f}",
+                    score=score,
+                    box_xyxy=box_xyxy,
+                )
+            if mask_u8.shape != rgb.shape[:2]:
+                mask_u8 = cv2.resize(mask_u8, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+            mask_bool = mask_u8 > 0
+            area = int(mask_bool.sum())
+            return Sam3PromptMaskResult(
+                status="accepted",
+                mask=mask_bool,
+                prompt=str(top.get("prompt") or prompt),
+                score=score,
+                area=area,
+                box_xyxy=box_xyxy,
+            )
+        except Exception as exc:
+            if timing_model is not None and request_started_mono is not None and request_to_response_s is None:
+                request_to_response_s = time.monotonic() - request_started_mono
+                self._record_ball_mask_request_timings(
+                    model=timing_model,
+                    request_capture_mono=request_capture_mono,
+                    request_started_mono=request_started_mono,
+                    request_to_response_s=request_to_response_s,
+                )
+            return Sam3PromptMaskResult(status="request_failed", error=str(exc), score=score, box_xyxy=box_xyxy)
+
     def _calculate_sam3_cup_mask(self, rgb: np.ndarray, default_area: int) -> tuple[np.ndarray, str] | None:
         if not self.container_sam3_url or not self.container_sam3_prompt:
             self._set_sam3_mask_status("disabled")
@@ -1318,104 +1431,62 @@ class LiveCupSuccessTracker:
         self.cup_mask_sam3_raw_area = None
         self.cup_mask_sam3_box_xyxy = None
 
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
-            [int(cv2.IMWRITE_JPEG_QUALITY), SUCCESS_BALL_SAM2_JPEG_QUALITY],
+        sam3 = self._request_sam3_prompt_mask(
+            rgb,
+            url=self.container_sam3_url,
+            prompt=self.container_sam3_prompt,
+            min_score=self.container_sam3_min_score,
+            timeout_s=self.container_sam3_timeout_s,
+            jpeg_quality=SUCCESS_BALL_SAM2_JPEG_QUALITY,
         )
-        if not ok:
-            self._set_sam3_mask_status("encode_failed")
+        self.cup_mask_sam3_raw_score = sam3.score
+        self.cup_mask_sam3_raw_area = sam3.area
+        self.cup_mask_sam3_box_xyxy = sam3.box_xyxy
+        if sam3.status != "accepted" or sam3.mask is None or sam3.score is None or sam3.area is None:
+            self._set_sam3_mask_status(sam3.status, sam3.error)
             return None
 
-        payload = {
-            "image_b64": base64.b64encode(encoded.tobytes()).decode("ascii"),
-            "prompts": [self.container_sam3_prompt],
-            "max_masks": 1,
-            "min_score": self.container_sam3_min_score,
-            "alpha": 0.65,
-        }
-        try:
-            resp = requests.post(
-                self.container_sam3_url,
-                json=payload,
-                timeout=self.container_sam3_timeout_s,
+        mask_bool = sam3.mask
+        score = sam3.score
+        area = sam3.area
+        max_area = int(max(default_area, 1) * SUCCESS_CUP_MAX_MASK_AREA_MULT)
+        if area < SUCCESS_CUP_MIN_MASK_AREA:
+            self._set_sam3_mask_status(
+                "area_too_small",
+                f"area={area} min={SUCCESS_CUP_MIN_MASK_AREA} score={score:.3f}",
             )
-            raise_for_status_with_body(resp)
-            data = resp.json()
-            top = data.get("top_mask") or {}
-            if not top:
-                self._set_sam3_mask_status("no_top_mask")
-                return None
-            score = float(top.get("score", 0.0))
-            self.cup_mask_sam3_raw_score = score
-            box = top.get("box_xyxy")
-            if isinstance(box, list):
-                self.cup_mask_sam3_box_xyxy = [float(x) for x in box]
-            if score < self.container_sam3_min_score:
-                self._set_sam3_mask_status(
-                    "low_score",
-                    f"score={score:.3f} min={self.container_sam3_min_score:.3f}",
-                )
-                return None
-
-            mask_b64 = top.get("mask_png_b64")
-            if not mask_b64:
-                self._set_sam3_mask_status("no_mask_payload", f"score={score:.3f}")
-                return None
-            if "," in mask_b64:
-                mask_b64 = mask_b64.split(",", 1)[1]
-            mask_bytes = base64.b64decode(mask_b64)
-            mask_u8 = cv2.imdecode(np.frombuffer(mask_bytes, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-            if mask_u8 is None:
-                self._set_sam3_mask_status("mask_decode_failed", f"score={score:.3f}")
-                return None
-            if mask_u8.shape != rgb.shape[:2]:
-                mask_u8 = cv2.resize(mask_u8, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-            mask_bool = mask_u8 > 0
-            area = int(mask_bool.sum())
-            self.cup_mask_sam3_raw_area = area
-            max_area = int(max(default_area, 1) * SUCCESS_CUP_MAX_MASK_AREA_MULT)
-            if area < SUCCESS_CUP_MIN_MASK_AREA:
-                self._set_sam3_mask_status(
-                    "area_too_small",
-                    f"area={area} min={SUCCESS_CUP_MIN_MASK_AREA} score={score:.3f}",
-                )
-                return None
-            if area > max_area:
-                self._set_sam3_mask_status(
-                    "area_too_large",
-                    f"area={area} max={max_area} score={score:.3f}",
-                )
-                return None
-            check_episode_iou = self.cup_mask_recalculate_reason not in {
-                "manual_sam3_rerun",
-                "sam3_prompt_update",
-            }
-            if check_episode_iou and self.previous_cup_mask is not None and self.previous_cup_mask.any():
-                iou = self._mask_iou(mask_bool, self.previous_cup_mask)
-                self.cup_mask_episode_iou = iou
-                if iou is None:
-                    self._set_sam3_mask_status(
-                        "episode_iou_unavailable",
-                        f"previous_shape={self.previous_cup_mask.shape} current_shape={mask_bool.shape}",
-                    )
-                    return None
-                if iou < self.cup_mask_episode_iou_threshold:
-                    self._set_sam3_mask_status(
-                        "episode_iou_too_low",
-                        f"iou={iou:.3f} min={self.cup_mask_episode_iou_threshold:.3f} score={score:.3f}",
-                    )
-                    return None
-
-            prompt = str(top.get("prompt") or self.container_sam3_prompt)
-            self.cup_mask_prompt = prompt
-            self.cup_mask_score = score
-            self._set_sam3_mask_status("accepted", f"area={area} score={score:.3f}")
-            return mask_bool, f"sam3:{prompt} score={score:.2f}"
-        except Exception as exc:
-            self._set_sam3_mask_status("request_failed", str(exc))
             return None
+        if area > max_area:
+            self._set_sam3_mask_status(
+                "area_too_large",
+                f"area={area} max={max_area} score={score:.3f}",
+            )
+            return None
+        check_episode_iou = self.cup_mask_recalculate_reason not in {
+            "manual_sam3_rerun",
+            "sam3_prompt_update",
+        }
+        if check_episode_iou and self.previous_cup_mask is not None and self.previous_cup_mask.any():
+            iou = self._mask_iou(mask_bool, self.previous_cup_mask)
+            self.cup_mask_episode_iou = iou
+            if iou is None:
+                self._set_sam3_mask_status(
+                    "episode_iou_unavailable",
+                    f"previous_shape={self.previous_cup_mask.shape} current_shape={mask_bool.shape}",
+                )
+                return None
+            if iou < self.cup_mask_episode_iou_threshold:
+                self._set_sam3_mask_status(
+                    "episode_iou_too_low",
+                    f"iou={iou:.3f} min={self.cup_mask_episode_iou_threshold:.3f} score={score:.3f}",
+                )
+                return None
+
+        prompt = sam3.prompt
+        self.cup_mask_prompt = prompt
+        self.cup_mask_score = score
+        self._set_sam3_mask_status("accepted", f"area={area} score={score:.3f}")
+        return mask_bool, f"sam3:{prompt} score={score:.2f}"
 
     def _previous_cup_mask_fallback(self, shape: tuple[int, int]) -> tuple[np.ndarray, str] | None:
         if self.previous_cup_mask is None or not self.previous_cup_mask.any():
@@ -1579,104 +1650,46 @@ class LiveCupSuccessTracker:
         self.ball_mask_sam3_raw_area = None
         self.ball_mask_sam3_box_xyxy = None
 
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
-            [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+        sam3 = self._request_sam3_prompt_mask(
+            rgb,
+            url=self.ball_sam3_url,
+            prompt=self.ball_sam3_prompt,
+            min_score=self.ball_sam3_min_score,
+            timeout_s=self.ball_sam3_timeout_s,
+            jpeg_quality=90,
+            timing_model="sam3",
+            request_capture_mono=self.ball_mask_sam3_async_request_capture_mono,
         )
-        if not ok:
-            self._set_ball_sam3_status("encode_failed")
-            return None
-
-        payload = {
-            "image_b64": base64.b64encode(encoded.tobytes()).decode("ascii"),
-            "prompts": [self.ball_sam3_prompt],
-            "max_masks": 1,
-            "min_score": self.ball_sam3_min_score,
-            "alpha": 0.65,
-        }
-        request_started_mono: float | None = None
-        request_capture_mono = self.ball_mask_sam3_async_request_capture_mono
-        request_to_response_s: float | None = None
-        try:
-            request_started_mono = time.monotonic()
-            resp = requests.post(
-                self.ball_sam3_url,
-                json=payload,
-                timeout=self.ball_sam3_timeout_s,
-            )
-            request_to_response_s = time.monotonic() - request_started_mono
-            assert request_started_mono is not None
-            self._record_ball_mask_request_timings(
-                model="sam3",
-                request_capture_mono=request_capture_mono,
-                request_started_mono=request_started_mono,
-                request_to_response_s=request_to_response_s,
-            )
-            raise_for_status_with_body(resp)
-            data = resp.json()
-            top = data.get("top_mask") or {}
-            if not top:
-                self._set_ball_sam3_status("no_top_mask")
-                return previous_fallback()
-            score = float(top.get("score", 0.0))
-            self.ball_mask_sam3_raw_score = score
-            box = top.get("box_xyxy")
-            if isinstance(box, list):
-                self.ball_mask_sam3_box_xyxy = [float(x) for x in box]
-            if score < self.ball_sam3_min_score:
-                self._set_ball_sam3_status(
-                    "low_score",
-                    f"score={score:.3f} min={self.ball_sam3_min_score:.3f}",
-                )
-                return previous_fallback()
-
-            mask_b64 = top.get("mask_png_b64")
-            if not mask_b64:
-                self._set_ball_sam3_status("no_mask_payload", f"score={score:.3f}")
-                return previous_fallback()
-            if "," in mask_b64:
-                mask_b64 = mask_b64.split(",", 1)[1]
-            mask_bytes = base64.b64decode(mask_b64)
-            mask_u8 = cv2.imdecode(np.frombuffer(mask_bytes, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-            if mask_u8 is None:
-                self._set_ball_sam3_status("mask_decode_failed", f"score={score:.3f}")
-                return previous_fallback()
-            if mask_u8.shape != rgb.shape[:2]:
-                mask_u8 = cv2.resize(mask_u8, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-            mask_bool = mask_u8 > 0
-            area = int(mask_bool.sum())
-            self.ball_mask_sam3_raw_area = area
-            if area < SUCCESS_MIN_BALL_AREA:
-                self._set_ball_sam3_status(
-                    "area_too_small",
-                    f"area={area} min={SUCCESS_MIN_BALL_AREA} score={score:.3f}",
-                )
-                return previous_fallback()
-            if area > SUCCESS_MAX_BALL_AREA:
-                self._set_ball_sam3_status(
-                    "area_too_large",
-                    f"area={area} max={SUCCESS_MAX_BALL_AREA} score={score:.3f}",
-                )
-                return previous_fallback()
-
-            prompt = str(top.get("prompt") or self.ball_sam3_prompt)
-            self.ball_mask_prompt = prompt
-            self.ball_mask_score = score
-            self._set_ball_sam3_status("accepted", f"area={area} score={score:.3f}")
-            return mask_bool, f"sam3:{prompt} score={score:.2f}"
-        except Exception as exc:
-            if request_started_mono is not None and request_to_response_s is None:
-                request_to_response_s = time.monotonic() - request_started_mono
-                self._record_ball_mask_request_timings(
-                    model="sam3",
-                    request_capture_mono=request_capture_mono,
-                    request_started_mono=request_started_mono,
-                    request_to_response_s=request_to_response_s,
-                )
-            self._set_ball_sam3_status("request_failed", str(exc))
+        self.ball_mask_sam3_raw_score = sam3.score
+        self.ball_mask_sam3_raw_area = sam3.area
+        self.ball_mask_sam3_box_xyxy = sam3.box_xyxy
+        if sam3.status != "accepted" or sam3.mask is None or sam3.score is None or sam3.area is None:
+            self._set_ball_sam3_status(sam3.status, sam3.error)
+            if sam3.status == "encode_failed":
+                return None
             return previous_fallback()
+
+        mask_bool = sam3.mask
+        score = sam3.score
+        area = sam3.area
+        if area < SUCCESS_MIN_BALL_AREA:
+            self._set_ball_sam3_status(
+                "area_too_small",
+                f"area={area} min={SUCCESS_MIN_BALL_AREA} score={score:.3f}",
+            )
+            return previous_fallback()
+        if area > SUCCESS_MAX_BALL_AREA:
+            self._set_ball_sam3_status(
+                "area_too_large",
+                f"area={area} max={SUCCESS_MAX_BALL_AREA} score={score:.3f}",
+            )
+            return previous_fallback()
+
+        prompt = sam3.prompt
+        self.ball_mask_prompt = prompt
+        self.ball_mask_score = score
+        self._set_ball_sam3_status("accepted", f"area={area} score={score:.3f}")
+        return mask_bool, f"sam3:{prompt} score={score:.2f}"
 
     def _previous_sam3_ball_mask_fallback(self, shape: tuple[int, int]) -> tuple[np.ndarray, str] | None:
         if (
