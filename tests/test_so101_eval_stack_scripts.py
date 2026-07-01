@@ -53,12 +53,21 @@ def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
     assert 'SAM2_EXPECTED_MODE="sam2_video"' in START_SCRIPT
     assert 'SAM2_SCRIPT="scripts/sam3_video_track_ui.py"' in START_SCRIPT
     assert 'SAM2_EXPECTED_MODE="sam3_video"' in START_SCRIPT
-    assert 'TRACKER_MODEL_ID="$SAM3_VIDEO_MODEL_ID"' in START_SCRIPT
-    assert 'TRACKER_EXTRA_ARGS=(--prompt "$SAM3_VIDEO_PROMPT")' in START_SCRIPT
+    assert 'TRACKER_EXTRA_ARGS=(' in START_SCRIPT
+    assert '--model-id "$SAM3_VIDEO_MODEL_ID"' in START_SCRIPT
+    assert '--prompt "$SAM3_VIDEO_PROMPT"' in START_SCRIPT
+    assert "--inference-state-device cpu" in START_SCRIPT
+    assert "--video-storage-device cpu" in START_SCRIPT
+    assert '--max-session-frames "$SAM3_VIDEO_MAX_SESSION_FRAMES"' in START_SCRIPT
+    assert 'SAM2_SCRIPT="scripts/yolo_ball_track_ui.py"' in START_SCRIPT
+    assert 'SAM2_EXPECTED_MODE="yolo_seg"' in START_SCRIPT
+    assert 'SO101_YOLO_BALL_MODEL' in START_SCRIPT
     assert 'REMOTE_POLICY_PATH="${MOLMOACT2_POLICY_PATH:-__none__}"' in START_SCRIPT
     assert 'if [ "$POLICY_PATH" = "__none__" ]; then' in START_SCRIPT
     assert 'MOLMOACT2_IMAGE_KEYS_B64="$(printf \'%s\' "$MOLMOACT2_IMAGE_KEYS" | base64 | tr -d \'\\n\')"' in START_SCRIPT
-    assert '"$MOLMOACT2_IMAGE_KEYS_B64" \\' in START_SCRIPT
+    assert '"$MOLMOACT2_IMAGE_KEYS_B64"' in START_SCRIPT
+    assert 'remote_cmd="bash -s --"' in START_SCRIPT
+    assert 'remote_cmd+=" ${quoted_arg}"' in START_SCRIPT
     assert 'IMAGE_KEYS="$(printf \'%s\' "$IMAGE_KEYS_B64" | base64 -d)"' in START_SCRIPT
     assert 'SAM3_READY_PATH="${SO101_SAM3_READY_PATH:-/}"' in START_SCRIPT
     assert '"http://127.0.0.1:${SAM3_PORT}${SAM3_READY_PATH}"' in START_SCRIPT
@@ -81,8 +90,9 @@ def test_start_script_owns_gpu_services_tunnels_and_local_ui() -> None:
     assert 'post_json_best_effort "http://127.0.0.1:${UI_PORT}/api/stop"' in START_SCRIPT
     assert '"$REPO_ROOT/scripts/launch_so101_eval_ui.sh"' in START_SCRIPT
     assert 'SO101_SUCCESS_SAM3_MIN_SCORE="${SO101_SUCCESS_SAM3_MIN_SCORE:-0.25}"' in START_SCRIPT
-    assert 'SO101_SUCCESS_BALL_SAM3_PROMPT="${SO101_SUCCESS_BALL_SAM3_PROMPT:-blue rubber ball}"' in START_SCRIPT
-    assert 'SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES="${SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES:-100}"' in START_SCRIPT
+    assert 'SO101_SUCCESS_BALL_SAM3_PROMPT="${SO101_SUCCESS_BALL_SAM3_PROMPT:-light blue object}"' in START_SCRIPT
+    assert 'SO101_SUCCESS_BALL_SAM3_MIN_SCORE="${SO101_SUCCESS_BALL_SAM3_MIN_SCORE:-0.25}"' in START_SCRIPT
+    assert 'SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES="${SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES:-0}"' in START_SCRIPT
     assert 'SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES="${SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES:-2}"' in START_SCRIPT
     assert 'SAM3_MODEL_ID="${SO101_SAM3_MODEL_ID:-facebook/sam3}"' in START_SCRIPT
     assert '--model-id "$SAM3_MODEL_ID"' in START_SCRIPT
@@ -100,6 +110,7 @@ def test_stop_script_stops_motion_local_processes_tunnels_and_remote_services() 
     assert 'pkill -f \'scripts/sam3_video_track_ui.py\'' in STOP_SCRIPT
     assert 'pkill -f \'scripts/sam2_video_track_ui.py\'' in STOP_SCRIPT
     assert 'pkill -f \'scripts/sam2_track_ui.py\'' in STOP_SCRIPT
+    assert 'pkill -f \'scripts/yolo_ball_track_ui.py\'' in STOP_SCRIPT
     assert 'SO101_STOP_VAST_INSTANCE' in STOP_SCRIPT
     assert 'vastai stop instance "$VAST_INSTANCE_ID"' in STOP_SCRIPT
 
@@ -132,8 +143,12 @@ def test_stack_env_example_documents_mutable_vast_config() -> None:
     assert "SO101_RUN_FINAL_CHECK=1" in ENV_EXAMPLE
     assert "SO101_SAM2_TRACKER=image" in ENV_EXAMPLE
     assert "SO101_SAM2_TRACKER=sam3_video" in ENV_EXAMPLE
+    assert "SO101_SAM2_TRACKER=yolo" in ENV_EXAMPLE
+    assert "SO101_YOLO_BALL_MODEL" in ENV_EXAMPLE
     assert "SO101_SAM3_VIDEO_MODEL_ID=facebook/sam3" in ENV_EXAMPLE
-    assert "SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=100" in ENV_EXAMPLE
+    assert "SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=0" in ENV_EXAMPLE
+    assert 'SO101_SUCCESS_BALL_SAM3_PROMPT="light blue object"' in ENV_EXAMPLE
+    assert "SO101_SUCCESS_BALL_SAM3_MIN_SCORE=0.25" in ENV_EXAMPLE
     assert "SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2" in ENV_EXAMPLE
     assert "SO101_STOP_REMOTE_SERVICES=1" in ENV_EXAMPLE
 

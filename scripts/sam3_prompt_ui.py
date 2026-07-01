@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gc
 import io
 import json
 import mimetypes
@@ -58,6 +59,25 @@ def _mask_png_b64(mask: np.ndarray) -> str:
 
 def _box_list(box) -> list[float]:
     return [float(v) for v in np.asarray(box).reshape(-1)[:4].tolist()]
+
+
+def _cuda_memory_stats() -> dict:
+    if not torch.cuda.is_available():
+        return {}
+    device = torch.cuda.current_device()
+    scale = 1024 * 1024
+    return {
+        "allocated_mb": round(torch.cuda.memory_allocated(device) / scale, 1),
+        "reserved_mb": round(torch.cuda.memory_reserved(device) / scale, 1),
+        "max_allocated_mb": round(torch.cuda.max_memory_allocated(device) / scale, 1),
+        "max_reserved_mb": round(torch.cuda.max_memory_reserved(device) / scale, 1),
+    }
+
+
+def _cleanup_cuda() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _detection_from_mask(
@@ -312,52 +332,54 @@ class Sam3Session:
             dtype=np.float32,
         )
 
+        memory_before = _cuda_memory_stats()
         with self._lock, torch.inference_mode():
-            autocast = (
-                torch.autocast("cuda", dtype=torch.bfloat16)
-                if torch.cuda.is_available()
-                else torch.autocast("cpu", enabled=False)
-            )
-            with autocast:
-                self._processor_ready()
-                for prompt_idx, prompt in enumerate(prompts):
-                    color = colors[prompt_idx % len(colors)]
-                    prompt_results, num_masks = self._prompt(
-                        image,
-                        prompt,
-                        max_masks=max_masks,
-                        include_masks=True,
-                        min_score=min_score,
-                    )
-                    response_results = []
-                    for mask_idx, detection in enumerate(prompt_results):
-                        mask_payload = detection.get("mask_png_b64")
-                        if mask_payload:
-                            mask_bytes = base64.b64decode(mask_payload)
-                            mask_image = Image.open(io.BytesIO(mask_bytes)).convert("L")
-                            mask = np.array(mask_image) > 0
-                        else:
-                            mask = np.zeros(base.shape[:2], dtype=bool)
-                        box = detection["box_xyxy"]
-                        score = float(detection["score"])
-                        overlay[mask] = (1.0 - alpha) * overlay[mask] + alpha * color
-                        response_detection = dict(detection)
-                        if not include_masks:
-                            response_detection.pop("mask_png_b64", None)
-                        if top_mask is None or score > float(top_mask.get("score", -1.0)):
-                            top_mask = {"prompt": prompt, **response_detection}
-                        if mask_idx == 0:
-                            draw_items.append((prompt, score, box, tuple(int(v) for v in color)))
-                        response_results.append(response_detection)
-                    results.append(
-                        {
-                            "prompt": prompt,
-                            "num_masks": num_masks,
-                            "detections": response_results,
-                        }
-                    )
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            try:
+                autocast = (
+                    torch.autocast("cuda", dtype=torch.bfloat16)
+                    if torch.cuda.is_available()
+                    else torch.autocast("cpu", enabled=False)
+                )
+                with autocast:
+                    self._processor_ready()
+                    for prompt_idx, prompt in enumerate(prompts):
+                        color = colors[prompt_idx % len(colors)]
+                        prompt_results, num_masks = self._prompt(
+                            image,
+                            prompt,
+                            max_masks=max_masks,
+                            include_masks=True,
+                            min_score=min_score,
+                        )
+                        response_results = []
+                        for mask_idx, detection in enumerate(prompt_results):
+                            mask_payload = detection.get("mask_png_b64")
+                            if mask_payload:
+                                mask_bytes = base64.b64decode(mask_payload)
+                                mask_image = Image.open(io.BytesIO(mask_bytes)).convert("L")
+                                mask = np.array(mask_image) > 0
+                            else:
+                                mask = np.zeros(base.shape[:2], dtype=bool)
+                            box = detection["box_xyxy"]
+                            score = float(detection["score"])
+                            overlay[mask] = (1.0 - alpha) * overlay[mask] + alpha * color
+                            response_detection = dict(detection)
+                            if not include_masks:
+                                response_detection.pop("mask_png_b64", None)
+                            if top_mask is None or score > float(top_mask.get("score", -1.0)):
+                                top_mask = {"prompt": prompt, **response_detection}
+                            if mask_idx == 0:
+                                draw_items.append((prompt, score, box, tuple(int(v) for v in color)))
+                            response_results.append(response_detection)
+                        results.append(
+                            {
+                                "prompt": prompt,
+                                "num_masks": num_masks,
+                                "detections": response_results,
+                            }
+                        )
+            finally:
+                _cleanup_cuda()
 
         out = Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8))
         draw = ImageDraw.Draw(out)
@@ -380,6 +402,8 @@ class Sam3Session:
             "results": results,
             "top_mask": top_mask,
             "min_score": min_score,
+            "cuda_memory_before": memory_before,
+            "cuda_memory_after": _cuda_memory_stats(),
         }
 
 
@@ -609,6 +633,7 @@ class Handler(BaseHTTPRequestHandler):
                     "backend": self.session.backend,
                     "active_backend": self.session._active_backend,
                     "model_id": self.session.model_id,
+                    "cuda_memory": _cuda_memory_stats(),
                 },
             )
             return
@@ -668,8 +693,16 @@ class Handler(BaseHTTPRequestHandler):
                 )
             self._json(200, result)
         except Exception as exc:
+            _cleanup_cuda()
             print(f"[sam3-ui] request error: {exc}", flush=True)
-            self._json(400, {"error": str(exc)})
+            self._json(
+                400,
+                {
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "cuda_memory": _cuda_memory_stats(),
+                },
+            )
 
     def log_message(self, fmt, *args):
         print(f"[sam3-ui] {self.address_string()} {fmt % args}", flush=True)

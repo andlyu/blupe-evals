@@ -72,7 +72,11 @@ SAM3_DETECT_REQUEST_TIMEOUT_S="${SO101_SAM3_DETECT_REQUEST_TIMEOUT_S:-90}"
 SAM2_TRACKER="${SO101_SAM2_TRACKER:-image}"
 SAM2_MODEL_ID="${SO101_SAM2_MODEL_ID:-facebook/sam2.1-hiera-base-plus}"
 SAM3_VIDEO_MODEL_ID="${SO101_SAM3_VIDEO_MODEL_ID:-$SAM3_MODEL_ID}"
-SAM3_VIDEO_PROMPT="${SO101_SUCCESS_BALL_SAM3_PROMPT:-blue rubber ball}"
+SAM3_VIDEO_PROMPT="${SO101_SAM3_VIDEO_PROMPT:-${SO101_SUCCESS_BALL_SAM3_PROMPT:-light blue object}}"
+SAM3_VIDEO_MAX_SESSION_FRAMES="${SO101_SAM3_VIDEO_MAX_SESSION_FRAMES:-300}"
+YOLO_BALL_MODEL="${SO101_YOLO_BALL_MODEL:-}"
+YOLO_BALL_IMGSZ="${SO101_YOLO_BALL_IMGSZ:-640}"
+YOLO_BALL_CONF="${SO101_YOLO_BALL_CONF:-0.25}"
 
 UI_PORT="${SO101_WEB_PORT:-8092}"
 CAMERA_RELAY_PORT="${SO101_CAMERA_RELAY_PORT:-8089}"
@@ -91,8 +95,13 @@ SSH_OPTS=(
   -o ServerAliveCountMax=3
   -p "$GPU_PORT"
 )
+SCP_OPTS=(
+  -o StrictHostKeyChecking=no
+  -P "$GPU_PORT"
+)
 if [ -n "$GPU_SSH_KEY" ]; then
   SSH_OPTS=(-i "$GPU_SSH_KEY" "${SSH_OPTS[@]}")
+  SCP_OPTS=(-i "$GPU_SSH_KEY" "${SCP_OPTS[@]}")
 fi
 
 stop_screen() {
@@ -179,34 +188,52 @@ sync_remote_hf_token() {
 start_remote_gpu_services() {
   echo "Ensuring GPU services on ${GPU_USER}@${GPU_HOST}:${GPU_PORT}"
   sync_remote_hf_token
-  ssh "${SSH_OPTS[@]}" "${GPU_USER}@${GPU_HOST}" bash -s -- \
-    "$REMOTE_ROOT" \
-    "$REMOTE_PYTHON" \
-    "$REMOTE_LOG_DIR" \
-    "$REMOTE_HF_HOME" \
-    "$POLICY_PORT" \
-    "$SAM3_PORT" \
-    "$SAM2_PORT" \
-    "$MOLMOACT2_CHECKPOINT_PATH" \
-    "$REMOTE_POLICY_PATH" \
-    "$REMOTE_LORA_LLM_PATH" \
-    "$REMOTE_LORA_VISION_PATH" \
-    "$MOLMOACT2_NORM_TAG" \
-    "$MOLMOACT2_IMAGE_KEYS_B64" \
-    "$MOLMOACT2_MODEL_DTYPE" \
-    "$MOLMOACT2_NUM_FLOW_TIMESTEPS" \
-    "$MOLMOACT2_NUM_ACTIONS" \
-    "$MOLMOACT2_EXPERIMENTS_DIR" \
-    "$SAM3_BACKEND" \
-    "$SAM3_MODEL_ID" \
-    "$SAM3_FRAMES_DIR" \
-    "$SAM3_READY_PATH" \
-    "$SAM2_TRACKER" \
-    "$SAM2_MODEL_ID" \
-    "$SAM3_VIDEO_MODEL_ID" \
-    "$SAM3_VIDEO_PROMPT" \
-    "$SAM3_DETECT_TIMEOUT_S" \
-    "$SAM3_DETECT_REQUEST_TIMEOUT_S" <<'REMOTE'
+  local remote_cmd
+  local quoted_arg
+  local remote_args=(
+    "$REMOTE_ROOT"
+    "$REMOTE_PYTHON"
+    "$REMOTE_LOG_DIR"
+    "$REMOTE_HF_HOME"
+    "$POLICY_PORT"
+    "$SAM3_PORT"
+    "$SAM2_PORT"
+    "$MOLMOACT2_CHECKPOINT_PATH"
+    "$REMOTE_POLICY_PATH"
+    "$REMOTE_LORA_LLM_PATH"
+    "$REMOTE_LORA_VISION_PATH"
+    "$MOLMOACT2_NORM_TAG"
+    "$MOLMOACT2_IMAGE_KEYS_B64"
+    "$MOLMOACT2_MODEL_DTYPE"
+    "$MOLMOACT2_NUM_FLOW_TIMESTEPS"
+    "$MOLMOACT2_NUM_ACTIONS"
+    "$MOLMOACT2_EXPERIMENTS_DIR"
+    "$SAM3_BACKEND"
+    "$SAM3_MODEL_ID"
+    "$SAM3_FRAMES_DIR"
+    "$SAM3_READY_PATH"
+    "$SAM2_TRACKER"
+    "$SAM2_MODEL_ID"
+    "$SAM3_VIDEO_MODEL_ID"
+    "$SAM3_VIDEO_PROMPT"
+    "$SAM3_DETECT_TIMEOUT_S"
+    "$SAM3_DETECT_REQUEST_TIMEOUT_S"
+    "$YOLO_BALL_MODEL"
+    "$YOLO_BALL_IMGSZ"
+    "$YOLO_BALL_CONF"
+    "$SAM3_VIDEO_MAX_SESSION_FRAMES"
+  )
+  remote_cmd="bash -s --"
+  for quoted_arg in "${remote_args[@]}"; do
+    printf -v quoted_arg '%q' "$quoted_arg"
+    remote_cmd+=" ${quoted_arg}"
+  done
+  local local_remote_script="${REPO_ROOT}/scripts/remote_start_so101_gpu_services.sh"
+  local remote_script="/tmp/remote_start_so101_gpu_services.sh"
+  scp "${SCP_OPTS[@]}" "$local_remote_script" "${GPU_USER}@${GPU_HOST}:${remote_script}" >/dev/null
+  ssh "${SSH_OPTS[@]}" "${GPU_USER}@${GPU_HOST}" "chmod +x '${remote_script}' && ${remote_script} ${remote_cmd#bash -s -- }"
+  return
+  ssh "${SSH_OPTS[@]}" "${GPU_USER}@${GPU_HOST}" "$remote_cmd" <<'REMOTE'
 set -euo pipefail
 
 REMOTE_ROOT="$1"
@@ -245,6 +272,10 @@ SAM3_VIDEO_MODEL_ID="${24}"
 SAM3_VIDEO_PROMPT="${25}"
 SAM3_DETECT_TIMEOUT_S="${26}"
 SAM3_DETECT_REQUEST_TIMEOUT_S="${27}"
+YOLO_BALL_MODEL="${28}"
+YOLO_BALL_IMGSZ="${29}"
+YOLO_BALL_CONF="${30}"
+SAM3_VIDEO_MAX_SESSION_FRAMES="${31:-300}"
 IMAGE_KEYS="$(printf '%s' "$IMAGE_KEYS_B64" | base64 -d)"
 
 mkdir -p "$LOG_DIR" "$SAM3_FRAMES_DIR"
@@ -284,7 +315,7 @@ with open(image_path, "rb") as f:
 
 payload = {
     "image_b64": image_b64,
-    "prompts": ["blue rubber ball"],
+    "prompts": ["light blue object"],
     "max_masks": 1,
     "min_score": 0.0,
     "alpha": 0.65,
@@ -356,23 +387,35 @@ case "$SAM2_TRACKER" in
   image)
     SAM2_SCRIPT="scripts/sam2_track_ui.py"
     SAM2_EXPECTED_MODE="sam2_image"
-    TRACKER_MODEL_ID="$SAM2_MODEL_ID"
-    TRACKER_EXTRA_ARGS=()
+    TRACKER_EXTRA_ARGS=(--model-id "$SAM2_MODEL_ID")
     ;;
   video)
     SAM2_SCRIPT="scripts/sam2_video_track_ui.py"
     SAM2_EXPECTED_MODE="sam2_video"
-    TRACKER_MODEL_ID="$SAM2_MODEL_ID"
-    TRACKER_EXTRA_ARGS=()
+    TRACKER_EXTRA_ARGS=(--model-id "$SAM2_MODEL_ID")
     ;;
   sam3_video)
     SAM2_SCRIPT="scripts/sam3_video_track_ui.py"
     SAM2_EXPECTED_MODE="sam3_video"
-    TRACKER_MODEL_ID="$SAM3_VIDEO_MODEL_ID"
-    TRACKER_EXTRA_ARGS=(--prompt "$SAM3_VIDEO_PROMPT")
+    TRACKER_EXTRA_ARGS=(
+      --model-id "$SAM3_VIDEO_MODEL_ID"
+      --prompt "$SAM3_VIDEO_PROMPT"
+      --inference-state-device cpu
+      --video-storage-device cpu
+      --max-session-frames "$SAM3_VIDEO_MAX_SESSION_FRAMES"
+    )
+    ;;
+  yolo)
+    if [ -z "$YOLO_BALL_MODEL" ]; then
+      echo "SO101_SAM2_TRACKER=yolo requires SO101_YOLO_BALL_MODEL=/path/to/best.pt" >&2
+      exit 1
+    fi
+    SAM2_SCRIPT="scripts/yolo_ball_track_ui.py"
+    SAM2_EXPECTED_MODE="yolo_seg"
+    TRACKER_EXTRA_ARGS=(--model "$YOLO_BALL_MODEL" --imgsz "$YOLO_BALL_IMGSZ" --conf "$YOLO_BALL_CONF")
     ;;
   *)
-    echo "Unknown SO101_SAM2_TRACKER=${SAM2_TRACKER}; expected image, video, or sam3_video" >&2
+    echo "Unknown SO101_SAM2_TRACKER=${SAM2_TRACKER}; expected image, video, sam3_video, or yolo" >&2
     exit 1
     ;;
 esac
@@ -382,11 +425,11 @@ if ! printf '%s' "$SAM2_HEALTH" | grep -q "\"mode\":\"${SAM2_EXPECTED_MODE}\""; 
   pkill -f 'scripts/sam3_video_track_ui.py' >/dev/null 2>&1 || true
   pkill -f 'scripts/sam2_video_track_ui.py' >/dev/null 2>&1 || true
   pkill -f 'scripts/sam2_track_ui.py' >/dev/null 2>&1 || true
+  pkill -f 'scripts/yolo_ball_track_ui.py' >/dev/null 2>&1 || true
   nohup "$PYTHON" "$SAM2_SCRIPT" \
     --host 127.0.0.1 \
     --port "$SAM2_PORT" \
     --device cuda \
-    --model-id "$TRACKER_MODEL_ID" \
     "${TRACKER_EXTRA_ARGS[@]}" \
     >"${LOG_DIR}/sam2_${SAM2_PORT}.log" 2>&1 &
   echo $! >"${LOG_DIR}/sam2_${SAM2_PORT}.pid"
@@ -460,9 +503,10 @@ start_local_ui() {
   SO101_SUCCESS_SAM3_URL="${SO101_SUCCESS_SAM3_URL:-http://127.0.0.1:${SAM3_PORT}/api/detect_image}" \
   SO101_SUCCESS_SAM3_PROMPT="${SO101_SUCCESS_SAM3_PROMPT:-black cylinder along with insides}" \
   SO101_SUCCESS_SAM3_MIN_SCORE="${SO101_SUCCESS_SAM3_MIN_SCORE:-0.25}" \
-  SO101_SUCCESS_BALL_SAM3_PROMPT="${SO101_SUCCESS_BALL_SAM3_PROMPT:-blue rubber ball}" \
+  SO101_SUCCESS_BALL_SAM3_PROMPT="${SO101_SUCCESS_BALL_SAM3_PROMPT:-light blue object}" \
   SO101_SUCCESS_BALL_SAM3_MIN_SCORE="${SO101_SUCCESS_BALL_SAM3_MIN_SCORE:-0.25}" \
-  SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES="${SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES:-100}" \
+  SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES="${SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES:-0}" \
+  SO101_SUCCESS_BALL_TRACKER_MODE="${SO101_SUCCESS_BALL_TRACKER_MODE:-$SAM2_TRACKER}" \
   SO101_SUCCESS_BALL_SAM2_AUTO="${SO101_SUCCESS_BALL_SAM2_AUTO:-1}" \
   SO101_SUCCESS_BALL_SAM2_URL="${SO101_SUCCESS_BALL_SAM2_URL:-http://127.0.0.1:${SAM2_PORT}/api/track_image}" \
   SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES="${SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES:-2}" \

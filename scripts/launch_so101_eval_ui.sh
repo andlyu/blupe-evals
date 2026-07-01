@@ -21,6 +21,7 @@ ROBOT_ID="${SO101_ROBOT_ID:-blupe_follower}"
 LEADER_PORT="${SO101_LEADER_PORT:-/dev/tty.usbmodem58FA1025151}"
 LEADER_ID="${SO101_LEADER_ID:-blupe_leader}"
 SUCCESS_TRACKING="${SO101_SUCCESS_TRACKING:-1}"
+SUCCESS_FPS="${SO101_SUCCESS_FPS:-10}"
 SAM2_TRACKING_AUTO="${SO101_SUCCESS_BALL_SAM2_AUTO:-0}"
 SAM2_TRACKING_HEALTH_URL="${SO101_SUCCESS_BALL_SAM2_HEALTH_URL:-http://127.0.0.1:8214/health}"
 SAM2_TRACKING_URL="${SO101_SUCCESS_BALL_SAM2_URL:-}"
@@ -179,6 +180,8 @@ done
 
 if [ "$SUCCESS_TRACKING" = "0" ]; then
   ui_cmd+=(--no-success-tracking)
+else
+  ui_cmd+=(--success-fps "$SUCCESS_FPS")
 fi
 
 if [ "$SUCCESS_TRACKING" != "0" ]; then

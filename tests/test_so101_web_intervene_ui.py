@@ -98,9 +98,13 @@ def test_live_view_start_recording_uses_visible_prompt_and_dataset_name() -> Non
     assert 'id="liveSuccessIndicator"' in SOURCE
     assert 'id="liveSuccessOverlay"' in SOURCE
     assert 'id="liveSam3RerunButton"' in SOURCE
-    assert 'onclick="rerunSam3Masks(\'front\')">Rerun SAM3</button>' in SOURCE
-    assert "async function rerunSam3Masks(cameraOverride = '')" in SOURCE
+    assert 'onclick="rerunSam3Masks(\'front\', false)">Rerun SAM3</button>' in SOURCE
+    assert "async function rerunSam3Masks(cameraOverride = '', useEditorConfig = true)" in SOURCE
     assert "const camera = cameraOverride || cfg.camera;" in SOURCE
+    assert "const payload = {camera, ball_seed_slot: selectedBallSeedSlot};" in SOURCE
+    assert "if (useEditorConfig) {" in SOURCE
+    assert 'prompt=str(data["prompt"]) if "prompt" in data else None' in SOURCE
+    assert 'min_score=float(data["min_score"]) if "min_score" in data else None' in SOURCE
     assert "setLiveRecordStatus(`rerunning SAM3 masks (${camera})`, 'warn');" in SOURCE
     assert "sam3RerunButton.disabled = data.mode === 'stopping';" in SOURCE
     assert 'Rerun SAM3 is disabled while stopping' in SOURCE
@@ -109,6 +113,33 @@ def test_live_view_start_recording_uses_visible_prompt_and_dataset_name() -> Non
     assert "body.live-view .cams { grid-template-columns: repeat(4" in SOURCE
     assert "body.page-monitor .cams { grid-template-columns: repeat(4" in SOURCE
     assert "getElementById('successOverlay')" not in SOURCE
+
+
+def test_live_view_can_save_sam3_frames_and_predictions() -> None:
+    assert "SAM_LABEL_ROOT = RAW_RECORD_ROOT / \"sam-labels\"" in SOURCE
+    assert "DEFAULT_SAM_LABEL_SAVE_FPS" in SOURCE
+    assert 'id="liveSam3SaveButton"' in SOURCE
+    assert 'onclick="saveSam3Predictions(\'front\')">Save Frames + Predictions</button>' in SOURCE
+    assert "async function saveSam3Predictions(camera = 'front')" in SOURCE
+    assert "button.textContent = saving ? 'Stopping Save...' : 'Starting Save...';" in SOURCE
+    assert "function renderSamLabelSaving(data)" in SOURCE
+    assert "`Stop Saving (${labels.count || 0})`" in SOURCE
+    assert "const path = saving ? '/api/success/save_predictions/stop' : '/api/success/save_predictions/start';" in SOURCE
+    assert "def save_success_predictions(" in SOURCE
+    assert "camera: Any = \"front\"" in SOURCE
+    assert "def start_sam_label_saving(self, camera: Any = \"front\", fps: float = DEFAULT_SAM_LABEL_SAVE_FPS)" in SOURCE
+    assert "def stop_sam_label_saving(self, join: bool = False)" in SOURCE
+    assert "def _sam_label_saving_loop(self, camera_name: str, fps: float, session_dir: Path)" in SOURCE
+    assert '"sam_labels": self._sam_label_snapshot_locked()' in SOURCE
+    assert '\"kind\": \"so101_sam_predictions\"' in SOURCE
+    assert '\"prediction_frame\": frame_paths.get(cam.name)' in SOURCE
+    assert 'annotations_path = session_dir / "annotations.jsonl"' in SOURCE
+    assert '\"container\": {' in SOURCE
+    assert '\"ball\": {' in SOURCE
+    assert 'elif parsed.path == "/api/success/save_predictions":' in SOURCE
+    assert "controller.save_success_predictions(camera=data.get(\"camera\", \"front\"))" in SOURCE
+    assert 'elif parsed.path == "/api/success/save_predictions/start":' in SOURCE
+    assert 'elif parsed.path == "/api/success/save_predictions/stop":' in SOURCE
 
 
 def test_success_mask_stream_renders_fresh_camera_frames_with_cached_masks() -> None:

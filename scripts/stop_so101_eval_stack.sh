@@ -112,6 +112,7 @@ pkill -f 'scripts/sam3_prompt_ui.py' >/dev/null 2>&1 || true
 pkill -f 'scripts/sam3_video_track_ui.py' >/dev/null 2>&1 || true
 pkill -f 'scripts/sam2_video_track_ui.py' >/dev/null 2>&1 || true
 pkill -f 'scripts/sam2_track_ui.py' >/dev/null 2>&1 || true
+pkill -f 'scripts/yolo_ball_track_ui.py' >/dev/null 2>&1 || true
 REMOTE
 }
 
