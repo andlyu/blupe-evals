@@ -100,9 +100,33 @@ and update `SO101_GPU_HOST` / `SO101_GPU_PORT`.
 2. The eval UI captures front/wrist frames and current robot state.
 3. The UI sends those to MolmoAct2 over `/act`.
 4. The UI executes returned joint actions on the follower arm.
-5. SAM3 seeds cup masks; the configured ball tracker refreshes ball masks asynchronously, and the mask MJPEG stream draws fresh camera frames with the latest completed mask. For live evals we can set `SO101_SAM2_TRACKER=sam3_video` to use SAM3 Video tracking instead of SAM2.
+5. SAM3 seeds cup masks and ball masks; the configured ball tracker refreshes
+   ball masks asynchronously, and the mask MJPEG stream draws fresh camera
+   frames with the latest completed mask. For live evals we can set
+   `SO101_SAM2_TRACKER=sam3_video` to use SAM3 Video tracking instead of SAM2.
 6. Recordings are written locally, then compacted/exported to a dataset.
 7. Converted v2.1 datasets are used for MolmoAct2 LoRA training.
+
+## Success Mask Flow
+
+- Readiness is strict: launch/check expect SAM3 and the ball tracker to be up
+  before the eval UI is considered usable.
+- Cup/container masks come from the SAM3 image prompt service on episode start
+  and explicit SAM3 reruns.
+- Ball masks are initially grounded by SAM3. Periodic SAM3 re-grounding is off
+  by default with `SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=0`; clicking
+  `Rerun SAM3` still forces a fresh ball seed.
+- The live ball tracker behind `/api/track_image` is SAM2 image tracking by
+  default. It is requested every `SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2`
+  success-tracker frames, which is about 5 Hz at the default 10 Hz success loop.
+- The mask stream does not wait for every inference. It keeps drawing fresh
+  camera frames with the latest completed mask while SAM2/SAM3 requests run in
+  background threads.
+- `/api/status` reports the numbers that matter for live operation:
+  `ball_mask_capture_to_display_*`, `ball_mask_capture_to_stream_*`,
+  `ball_mask_sam2_inference_hz`, `ball_mask_sam3_inference_hz`, and
+  `ball_mask_sam2_vs_sam3_align_rate`. Alignment is measured against the latest
+  SAM3 ball mask; it is telemetry, not an acceptance filter.
 
 ## Related Docs
 

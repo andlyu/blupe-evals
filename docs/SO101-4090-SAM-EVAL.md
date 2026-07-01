@@ -71,9 +71,12 @@ response reports `mode: sam3_video` when SAM3 Video is active. Tracker requests
 run in the background every
 `SO101_SUCCESS_BALL_SAM2_EVERY_N_FRAMES=2` success-tracker frames, about 5 Hz at
 the default 10 Hz success loop, while `/api/success.mjpg` keeps drawing fresh
-camera frames with the latest completed mask. Current defaults are `black
-cylinder along with insides` for the cup/cylinder at minimum score `0.25`, and
-`blue rubber ball` for the ball at minimum score `0.25`.
+camera frames with the latest completed mask. Periodic SAM3 ball re-grounding is
+off by default with `SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=0`; the operator can
+still force it with `Rerun SAM3`. The status payload reports actual mask
+latency, inference Hz, and SAM2-vs-SAM3 alignment telemetry. Current defaults
+are `black cylinder along with insides` for the cup/cylinder at minimum score
+`0.25`, and `light blue object` for the ball at minimum score `0.25`.
 
 ## 4090 Setup
 
@@ -152,9 +155,9 @@ SO101_POLICY_CAMERAS=front,wrist \
 SO101_SUCCESS_SAM3_URL=http://127.0.0.1:8213/api/detect_image \
 SO101_SUCCESS_SAM3_PROMPT="black cylinder along with insides" \
 SO101_SUCCESS_SAM3_MIN_SCORE=0.25 \
-SO101_SUCCESS_BALL_SAM3_PROMPT="blue rubber ball" \
+SO101_SUCCESS_BALL_SAM3_PROMPT="light blue object" \
 SO101_SUCCESS_BALL_SAM3_MIN_SCORE=0.25 \
-SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=100 \
+SO101_SUCCESS_BALL_SAM3_EVERY_N_FRAMES=0 \
 SO101_SAM2_TRACKER=image \
 SO101_SUCCESS_BALL_SAM2_AUTO=1 \
 SO101_SUCCESS_BALL_SAM2_URL=http://127.0.0.1:8214/api/track_image \

@@ -250,6 +250,60 @@ class PolicyChunkQuery:
     error: BaseException | None = None
 
 
+@dataclass(frozen=True)
+class BallMaskAsyncAttrs:
+    lock: str
+    refresh_running: str
+    status: str
+    error: str
+    elapsed_s: str
+    request_capture_mono: str
+    frame_to_request_s: str
+    request_to_response_s: str
+    started_frame: str
+    completed_frame: str
+    generation: str
+    frame_to_request_history: str
+    request_to_response_history: str
+    last_request_frame: str
+
+
+BALL_MASK_ASYNC_ATTRS = {
+    "sam3": BallMaskAsyncAttrs(
+        lock="ball_mask_sam3_async_lock",
+        refresh_running="ball_mask_sam3_refresh_running",
+        status="ball_mask_sam3_async_status",
+        error="ball_mask_sam3_async_error",
+        elapsed_s="ball_mask_sam3_async_elapsed_s",
+        request_capture_mono="ball_mask_sam3_async_request_capture_mono",
+        frame_to_request_s="ball_mask_sam3_async_frame_to_request_s",
+        request_to_response_s="ball_mask_sam3_async_request_to_response_s",
+        started_frame="ball_mask_sam3_async_started_frame",
+        completed_frame="ball_mask_sam3_async_completed_frame",
+        generation="ball_mask_sam3_async_generation",
+        frame_to_request_history="ball_mask_sam3_async_frame_to_request_history",
+        request_to_response_history="ball_mask_sam3_async_request_to_response_history",
+        last_request_frame="ball_mask_sam3_last_request_frame",
+    ),
+    "sam2": BallMaskAsyncAttrs(
+        lock="ball_mask_sam2_async_lock",
+        refresh_running="ball_mask_sam2_refresh_running",
+        status="ball_mask_sam2_async_status",
+        error="ball_mask_sam2_async_error",
+        elapsed_s="ball_mask_sam2_async_elapsed_s",
+        request_capture_mono="ball_mask_sam2_async_request_capture_mono",
+        frame_to_request_s="ball_mask_sam2_async_frame_to_request_s",
+        request_to_response_s="ball_mask_sam2_async_request_to_response_s",
+        started_frame="ball_mask_sam2_async_started_frame",
+        completed_frame="ball_mask_sam2_async_completed_frame",
+        generation="ball_mask_sam2_async_generation",
+        frame_to_request_history="ball_mask_sam2_async_frame_to_request_history",
+        request_to_response_history="ball_mask_sam2_async_request_to_response_history",
+        last_request_frame="ball_mask_sam2_last_request_frame",
+    ),
+}
+
+
 POLICY_TO_ROBOT_JOINT_SIGNS = load_joint_array_env(
     "SO101_POLICY_TO_ROBOT_JOINT_SIGNS",
     DEFAULT_SO101_POLICY_TO_ROBOT_JOINT_SIGNS,
@@ -733,21 +787,7 @@ class LiveCupSuccessTracker:
         self.ball_mask_sam3_raw_score = None
         self.ball_mask_sam3_raw_area = None
         self.ball_mask_sam3_box_xyxy = None
-        self.ball_mask_sam3_last_request_frame = None
-        with self.ball_mask_sam3_async_lock:
-            self.ball_mask_sam3_refresh_running = False
-            self.ball_mask_sam3_async_status = f"pending:{reason}"
-            self.ball_mask_sam3_async_error = ""
-            self.ball_mask_sam3_async_elapsed_s = None
-            self.ball_mask_sam3_async_request_capture_mono = None
-            self.ball_mask_sam3_async_frame_to_request_s = None
-            self.ball_mask_sam3_async_request_to_response_s = None
-            if clear_latency_history:
-                self.ball_mask_sam3_async_frame_to_request_history.clear()
-                self.ball_mask_sam3_async_request_to_response_history.clear()
-            self.ball_mask_sam3_async_started_frame = None
-            self.ball_mask_sam3_async_completed_frame = None
-            self.ball_mask_sam3_async_generation = None
+        self._reset_ball_async("sam3", f"pending:{reason}", clear_latency_history=clear_latency_history)
         self.ball_mask_sam2_status = "disabled" if not self.ball_sam2_url else f"pending:{reason}"
         self.ball_mask_sam2_error = ""
         self.ball_mask_sam2_raw_score = None
@@ -757,21 +797,11 @@ class LiveCupSuccessTracker:
         if reason in {"manual_sam3_rerun", "sam3_prompt_update"}:
             self.ball_sam3_area_history.clear()
             self.ball_sam3_area_mean = None
-        self.ball_mask_sam2_last_request_frame = None
-        with self.ball_mask_sam2_async_lock:
-            self.ball_mask_sam2_refresh_running = False
-            self.ball_mask_sam2_async_status = "disabled" if not self.ball_sam2_url else f"pending:{reason}"
-            self.ball_mask_sam2_async_error = ""
-            self.ball_mask_sam2_async_elapsed_s = None
-            self.ball_mask_sam2_async_request_capture_mono = None
-            self.ball_mask_sam2_async_frame_to_request_s = None
-            self.ball_mask_sam2_async_request_to_response_s = None
-            if clear_latency_history:
-                self.ball_mask_sam2_async_frame_to_request_history.clear()
-                self.ball_mask_sam2_async_request_to_response_history.clear()
-            self.ball_mask_sam2_async_started_frame = None
-            self.ball_mask_sam2_async_completed_frame = None
-            self.ball_mask_sam2_async_generation = None
+        self._reset_ball_async(
+            "sam2",
+            "disabled" if not self.ball_sam2_url else f"pending:{reason}",
+            clear_latency_history=clear_latency_history,
+        )
         self.ball_mask_capture_to_display_s = None
         self.ball_mask_capture_to_display_source = ""
         if clear_latency_history:
@@ -1045,6 +1075,77 @@ class LiveCupSuccessTracker:
         self.ball_mask_hsv_status = status
         self.ball_mask_hsv_error = error
 
+    @staticmethod
+    def _ball_async_attrs(model: str) -> BallMaskAsyncAttrs:
+        try:
+            return BALL_MASK_ASYNC_ATTRS[model]
+        except KeyError as exc:
+            raise ValueError(f"unknown ball mask async model {model!r}") from exc
+
+    def _reset_ball_async(self, model: str, status: str, *, clear_latency_history: bool) -> None:
+        attrs = self._ball_async_attrs(model)
+        lock = getattr(self, attrs.lock)
+        with lock:
+            setattr(self, attrs.refresh_running, False)
+            setattr(self, attrs.status, status)
+            setattr(self, attrs.error, "")
+            setattr(self, attrs.elapsed_s, None)
+            setattr(self, attrs.request_capture_mono, None)
+            setattr(self, attrs.frame_to_request_s, None)
+            setattr(self, attrs.request_to_response_s, None)
+            if clear_latency_history:
+                getattr(self, attrs.frame_to_request_history).clear()
+                getattr(self, attrs.request_to_response_history).clear()
+            setattr(self, attrs.started_frame, None)
+            setattr(self, attrs.completed_frame, None)
+            setattr(self, attrs.generation, None)
+            setattr(self, attrs.last_request_frame, None)
+
+    def _should_refresh_ball_async(self, model: str, cadence_frames: int) -> bool:
+        if cadence_frames <= 0:
+            return False
+        attrs = self._ball_async_attrs(model)
+        lock = getattr(self, attrs.lock)
+        with lock:
+            if getattr(self, attrs.refresh_running):
+                return False
+        last_request_frame = getattr(self, attrs.last_request_frame)
+        if last_request_frame is None:
+            return True
+        return self.frame_idx - int(last_request_frame) >= int(cadence_frames)
+
+    def _begin_ball_async_refresh(
+        self,
+        model: str,
+        *,
+        frame_idx: int,
+        generation: int,
+        request_capture_mono: float | None,
+    ) -> bool:
+        attrs = self._ball_async_attrs(model)
+        lock = getattr(self, attrs.lock)
+        with lock:
+            if getattr(self, attrs.refresh_running):
+                return False
+            setattr(self, attrs.refresh_running, True)
+            setattr(self, attrs.status, "requesting")
+            setattr(self, attrs.error, "")
+            setattr(self, attrs.elapsed_s, None)
+            setattr(self, attrs.request_capture_mono, request_capture_mono)
+            setattr(self, attrs.frame_to_request_s, None)
+            setattr(self, attrs.request_to_response_s, None)
+            setattr(self, attrs.started_frame, frame_idx)
+            setattr(self, attrs.generation, generation)
+            setattr(self, attrs.last_request_frame, frame_idx)
+        return True
+
+    def _finish_ball_async_refresh(self, model: str) -> None:
+        attrs = self._ball_async_attrs(model)
+        lock = getattr(self, attrs.lock)
+        with lock:
+            setattr(self, attrs.request_capture_mono, None)
+            setattr(self, attrs.refresh_running, False)
+
     def _record_ball_mask_request_timings(
         self,
         *,
@@ -1055,37 +1156,19 @@ class LiveCupSuccessTracker:
     ) -> None:
         if request_to_response_s < 0.0:
             request_to_response_s = 0.0
-        if model == "sam3":
-            lock = self.ball_mask_sam3_async_lock
-            request_capture_key = request_capture_mono
-            with lock:
-                self.ball_mask_sam3_async_request_to_response_s = float(request_to_response_s)
-                if request_capture_key is None:
-                    self.ball_mask_sam3_async_frame_to_request_s = None
-                else:
-                    frame_to_request_s = float(request_started_mono - request_capture_key)
-                    if frame_to_request_s < 0.0:
-                        frame_to_request_s = 0.0
-                    self.ball_mask_sam3_async_frame_to_request_s = frame_to_request_s
-                    self.ball_mask_sam3_async_frame_to_request_history.append(frame_to_request_s)
-                self.ball_mask_sam3_async_request_to_response_history.append(float(request_to_response_s))
-            return
-
-        if model == "sam2":
-            lock = self.ball_mask_sam2_async_lock
-            request_capture_key = request_capture_mono
-            with lock:
-                self.ball_mask_sam2_async_request_to_response_s = float(request_to_response_s)
-                if request_capture_key is None:
-                    self.ball_mask_sam2_async_frame_to_request_s = None
-                else:
-                    frame_to_request_s = float(request_started_mono - request_capture_key)
-                    if frame_to_request_s < 0.0:
-                        frame_to_request_s = 0.0
-                    self.ball_mask_sam2_async_frame_to_request_s = frame_to_request_s
-                    self.ball_mask_sam2_async_frame_to_request_history.append(frame_to_request_s)
-                self.ball_mask_sam2_async_request_to_response_history.append(float(request_to_response_s))
-            return
+        attrs = self._ball_async_attrs(model)
+        lock = getattr(self, attrs.lock)
+        with lock:
+            setattr(self, attrs.request_to_response_s, float(request_to_response_s))
+            if request_capture_mono is None:
+                setattr(self, attrs.frame_to_request_s, None)
+            else:
+                frame_to_request_s = float(request_started_mono - request_capture_mono)
+                if frame_to_request_s < 0.0:
+                    frame_to_request_s = 0.0
+                setattr(self, attrs.frame_to_request_s, frame_to_request_s)
+                getattr(self, attrs.frame_to_request_history).append(frame_to_request_s)
+            getattr(self, attrs.request_to_response_history).append(float(request_to_response_s))
 
     @staticmethod
     def _inference_hz(history: deque[float]) -> float | None:
@@ -2150,23 +2233,10 @@ class LiveCupSuccessTracker:
                 return False
         elif self.ball_mask is None or not self.ball_mask.any():
             return False
-        with self.ball_mask_sam2_async_lock:
-            if self.ball_mask_sam2_refresh_running:
-                return False
-        if self.ball_mask_sam2_last_request_frame is None:
-            return True
-        return self.frame_idx - self.ball_mask_sam2_last_request_frame >= int(self.ball_mask_sam2_every_n_frames)
+        return self._should_refresh_ball_async("sam2", int(self.ball_mask_sam2_every_n_frames))
 
     def _should_refresh_ball_with_sam3(self) -> bool:
-        cadence = int(self.ball_mask_sam3_every_n_frames)
-        if cadence <= 0:
-            return False
-        with self.ball_mask_sam3_async_lock:
-            if self.ball_mask_sam3_refresh_running:
-                return False
-        if self.ball_mask_sam3_last_request_frame is None:
-            return True
-        return self.frame_idx - self.ball_mask_sam3_last_request_frame >= cadence
+        return self._should_refresh_ball_async("sam3", int(self.ball_mask_sam3_every_n_frames))
 
     def _apply_sam3_ball_refresh_result(
         self,
@@ -2245,26 +2315,19 @@ class LiveCupSuccessTracker:
                 self.ball_mask_sam3_async_error = str(exc)
                 self.ball_mask_sam3_async_elapsed_s = time.monotonic() - started
         finally:
-            with self.ball_mask_sam3_async_lock:
-                self.ball_mask_sam3_async_request_capture_mono = None
-                self.ball_mask_sam3_refresh_running = False
+            self._finish_ball_async_refresh("sam3")
 
     def _start_ball_sam3_refresh(self, rgb: np.ndarray, *, request_capture_mono: float | None = None) -> None:
         frame_idx = int(self.frame_idx)
         generation = int(self.ball_mask_generation)
-        with self.ball_mask_sam3_async_lock:
-            if self.ball_mask_sam3_refresh_running:
-                return
-            self.ball_mask_sam3_refresh_running = True
-            self.ball_mask_sam3_async_status = "requesting"
-            self.ball_mask_sam3_async_error = ""
-            self.ball_mask_sam3_async_elapsed_s = None
-            self.ball_mask_sam3_async_request_capture_mono = request_capture_mono
-            self.ball_mask_sam3_async_frame_to_request_s = None
-            self.ball_mask_sam3_async_request_to_response_s = None
-            self.ball_mask_sam3_async_started_frame = frame_idx
-            self.ball_mask_sam3_async_generation = generation
-            self.ball_mask_sam3_last_request_frame = frame_idx
+        started = self._begin_ball_async_refresh(
+            "sam3",
+            frame_idx=frame_idx,
+            generation=generation,
+            request_capture_mono=request_capture_mono,
+        )
+        if not started:
+            return
         thread = threading.Thread(
             target=self._run_ball_sam3_refresh,
             args=(rgb.copy(), frame_idx, generation, request_capture_mono),
@@ -2357,9 +2420,7 @@ class LiveCupSuccessTracker:
                 self.ball_mask_sam2_async_error = str(exc)
                 self.ball_mask_sam2_async_elapsed_s = time.monotonic() - started
         finally:
-            with self.ball_mask_sam2_async_lock:
-                self.ball_mask_sam2_async_request_capture_mono = None
-                self.ball_mask_sam2_refresh_running = False
+            self._finish_ball_async_refresh("sam2")
 
     def _start_ball_sam2_refresh(self, rgb: np.ndarray, *, request_capture_mono: float | None = None) -> None:
         tracker_is_sam3_video = self._external_ball_tracker_is_sam3_video()
@@ -2373,19 +2434,14 @@ class LiveCupSuccessTracker:
         generation = int(self.ball_mask_generation)
         seed_mask = self.ball_mask.copy() if self.ball_mask is not None and self.ball_mask.any() else None
         seed_source = str(self.ball_mask_source)
-        with self.ball_mask_sam2_async_lock:
-            if self.ball_mask_sam2_refresh_running:
-                return
-            self.ball_mask_sam2_refresh_running = True
-            self.ball_mask_sam2_async_status = "requesting"
-            self.ball_mask_sam2_async_error = ""
-            self.ball_mask_sam2_async_elapsed_s = None
-            self.ball_mask_sam2_async_request_capture_mono = request_capture_mono
-            self.ball_mask_sam2_async_frame_to_request_s = None
-            self.ball_mask_sam2_async_request_to_response_s = None
-            self.ball_mask_sam2_async_started_frame = frame_idx
-            self.ball_mask_sam2_async_generation = generation
-            self.ball_mask_sam2_last_request_frame = frame_idx
+        started = self._begin_ball_async_refresh(
+            "sam2",
+            frame_idx=frame_idx,
+            generation=generation,
+            request_capture_mono=request_capture_mono,
+        )
+        if not started:
+            return
         thread = threading.Thread(
             target=self._run_ball_sam2_refresh,
             args=(rgb.copy(), seed_mask, seed_source, frame_idx, generation, request_capture_mono),
